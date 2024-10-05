@@ -5,3 +5,7 @@ name = "cognet"
 version = "0.1.0"
 
 [dependencies]
+derive-new = "0.7.0"
+strum = "0.26.3"
+thiserror = "1.0.64"
+tracing = "0.1.40"
