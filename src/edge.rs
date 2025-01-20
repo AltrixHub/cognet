@@ -1,9 +1,12 @@
 pub mod slot;
 pub use slot::*;
 
+use crate::NodeId;
+
 #[derive(Debug)]
 pub struct Edge {
-    pub node_id: String,
-    pub output_slots: Vec<OutputSlot>,
-    pub input_slot: Vec<InputSlot>,
+    pub from_node: NodeId,
+    pub from_slot: OutputSlotId,
+    pub to_node: NodeId,
+    pub to_slot: InputSlotId,
 }
