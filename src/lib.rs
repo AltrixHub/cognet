@@ -2,7 +2,7 @@ use std::{
     any::Any,
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 pub mod edge;
@@ -15,7 +15,7 @@ pub trait AsAny {
 }
 
 pub trait NodeEntity: Debug + AsAny + Send + Sync {
-    fn execute(&mut self);
+    fn execute(&self, evaluation_context: &mut EvaluationContext);
 }
 
 impl dyn NodeEntity {
@@ -51,7 +51,7 @@ pub struct EvaluationContext {
 
 #[derive(Default, Debug)]
 pub struct NodeGraph {
-    pub nodes: HashMap<NodeId, Arc<Mutex<dyn NodeEntity>>>,
+    pub nodes: HashMap<NodeId, Arc<dyn NodeEntity>>,
     pub edges: HashMap<EdgeId, Edge>,
     pub context: EvaluationContext,
     pub affected_nodes: HashSet<NodeId>,
@@ -63,17 +63,6 @@ impl NodeGraph {
     }
 
     pub fn execute(&mut self) -> Result<(), &'static str> {
-        let sorted_nodes = self.topological_sort()?;
-        for node_id in sorted_nodes {
-            if let Some(node) = self.nodes.get_mut(&node_id) {
-                let mut node = node.lock().unwrap();
-                node.execute();
-            }
-        }
-        Ok(())
-    }
-
-    pub fn execute_affected_nodes(&mut self) -> Result<(), &'static str> {
         if self.affected_nodes.is_empty() {
             return Ok(());
         }
@@ -81,9 +70,8 @@ impl NodeGraph {
         let sorted_nodes = self.topological_sort()?;
         for node_id in sorted_nodes {
             if self.affected_nodes.contains(&node_id) {
-                if let Some(node) = self.nodes.get_mut(&node_id) {
-                    let mut node = node.lock().unwrap();
-                    node.execute();
+                if let Some(node) = self.nodes.get(&node_id) {
+                    node.execute(&mut self.context);
                 }
             }
         }
@@ -147,7 +135,7 @@ impl NodeGraph {
 
     pub fn add_node<T: 'static + NodeEntity>(&mut self, node: T) -> NodeId {
         let node_id = Ulid::new();
-        let node_arc = Arc::new(Mutex::new(node));
+        let node_arc = Arc::new(node);
         self.nodes.insert(node_id, node_arc);
         self.mark_affected_nodes(vec![node_id]);
         node_id
@@ -270,7 +258,7 @@ impl NodeGraph {
         new_node: T,
     ) -> Result<(), &'static str> {
         if self.nodes.contains_key(&node_id) {
-            let node_arc = Arc::new(Mutex::new(new_node));
+            let node_arc = Arc::new(new_node);
             self.nodes.insert(node_id, node_arc);
             let affected_nodes = self.collect_affected_nodes(vec![node_id]);
             self.mark_affected_nodes(affected_nodes);
@@ -280,26 +268,18 @@ impl NodeGraph {
         }
     }
 
-    pub fn get_node_by_id(&self, node_id: NodeId) -> Option<Arc<Mutex<dyn NodeEntity>>> {
+    pub fn get_node_by_id(&self, node_id: NodeId) -> Option<Arc<dyn NodeEntity>> {
         self.nodes.get(&node_id).map(|node| Arc::clone(node))
     }
 
-    // pub fn get_nodes_by_type<T: NodeEntity>(&self) -> Vec<(NodeId, Arc<&T>)> {
-    //     self.nodes
-    //         .iter()
-    //         .filter_map(|(&id, node)| {
-    //             if let Ok(node_ref) = node.lock() {
-    //                 node_ref
-    //                     .downcast_ref::<T>()
-    //                     .map(|typed_node| (id, Arc::clone(&node)))
-    //             } else {
-    //                 None
-    //             }
-    //         })
-    //         .collect()
-    // }
+    pub fn get_nodes_by_type<T: NodeEntity + 'static>(&self) -> Vec<(NodeId, &T)> {
+        self.nodes
+            .iter()
+            .filter_map(|(&id, node)| node.downcast_ref::<T>().map(|typed_node| (id, typed_node)))
+            .collect()
+    }
 
-    pub fn get_all_nodes(&self) -> Vec<(NodeId, Arc<Mutex<dyn NodeEntity>>)> {
+    pub fn get_all_nodes(&self) -> Vec<(NodeId, Arc<dyn NodeEntity>)> {
         self.nodes
             .iter()
             .map(|(&id, node)| (id, Arc::clone(node)))
@@ -335,8 +315,8 @@ mod tests {
     }
 
     impl NodeEntity for AddNode {
-        fn execute(&mut self) {
-            self.executed_count += 1;
+        fn execute(&self, evaluation_context: &mut EvaluationContext) {
+            // self.executed_count += 1;
             println!("Executing AddNode with id: {}", self.id);
         }
     }
@@ -560,49 +540,29 @@ mod tests {
             to_slot: Ulid::new(),
         });
 
-        node_graph.execute_affected_nodes().unwrap();
+        node_graph.execute().unwrap();
 
         println!("--- first execute finished---");
 
         let add_node_ref = node_graph.get_node_by_id(node2_id).unwrap();
-        let node = add_node_ref
-            .lock()
-            .unwrap()
-            .downcast_ref::<AddNode>()
-            .unwrap()
-            .clone();
+        let node = add_node_ref.downcast_ref::<AddNode>().unwrap().clone();
         node_graph.update_node(node2_id, node).unwrap();
 
-        node_graph.execute_affected_nodes().unwrap();
+        node_graph.execute().unwrap();
 
         let executed_1 = node_graph
             .get_node_by_id(node1_id)
-            .and_then(|node| {
-                let locked_node = node.lock().unwrap();
-                locked_node.as_any().downcast_ref::<AddNode>().cloned()
-            })
+            .and_then(|node| node.downcast_ref::<AddNode>().cloned())
             .map_or(false, |n| n.executed_count == 1);
 
         let executed_2 = node_graph
             .get_node_by_id(node2_id)
-            .and_then(|node| {
-                node.lock()
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<AddNode>()
-                    .cloned()
-            })
+            .and_then(|node| node.downcast_ref::<AddNode>().cloned())
             .map_or(false, |n| n.executed_count == 2);
 
         let executed_3 = node_graph
             .get_node_by_id(node3_id)
-            .and_then(|node| {
-                node.lock()
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<AddNode>()
-                    .cloned()
-            })
+            .and_then(|node| node.downcast_ref::<AddNode>().cloned())
             .map_or(false, |n| n.executed_count == 2);
 
         assert!(executed_1);
