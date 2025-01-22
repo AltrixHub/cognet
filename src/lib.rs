@@ -29,9 +29,11 @@ macro_rules! impl_node_core {
 
                 for edge_id in &input_slot.connected_edges {
                     if let Some(edge) = evaluation_context.edges.get(edge_id) {
-                        // if let Some(value) = evaluation_context.outputs.get(&edge.from_slot) {
-                        //     result.push(value);
-                        // }
+                        if let Some(value) =
+                            evaluation_context.outputs.get(&edge.from_output_slot_id)
+                        {
+                            result.push(value);
+                        }
                     }
                 }
 
@@ -164,6 +166,42 @@ impl NodeGraph {
         Ok(())
     }
 
+    fn create_edge(
+        &self,
+        from_node_id: NodeId,
+        from_output_slot_index: usize,
+        to_node_id: NodeId,
+        to_input_slot_index: usize,
+    ) -> Result<Edge, &'static str> {
+        let from_output_slot_id = {
+            let node = self
+                .get_node_by_id(from_node_id)
+                .ok_or("From node not found")?;
+            node.outputs()
+                .get(from_output_slot_index)
+                .ok_or("Invalid output slot index")?
+                .id
+                .clone()
+        };
+
+        let to_input_slot_id = {
+            let node = self.get_node_by_id(to_node_id).ok_or("To node not found")?;
+            node.inputs()
+                .get(to_input_slot_index)
+                .ok_or("Invalid input slot index")?
+                .id
+                .clone()
+        };
+        Ok(Edge {
+            from_node_id,
+            from_output_slot_index,
+            from_output_slot_id,
+            to_node_id,
+            to_input_slot_index,
+            to_input_slot_id,
+        })
+    }
+
     fn mark_affected_nodes(&mut self, nodes: Vec<NodeId>) {
         self.affected_nodes.extend(nodes.into_iter());
     }
@@ -179,12 +217,12 @@ impl NodeGraph {
 
         for edge in self.context.edges.values() {
             in_degree
-                .entry(edge.to_node)
+                .entry(edge.to_node_id)
                 .and_modify(|count| *count += 1);
             adj_list
-                .entry(edge.from_node)
+                .entry(edge.from_node_id)
                 .or_default()
-                .push(edge.to_node);
+                .push(edge.to_node_id);
         }
 
         let mut queue: VecDeque<NodeId> = in_degree
@@ -226,24 +264,24 @@ impl NodeGraph {
     }
 
     pub fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
-        let from_node_id = edge.from_node;
-        let to_node_id = edge.to_node;
+        let from_node_id = edge.from_node_id;
+        let to_node_id = edge.to_node_id;
 
         let from_node = self
             .nodes
             .get(&from_node_id)
-            .ok_or_else(|| format!("From node {:?} does not exist", edge.from_node))?;
+            .ok_or_else(|| format!("From node {:?} does not exist", edge.from_node_id))?;
         let to_node = self
             .nodes
             .get(&to_node_id)
-            .ok_or_else(|| format!("To node {:?} does not exist", edge.to_node))?;
+            .ok_or_else(|| format!("To node {:?} does not exist", edge.to_node_id))?;
 
         let from_slot = from_node
             .get_output_slot_by_index(edge.from_output_slot_index)
             .ok_or_else(|| {
                 format!(
                     "Output slot index {:?} does not exist in node {:?}",
-                    edge.from_output_slot_index, edge.from_node
+                    edge.from_output_slot_index, edge.from_node_id
                 )
             })?;
         let to_slot = to_node
@@ -251,7 +289,7 @@ impl NodeGraph {
             .ok_or_else(|| {
                 format!(
                     "Input slot index {:?} does not exist in node {:?}",
-                    edge.to_input_slot_index, edge.to_node
+                    edge.to_input_slot_index, edge.to_node_id
                 )
             })?;
 
@@ -290,8 +328,8 @@ impl NodeGraph {
             .remove(&edge_id)
             .ok_or("Edge does not exist")?;
 
-        let from_node_id = edge.from_node;
-        let to_node_id = edge.to_node;
+        let from_node_id = edge.from_node_id;
+        let to_node_id = edge.to_node_id;
 
         if let Some(node) = self.nodes.get_mut(&from_node_id) {
             if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
@@ -318,16 +356,16 @@ impl NodeGraph {
             .get(&edge_id)
             .ok_or("Edge does not exist")?;
 
-        let old_from_node_id = old_edge.from_node;
-        let old_to_node_id = old_edge.to_node;
+        let old_from_node_id = old_edge.from_node_id;
+        let old_to_node_id = old_edge.to_node_id;
 
         let new_from_node = self
             .nodes
-            .get(&new_edge.from_node)
+            .get(&new_edge.from_node_id)
             .ok_or("New from_node does not exist")?;
         let new_to_node = self
             .nodes
-            .get(&new_edge.to_node)
+            .get(&new_edge.to_node_id)
             .ok_or("New to_node does not exist")?;
 
         let new_from_slot = new_from_node
@@ -353,13 +391,13 @@ impl NodeGraph {
             }
         }
 
-        if let Some(node) = self.nodes.get_mut(&new_edge.from_node) {
+        if let Some(node) = self.nodes.get_mut(&new_edge.from_node_id) {
             if let Some(slot) = node.get_output_slot_by_index_mut(new_edge.from_output_slot_index) {
                 slot.connected_edges.push(edge_id);
             }
         }
 
-        if let Some(node) = self.nodes.get_mut(&new_edge.to_node) {
+        if let Some(node) = self.nodes.get_mut(&new_edge.to_node_id) {
             if let Some(slot) = node.get_input_slot_by_index_mut(new_edge.to_input_slot_index) {
                 slot.connected_edges.push(edge_id);
             }
@@ -368,8 +406,8 @@ impl NodeGraph {
         let affected_nodes = self.collect_affected_nodes(vec![
             old_from_node_id,
             old_to_node_id,
-            new_edge.from_node,
-            new_edge.to_node,
+            new_edge.from_node_id,
+            new_edge.to_node_id,
         ]);
         self.mark_affected_nodes(affected_nodes);
 
@@ -387,7 +425,7 @@ impl NodeGraph {
             let affected_nodes = self.collect_affected_nodes(vec![node_id]);
             self.context
                 .edges
-                .retain(|_, edge| edge.from_node != node_id && edge.to_node != node_id);
+                .retain(|_, edge| edge.from_node_id != node_id && edge.to_node_id != node_id);
             self.mark_affected_nodes(affected_nodes);
             Ok(())
         } else {
@@ -432,8 +470,8 @@ impl NodeGraph {
         while let Some(node_id) = queue.pop_front() {
             if affected.insert(node_id) {
                 for edge in self.context.edges.values() {
-                    if edge.from_node == node_id && !affected.contains(&edge.to_node) {
-                        queue.push_back(edge.to_node);
+                    if edge.from_node_id == node_id && !affected.contains(&edge.to_node_id) {
+                        queue.push_back(edge.to_node_id);
                     }
                 }
             }
@@ -499,22 +537,11 @@ mod tests {
         let node2_id = node_graph.add_node(node2);
         let node3_id = node_graph.add_node(node3);
 
-        node_graph
-            .add_edge(Edge {
-                from_node: node1_id,
-                from_output_slot_index: 0,
-                to_node: node2_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
-        node_graph
-            .add_edge(Edge {
-                from_node: node2_id,
-                from_output_slot_index: 0,
-                to_node: node3_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
+        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
+        let edge_2_3 = node_graph.create_edge(node2_id, 0, node3_id, 0).unwrap();
+
+        node_graph.add_edge(edge_1_2).unwrap();
+        node_graph.add_edge(edge_2_3).unwrap();
 
         assert!(node_graph.execute().is_ok());
     }
@@ -531,22 +558,11 @@ mod tests {
         let node2_id = node_graph.add_node(node2);
         let node3_id = node_graph.add_node(node3);
 
-        node_graph
-            .add_edge(Edge {
-                from_node: node1_id,
-                from_output_slot_index: 0,
-                to_node: node2_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
-        node_graph
-            .add_edge(Edge {
-                from_node: node2_id,
-                from_output_slot_index: 0,
-                to_node: node3_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
+        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
+        let edge_2_3 = node_graph.create_edge(node2_id, 0, node3_id, 0).unwrap();
+
+        node_graph.add_edge(edge_1_2).unwrap();
+        node_graph.add_edge(edge_2_3).unwrap();
 
         let sorted = node_graph.topological_sort().unwrap();
         assert_eq!(sorted, vec![node1_id, node2_id, node3_id]);
@@ -562,22 +578,11 @@ mod tests {
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
 
-        node_graph
-            .add_edge(Edge {
-                from_node: node1_id,
-                from_output_slot_index: 0,
-                to_node: node2_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
-        node_graph
-            .add_edge(Edge {
-                from_node: node2_id,
-                from_output_slot_index: 0,
-                to_node: node1_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
+        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
+        let edge_2_1 = node_graph.create_edge(node2_id, 0, node1_id, 0).unwrap();
+
+        node_graph.add_edge(edge_1_2).unwrap();
+        node_graph.add_edge(edge_2_1).unwrap();
 
         assert!(node_graph.topological_sort().is_err());
     }
@@ -610,14 +615,9 @@ mod tests {
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
 
-        let edge_id = node_graph
-            .add_edge(Edge {
-                from_node: node1_id,
-                from_output_slot_index: 0,
-                to_node: node2_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
+        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
+
+        let edge_id = node_graph.add_edge(edge_1_2).unwrap();
 
         assert!(node_graph.get_edge(edge_id).is_some());
     }
@@ -631,13 +631,9 @@ mod tests {
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
 
-        let edge = Edge {
-            from_node: node1_id,
-            from_output_slot_index: 0,
-            to_node: node2_id,
-            to_input_slot_index: 0,
-        };
-        let edge_id = node_graph.add_edge(edge).unwrap();
+        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
+
+        let edge_id = node_graph.add_edge(edge_1_2).unwrap();
 
         assert!(node_graph.remove_edge(edge_id).is_ok());
         assert!(!node_graph.context.edges.contains_key(&edge_id));
@@ -655,26 +651,16 @@ mod tests {
         let node2_id = node_graph.add_node(node2);
         let node3_id = node_graph.add_node(node3);
 
-        node_graph
-            .add_edge(Edge {
-                from_node: node1_id,
-                from_output_slot_index: 0,
-                to_node: node2_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
-        node_graph
-            .add_edge(Edge {
-                from_node: node2_id,
-                from_output_slot_index: 0,
-                to_node: node3_id,
-                to_input_slot_index: 0,
-            })
-            .unwrap();
+        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
+        let edge_2_3 = node_graph.create_edge(node2_id, 0, node3_id, 0).unwrap();
+
+        node_graph.add_edge(edge_1_2).unwrap();
+        node_graph.add_edge(edge_2_3).unwrap();
 
         node_graph.execute().unwrap();
 
         println!("--- first execute finished---");
+        println!("{:?}", node_graph);
 
         node_graph
             .update_node(node2_id, AddNode::initialize())

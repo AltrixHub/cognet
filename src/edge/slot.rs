@@ -45,14 +45,14 @@ pub enum SlotId {
     Output(OutputSlotId),
 }
 
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq, Default, Clone)]
 pub enum DataType {
     #[default]
     Number,
     String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InputSlot {
     pub id: InputSlotId,
     pub label: &'static str,
@@ -60,7 +60,7 @@ pub struct InputSlot {
     pub connected_edges: Vec<EdgeId>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct OutputSlot {
     pub id: OutputSlotId,
     pub label: &'static str,
