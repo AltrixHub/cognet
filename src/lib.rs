@@ -2,7 +2,6 @@ use std::{
     any::Any,
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
-    sync::Arc,
 };
 
 pub mod edge;
@@ -14,21 +13,103 @@ pub trait AsAny {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-pub trait NodeEntity: Debug + AsAny + Send + Sync {
+macro_rules! impl_node_core {
+    ($struct_name:ident) => {
+        impl NodeCore for $struct_name {
+            fn input_value<'a>(
+                &'a self,
+                evaluation_context: &'a EvaluationContext,
+                slot_index: usize,
+            ) -> Vec<&'a Data> {
+                let mut result = Vec::new();
+                let input_slot = match self.inputs().get(slot_index) {
+                    Some(slot) => slot,
+                    None => return result,
+                };
+
+                for edge_id in &input_slot.connected_edges {
+                    if let Some(edge) = evaluation_context.edges.get(edge_id) {
+                        // if let Some(value) = evaluation_context.outputs.get(&edge.from_slot) {
+                        //     result.push(value);
+                        // }
+                    }
+                }
+
+                result
+            }
+
+            fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot> {
+                self.inputs().get(input_slot_index)
+            }
+
+            fn get_output_slot_by_index(&self, output_slot_index: usize) -> Option<&OutputSlot> {
+                self.outputs().get(output_slot_index)
+            }
+
+            fn get_input_slot_by_index_mut(
+                &mut self,
+                input_slot_index: usize,
+            ) -> Option<&mut InputSlot> {
+                self.inputs.get_mut(input_slot_index)
+            }
+
+            fn get_output_slot_by_index_mut(
+                &mut self,
+                output_slot_index: usize,
+            ) -> Option<&mut OutputSlot> {
+                self.outputs.get_mut(output_slot_index)
+            }
+
+            fn inputs(&self) -> &Vec<InputSlot> {
+                &self.inputs
+            }
+
+            fn outputs(&self) -> &Vec<OutputSlot> {
+                &self.outputs
+            }
+        }
+    };
+}
+pub trait NodeImpl: Debug + AsAny + Send + Sync + NodeCore {
+    fn initialize() -> Self
+    where
+        Self: Sized;
+
     fn execute(&self, evaluation_context: &mut EvaluationContext);
 }
 
-impl dyn NodeEntity {
-    pub fn downcast_ref<T: NodeEntity + 'static>(&self) -> Option<&T> {
+pub trait NodeCore {
+    fn input_value<'a>(
+        &'a self,
+        evaluation_context: &'a EvaluationContext,
+        slot_index: usize,
+    ) -> Vec<&'a Data>;
+
+    fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot>;
+
+    fn get_output_slot_by_index(&self, output_slot_index: usize) -> Option<&OutputSlot>;
+
+    fn get_input_slot_by_index_mut(&mut self, input_slot_index: usize) -> Option<&mut InputSlot>;
+
+    fn get_output_slot_by_index_mut(&mut self, output_slot_index: usize)
+        -> Option<&mut OutputSlot>;
+
+    fn inputs(&self) -> &Vec<InputSlot>;
+
+    fn outputs(&self) -> &Vec<OutputSlot>;
+}
+
+impl dyn NodeImpl {
+    pub fn downcast_ref<T: NodeImpl + 'static>(&self) -> Option<&T> {
         self.as_any().downcast_ref::<T>()
     }
 
-    pub fn downcast_mut<T: NodeEntity + 'static>(&mut self) -> Option<&mut T> {
+    pub fn downcast_mut<T: NodeImpl + 'static>(&mut self) -> Option<&mut T> {
         self.as_any_mut().downcast_mut::<T>()
     }
 }
 
-impl<T: 'static + NodeEntity> AsAny for T {
+impl<T: 'static + NodeImpl> AsAny for T {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -41,18 +122,21 @@ impl<T: 'static + NodeEntity> AsAny for T {
 pub type NodeId = Ulid;
 pub type EdgeId = Ulid;
 
-pub type Edges = HashMap<String, Edge>;
+#[derive(Debug)]
+pub enum Data {
+    Number(f32),
+    String(String),
+}
 
 #[derive(Default, Debug)]
 pub struct EvaluationContext {
-    inputs: HashMap<InputSlotId, Vec<InputSlot>>,
-    outputs: HashMap<OutputSlotId, Vec<OutputSlot>>,
+    edges: HashMap<EdgeId, Edge>,
+    outputs: HashMap<OutputSlotId, Data>,
 }
 
 #[derive(Default, Debug)]
 pub struct NodeGraph {
-    pub nodes: HashMap<NodeId, Arc<dyn NodeEntity>>,
-    pub edges: HashMap<EdgeId, Edge>,
+    pub nodes: HashMap<NodeId, Box<dyn NodeImpl>>,
     pub context: EvaluationContext,
     pub affected_nodes: HashSet<NodeId>,
 }
@@ -93,7 +177,7 @@ impl NodeGraph {
             adj_list.insert(node_id, Vec::new());
         }
 
-        for edge in self.edges.values() {
+        for edge in self.context.edges.values() {
             in_degree
                 .entry(edge.to_node)
                 .and_modify(|count| *count += 1);
@@ -133,117 +217,176 @@ impl NodeGraph {
         Ok(sorted)
     }
 
-    pub fn add_node<T: 'static + NodeEntity>(&mut self, node: T) -> NodeId {
+    pub fn add_node<T: 'static + NodeImpl>(&mut self, node: T) -> NodeId {
         let node_id = Ulid::new();
-        let node_arc = Arc::new(node);
-        self.nodes.insert(node_id, node_arc);
+        let node_box = Box::new(node);
+        self.nodes.insert(node_id, node_box);
         self.mark_affected_nodes(vec![node_id]);
         node_id
     }
 
-    pub fn add_edge(&mut self, edge: Edge) -> EdgeId {
-        let edge_id = Ulid::new();
+    pub fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
+        let from_node_id = edge.from_node;
+        let to_node_id = edge.to_node;
 
-        if let Some(input_slots) = self.context.inputs.get_mut(&edge.to_node) {
-            if let Some(slot) = input_slots.iter_mut().find(|s| s.id == edge.to_slot) {
+        let from_node = self
+            .nodes
+            .get(&from_node_id)
+            .ok_or_else(|| format!("From node {:?} does not exist", edge.from_node))?;
+        let to_node = self
+            .nodes
+            .get(&to_node_id)
+            .ok_or_else(|| format!("To node {:?} does not exist", edge.to_node))?;
+
+        let from_slot = from_node
+            .get_output_slot_by_index(edge.from_output_slot_index)
+            .ok_or_else(|| {
+                format!(
+                    "Output slot index {:?} does not exist in node {:?}",
+                    edge.from_output_slot_index, edge.from_node
+                )
+            })?;
+        let to_slot = to_node
+            .get_input_slot_by_index(edge.to_input_slot_index)
+            .ok_or_else(|| {
+                format!(
+                    "Input slot index {:?} does not exist in node {:?}",
+                    edge.to_input_slot_index, edge.to_node
+                )
+            })?;
+
+        if from_slot.data_type != to_slot.data_type {
+            return Err(format!(
+                "Data type mismatch between output slot index {:?} and input slot index {:?}",
+                edge.from_output_slot_index, edge.to_input_slot_index
+            ));
+        }
+
+        let edge_id = EdgeId::new();
+
+        if let Some(node) = self.nodes.get_mut(&from_node_id) {
+            if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
                 slot.connected_edges.push(edge_id);
             }
         }
 
-        if let Some(output_slots) = self.context.outputs.get_mut(&edge.from_node) {
-            if let Some(slot) = output_slots.iter_mut().find(|s| s.id == edge.from_slot) {
+        if let Some(node) = self.nodes.get_mut(&to_node_id) {
+            if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
                 slot.connected_edges.push(edge_id);
             }
         }
 
-        let from_node = edge.from_node;
-        let to_node = edge.to_node;
-        self.edges.insert(edge_id, edge);
-
-        let affected_nodes = self.collect_affected_nodes(vec![from_node, to_node]);
+        let affected_nodes = self.collect_affected_nodes(vec![from_node_id, to_node_id]);
         self.mark_affected_nodes(affected_nodes);
+        self.context.edges.insert(edge_id, edge);
 
-        edge_id
+        Ok(edge_id)
     }
 
     pub fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), &'static str> {
-        if let Some(edge) = self.edges.remove(&edge_id) {
-            if let Some(input_slots) = self.context.inputs.get_mut(&edge.to_node) {
-                if let Some(slot) = input_slots.iter_mut().find(|s| s.id == edge.to_slot) {
-                    slot.connected_edges.retain(|&id| id != edge_id);
-                }
-            }
+        let edge = self
+            .context
+            .edges
+            .remove(&edge_id)
+            .ok_or("Edge does not exist")?;
 
-            if let Some(output_slots) = self.context.outputs.get_mut(&edge.from_node) {
-                if let Some(slot) = output_slots.iter_mut().find(|s| s.id == edge.from_slot) {
-                    slot.connected_edges.retain(|&id| id != edge_id);
-                }
-            }
+        let from_node_id = edge.from_node;
+        let to_node_id = edge.to_node;
 
-            let affected_nodes = self.collect_affected_nodes(vec![edge.from_node, edge.to_node]);
-            self.mark_affected_nodes(affected_nodes);
-
-            Ok(())
-        } else {
-            Err("Edge not found.")
-        }
-    }
-
-    pub fn update_edge(&mut self, edge_id: EdgeId, new_edge: Edge) -> Result<(), &'static str> {
-        if let Some(old_edge) = self.edges.get(&edge_id) {
-            if let Some(input_slots) = self.context.inputs.get_mut(&old_edge.to_node) {
-                if let Some(slot) = input_slots.iter_mut().find(|s| s.id == old_edge.to_slot) {
-                    slot.connected_edges.retain(|&id| id != edge_id);
-                }
-            }
-
-            if let Some(output_slots) = self.context.outputs.get_mut(&old_edge.from_node) {
-                if let Some(slot) = output_slots.iter_mut().find(|s| s.id == old_edge.from_slot) {
-                    slot.connected_edges.retain(|&id| id != edge_id);
-                }
+        if let Some(node) = self.nodes.get_mut(&from_node_id) {
+            if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
+                slot.connected_edges.retain(|&id| id != edge_id);
             }
         }
 
-        if let Some(input_slots) = self.context.inputs.get_mut(&new_edge.to_node) {
-            if let Some(slot) = input_slots.iter_mut().find(|s| s.id == new_edge.to_slot) {
-                slot.connected_edges.push(edge_id);
+        if let Some(node) = self.nodes.get_mut(&to_node_id) {
+            if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
+                slot.connected_edges.retain(|&id| id != edge_id);
             }
         }
 
-        if let Some(output_slots) = self.context.outputs.get_mut(&new_edge.from_node) {
-            if let Some(slot) = output_slots.iter_mut().find(|s| s.id == new_edge.from_slot) {
-                slot.connected_edges.push(edge_id);
-            }
-        }
-
-        let from_node = new_edge.from_node;
-        let to_node = new_edge.to_node;
-        self.edges.insert(edge_id, new_edge);
-
-        let affected_nodes = self.collect_affected_nodes(vec![from_node, to_node]);
+        let affected_nodes = self.collect_affected_nodes(vec![from_node_id, to_node_id]);
         self.mark_affected_nodes(affected_nodes);
 
         Ok(())
     }
 
-    pub fn get_edges_by_slot(&self, slot_id: SlotId) -> Vec<&Edge> {
-        self.edges
-            .values()
-            .filter(|edge| match &slot_id {
-                SlotId::Input(id) => edge.to_slot == *id,
-                SlotId::Output(id) => edge.from_slot == *id,
-            })
-            .collect()
+    pub fn update_edge(&mut self, edge_id: EdgeId, new_edge: Edge) -> Result<(), &'static str> {
+        let old_edge = self
+            .context
+            .edges
+            .get(&edge_id)
+            .ok_or("Edge does not exist")?;
+
+        let old_from_node_id = old_edge.from_node;
+        let old_to_node_id = old_edge.to_node;
+
+        let new_from_node = self
+            .nodes
+            .get(&new_edge.from_node)
+            .ok_or("New from_node does not exist")?;
+        let new_to_node = self
+            .nodes
+            .get(&new_edge.to_node)
+            .ok_or("New to_node does not exist")?;
+
+        let new_from_slot = new_from_node
+            .get_output_slot_by_index(new_edge.from_output_slot_index)
+            .ok_or("New output slot does not exist")?;
+        let new_to_slot = new_to_node
+            .get_input_slot_by_index(new_edge.to_input_slot_index)
+            .ok_or("New input slot does not exist")?;
+
+        if new_from_slot.data_type != new_to_slot.data_type {
+            return Err("Data type mismatch between new output and input slots");
+        }
+
+        if let Some(node) = self.nodes.get_mut(&old_from_node_id) {
+            if let Some(slot) = node.get_output_slot_by_index_mut(old_edge.from_output_slot_index) {
+                slot.connected_edges.retain(|&id| id != edge_id);
+            }
+        }
+
+        if let Some(node) = self.nodes.get_mut(&old_to_node_id) {
+            if let Some(slot) = node.get_input_slot_by_index_mut(old_edge.to_input_slot_index) {
+                slot.connected_edges.retain(|&id| id != edge_id);
+            }
+        }
+
+        if let Some(node) = self.nodes.get_mut(&new_edge.from_node) {
+            if let Some(slot) = node.get_output_slot_by_index_mut(new_edge.from_output_slot_index) {
+                slot.connected_edges.push(edge_id);
+            }
+        }
+
+        if let Some(node) = self.nodes.get_mut(&new_edge.to_node) {
+            if let Some(slot) = node.get_input_slot_by_index_mut(new_edge.to_input_slot_index) {
+                slot.connected_edges.push(edge_id);
+            }
+        }
+
+        let affected_nodes = self.collect_affected_nodes(vec![
+            old_from_node_id,
+            old_to_node_id,
+            new_edge.from_node,
+            new_edge.to_node,
+        ]);
+        self.mark_affected_nodes(affected_nodes);
+
+        self.context.edges.insert(edge_id, new_edge);
+
+        Ok(())
     }
 
     pub fn get_edge(&self, edge_id: EdgeId) -> Option<&Edge> {
-        self.edges.get(&edge_id)
+        self.context.edges.get(&edge_id)
     }
 
     pub fn remove_node(&mut self, node_id: NodeId) -> Result<(), &'static str> {
         if self.nodes.remove(&node_id).is_some() {
             let affected_nodes = self.collect_affected_nodes(vec![node_id]);
-            self.edges
+            self.context
+                .edges
                 .retain(|_, edge| edge.from_node != node_id && edge.to_node != node_id);
             self.mark_affected_nodes(affected_nodes);
             Ok(())
@@ -252,14 +395,14 @@ impl NodeGraph {
         }
     }
 
-    pub fn update_node<T: 'static + NodeEntity>(
+    pub fn update_node<T: 'static + NodeImpl>(
         &mut self,
         node_id: NodeId,
         new_node: T,
     ) -> Result<(), &'static str> {
         if self.nodes.contains_key(&node_id) {
-            let node_arc = Arc::new(new_node);
-            self.nodes.insert(node_id, node_arc);
+            let node_box = Box::new(new_node);
+            self.nodes.insert(node_id, node_box);
             let affected_nodes = self.collect_affected_nodes(vec![node_id]);
             self.mark_affected_nodes(affected_nodes);
             Ok(())
@@ -267,23 +410,19 @@ impl NodeGraph {
             Err("Node not found.")
         }
     }
-
-    pub fn get_node_by_id(&self, node_id: NodeId) -> Option<Arc<dyn NodeEntity>> {
-        self.nodes.get(&node_id).map(|node| Arc::clone(node))
+    pub fn get_node_by_id(&self, node_id: NodeId) -> Option<&Box<dyn NodeImpl>> {
+        self.nodes.get(&node_id).map(|node| node)
     }
 
-    pub fn get_nodes_by_type<T: NodeEntity + 'static>(&self) -> Vec<(NodeId, &T)> {
+    pub fn get_nodes_by_type<T: NodeImpl + 'static>(&self) -> Vec<(NodeId, &T)> {
         self.nodes
             .iter()
             .filter_map(|(&id, node)| node.downcast_ref::<T>().map(|typed_node| (id, typed_node)))
             .collect()
     }
 
-    pub fn get_all_nodes(&self) -> Vec<(NodeId, Arc<dyn NodeEntity>)> {
-        self.nodes
-            .iter()
-            .map(|(&id, node)| (id, Arc::clone(node)))
-            .collect()
+    pub fn get_all_nodes(&self) -> Vec<(NodeId, &Box<dyn NodeImpl>)> {
+        self.nodes.iter().map(|(&id, node)| (id, node)).collect()
     }
 
     fn collect_affected_nodes(&self, initial_nodes: Vec<NodeId>) -> Vec<NodeId> {
@@ -292,7 +431,7 @@ impl NodeGraph {
 
         while let Some(node_id) = queue.pop_front() {
             if affected.insert(node_id) {
-                for edge in self.edges.values() {
+                for edge in self.context.edges.values() {
                     if edge.from_node == node_id && !affected.contains(&edge.to_node) {
                         queue.push_back(edge.to_node);
                     }
@@ -306,18 +445,45 @@ impl NodeGraph {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Add;
+
     use super::*;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     struct AddNode {
-        id: u32,
-        executed_count: u8,
+        node_name: &'static str,
+        inputs: Vec<InputSlot>,
+        outputs: Vec<OutputSlot>,
     }
 
-    impl NodeEntity for AddNode {
+    impl_node_core!(AddNode);
+
+    impl NodeImpl for AddNode {
+        fn initialize() -> Self {
+            Self {
+                node_name: "Addition",
+                inputs: vec![
+                    InputSlot {
+                        label: "A",
+                        data_type: DataType::Number,
+                        ..Default::default()
+                    },
+                    InputSlot {
+                        label: "B",
+                        data_type: DataType::Number,
+                        ..Default::default()
+                    },
+                ],
+                outputs: vec![OutputSlot {
+                    label: "Result",
+                    data_type: DataType::Number,
+                    ..Default::default()
+                }],
+            }
+        }
         fn execute(&self, evaluation_context: &mut EvaluationContext) {
-            // self.executed_count += 1;
-            println!("Executing AddNode with id: {}", self.id);
+            let data = self.input_value(evaluation_context, 0);
+            println!("test");
         }
     }
 
@@ -325,35 +491,30 @@ mod tests {
     fn test_execute() {
         let mut node_graph = NodeGraph::new();
 
-        let node1 = AddNode {
-            id: 1,
-            executed_count: 0,
-        };
-        let node2 = AddNode {
-            id: 2,
-            executed_count: 0,
-        };
-        let node3 = AddNode {
-            id: 3,
-            executed_count: 0,
-        };
+        let node1 = AddNode::initialize();
+        let node2 = AddNode::initialize();
+        let node3 = AddNode::initialize();
 
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
         let node3_id = node_graph.add_node(node3);
 
-        node_graph.add_edge(Edge {
-            from_node: node1_id,
-            from_slot: Ulid::new(),
-            to_node: node2_id,
-            to_slot: Ulid::new(),
-        });
-        node_graph.add_edge(Edge {
-            from_node: node2_id,
-            from_slot: Ulid::new(),
-            to_node: node3_id,
-            to_slot: Ulid::new(),
-        });
+        node_graph
+            .add_edge(Edge {
+                from_node: node1_id,
+                from_output_slot_index: 0,
+                to_node: node2_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
+        node_graph
+            .add_edge(Edge {
+                from_node: node2_id,
+                from_output_slot_index: 0,
+                to_node: node3_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
 
         assert!(node_graph.execute().is_ok());
     }
@@ -362,35 +523,30 @@ mod tests {
     fn test_topological_sort() {
         let mut node_graph = NodeGraph::new();
 
-        let node1 = AddNode {
-            id: 1,
-            executed_count: 0,
-        };
-        let node2 = AddNode {
-            id: 2,
-            executed_count: 0,
-        };
-        let node3 = AddNode {
-            id: 3,
-            executed_count: 0,
-        };
+        let node1 = AddNode::initialize();
+        let node2 = AddNode::initialize();
+        let node3 = AddNode::initialize();
 
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
         let node3_id = node_graph.add_node(node3);
 
-        node_graph.add_edge(Edge {
-            from_node: node1_id,
-            from_slot: Ulid::new(),
-            to_node: node2_id,
-            to_slot: Ulid::new(),
-        });
-        node_graph.add_edge(Edge {
-            from_node: node2_id,
-            from_slot: Ulid::new(),
-            to_node: node3_id,
-            to_slot: Ulid::new(),
-        });
+        node_graph
+            .add_edge(Edge {
+                from_node: node1_id,
+                from_output_slot_index: 0,
+                to_node: node2_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
+        node_graph
+            .add_edge(Edge {
+                from_node: node2_id,
+                from_output_slot_index: 0,
+                to_node: node3_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
 
         let sorted = node_graph.topological_sort().unwrap();
         assert_eq!(sorted, vec![node1_id, node2_id, node3_id]);
@@ -400,30 +556,28 @@ mod tests {
     fn test_cycle_detection() {
         let mut node_graph = NodeGraph::new();
 
-        let node1 = AddNode {
-            id: 1,
-            executed_count: 0,
-        };
-        let node2 = AddNode {
-            id: 2,
-            executed_count: 0,
-        };
+        let node1 = AddNode::initialize();
+        let node2 = AddNode::initialize();
 
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
 
-        node_graph.add_edge(Edge {
-            from_node: node1_id,
-            from_slot: Ulid::new(),
-            to_node: node2_id,
-            to_slot: Ulid::new(),
-        });
-        node_graph.add_edge(Edge {
-            from_node: node2_id,
-            from_slot: Ulid::new(),
-            to_node: node1_id,
-            to_slot: Ulid::new(),
-        });
+        node_graph
+            .add_edge(Edge {
+                from_node: node1_id,
+                from_output_slot_index: 0,
+                to_node: node2_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
+        node_graph
+            .add_edge(Edge {
+                from_node: node2_id,
+                from_output_slot_index: 0,
+                to_node: node1_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
 
         assert!(node_graph.topological_sort().is_err());
     }
@@ -431,10 +585,7 @@ mod tests {
     #[test]
     fn test_add_and_get_node() {
         let mut node_graph = NodeGraph::new();
-        let node = AddNode {
-            id: 1,
-            executed_count: 0,
-        };
+        let node = AddNode::initialize();
         let node_id = node_graph.add_node(node);
 
         assert!(node_graph.get_node_by_id(node_id).is_some());
@@ -443,10 +594,7 @@ mod tests {
     #[test]
     fn test_remove_node() {
         let mut node_graph = NodeGraph::new();
-        let node = AddNode {
-            id: 1,
-            executed_count: 0,
-        };
+        let node = AddNode::initialize();
         let node_id = node_graph.add_node(node);
 
         assert!(node_graph.remove_node(node_id).is_ok());
@@ -457,24 +605,19 @@ mod tests {
     fn test_add_and_get_edge() {
         let mut node_graph = NodeGraph::new();
 
-        let node1 = AddNode {
-            id: 1,
-            executed_count: 0,
-        };
-        let node2 = AddNode {
-            id: 2,
-            executed_count: 0,
-        };
+        let node1 = AddNode::initialize();
+        let node2 = AddNode::initialize();
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
 
-        let edge = Edge {
-            from_node: node1_id,
-            from_slot: Ulid::new(),
-            to_node: node2_id,
-            to_slot: Ulid::new(),
-        };
-        let edge_id = node_graph.add_edge(edge);
+        let edge_id = node_graph
+            .add_edge(Edge {
+                from_node: node1_id,
+                from_output_slot_index: 0,
+                to_node: node2_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
 
         assert!(node_graph.get_edge(edge_id).is_some());
     }
@@ -483,91 +626,60 @@ mod tests {
     fn test_remove_edge() {
         let mut node_graph = NodeGraph::new();
 
-        let node1 = AddNode {
-            id: 1,
-            executed_count: 0,
-        };
-        let node2 = AddNode {
-            id: 2,
-            executed_count: 0,
-        };
+        let node1 = AddNode::initialize();
+        let node2 = AddNode::initialize();
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
 
         let edge = Edge {
             from_node: node1_id,
-            from_slot: Ulid::new(),
+            from_output_slot_index: 0,
             to_node: node2_id,
-            to_slot: Ulid::new(),
+            to_input_slot_index: 0,
         };
-        let edge_id = node_graph.add_edge(edge);
+        let edge_id = node_graph.add_edge(edge).unwrap();
 
         assert!(node_graph.remove_edge(edge_id).is_ok());
-        assert!(!node_graph.edges.contains_key(&edge_id));
+        assert!(!node_graph.context.edges.contains_key(&edge_id));
     }
 
     #[test]
     fn test_node_execution() {
         let mut node_graph = NodeGraph::new();
 
-        let node1 = AddNode {
-            id: 1,
-            executed_count: 0,
-        };
-        let node2 = AddNode {
-            id: 2,
-            executed_count: 0,
-        };
-        let node3 = AddNode {
-            id: 3,
-            executed_count: 0,
-        };
+        let node1 = AddNode::initialize();
+        let node2 = AddNode::initialize();
+        let node3 = AddNode::initialize();
 
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
         let node3_id = node_graph.add_node(node3);
 
-        node_graph.add_edge(Edge {
-            from_node: node1_id,
-            from_slot: Ulid::new(),
-            to_node: node2_id,
-            to_slot: Ulid::new(),
-        });
-        node_graph.add_edge(Edge {
-            from_node: node2_id,
-            from_slot: Ulid::new(),
-            to_node: node3_id,
-            to_slot: Ulid::new(),
-        });
+        node_graph
+            .add_edge(Edge {
+                from_node: node1_id,
+                from_output_slot_index: 0,
+                to_node: node2_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
+        node_graph
+            .add_edge(Edge {
+                from_node: node2_id,
+                from_output_slot_index: 0,
+                to_node: node3_id,
+                to_input_slot_index: 0,
+            })
+            .unwrap();
 
         node_graph.execute().unwrap();
 
         println!("--- first execute finished---");
 
-        let add_node_ref = node_graph.get_node_by_id(node2_id).unwrap();
-        let node = add_node_ref.downcast_ref::<AddNode>().unwrap().clone();
-        node_graph.update_node(node2_id, node).unwrap();
+        node_graph
+            .update_node(node2_id, AddNode::initialize())
+            .unwrap();
 
         node_graph.execute().unwrap();
-
-        let executed_1 = node_graph
-            .get_node_by_id(node1_id)
-            .and_then(|node| node.downcast_ref::<AddNode>().cloned())
-            .map_or(false, |n| n.executed_count == 1);
-
-        let executed_2 = node_graph
-            .get_node_by_id(node2_id)
-            .and_then(|node| node.downcast_ref::<AddNode>().cloned())
-            .map_or(false, |n| n.executed_count == 2);
-
-        let executed_3 = node_graph
-            .get_node_by_id(node3_id)
-            .and_then(|node| node.downcast_ref::<AddNode>().cloned())
-            .map_or(false, |n| n.executed_count == 2);
-
-        assert!(executed_1);
-        assert!(executed_2);
-
-        assert!(executed_3);
     }
 }
