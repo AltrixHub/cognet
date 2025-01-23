@@ -20,11 +20,11 @@ macro_rules! impl_node_core {
                 &'a self,
                 evaluation_context: &'a EvaluationContext,
                 slot_index: usize,
-            ) -> Vec<&'a Data> {
+            ) -> Result<Vec<&'a Data>, String> {
                 let mut result = Vec::new();
                 let input_slot = match self.inputs().get(slot_index) {
                     Some(slot) => slot,
-                    None => return result,
+                    None => return Err("Invalid slot index".to_string()),
                 };
 
                 for edge_id in &input_slot.connected_edges {
@@ -37,7 +37,46 @@ macro_rules! impl_node_core {
                     }
                 }
 
-                result
+                Ok(result)
+            }
+
+            fn set_output_value(
+                &self,
+                evaluation_context: &mut EvaluationContext,
+                slot_index: usize,
+                value: &dyn Any,
+            ) -> Result<(), String> {
+                match self.outputs().get(slot_index) {
+                    Some(slot) => match slot.data_type {
+                        DataType::Number => {
+                            if let Some(value) = value.downcast_ref::<f32>() {
+                                evaluation_context
+                                    .outputs
+                                    .insert(OutputSlotId::new(), Data::Number(*value));
+                                Ok(())
+                            } else {
+                                return Err(format!(
+                                    "Type mismatch: expected f32, but got {:?}",
+                                    value.type_id()
+                                ));
+                            }
+                        }
+                        DataType::String => {
+                            if let Some(value) = value.downcast_ref::<String>() {
+                                evaluation_context
+                                    .outputs
+                                    .insert(OutputSlotId::new(), Data::String(value.clone()));
+                                Ok(())
+                            } else {
+                                return Err(format!(
+                                    "Type mismatch: expected String, but got {:?}",
+                                    value.type_id()
+                                ));
+                            }
+                        }
+                    },
+                    None => return Err("Invalid value index".to_string()),
+                }
             }
 
             fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot> {
@@ -72,6 +111,15 @@ macro_rules! impl_node_core {
         }
     };
 }
+
+macro_rules! impl_primitive_node_core {
+    ($struct_name:ident) => {
+        impl NodePrimitive for $struct_name {}
+
+        impl_node_core!($struct_name);
+    };
+}
+
 pub trait NodeImpl: Debug + AsAny + Send + Sync + NodeCore {
     fn initialize() -> Self
     where
@@ -80,18 +128,35 @@ pub trait NodeImpl: Debug + AsAny + Send + Sync + NodeCore {
     fn execute(&self, evaluation_context: &mut EvaluationContext);
 }
 
+pub trait NodePrimitive: NodeCore {
+    fn set_default_value(
+        &self,
+        evaluation_context: &mut EvaluationContext,
+        value: &dyn Any,
+    ) -> Result<(), String> {
+        self.set_output_value(evaluation_context, 0, value)
+    }
+}
+
 pub trait NodeCore {
     fn input_value<'a>(
         &'a self,
         evaluation_context: &'a EvaluationContext,
         slot_index: usize,
-    ) -> Vec<&'a Data>;
+    ) -> Result<Vec<&'a Data>, String>;
 
     fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot>;
 
     fn get_output_slot_by_index(&self, output_slot_index: usize) -> Option<&OutputSlot>;
 
     fn get_input_slot_by_index_mut(&mut self, input_slot_index: usize) -> Option<&mut InputSlot>;
+
+    fn set_output_value(
+        &self,
+        evaluation_context: &mut EvaluationContext,
+        slot_index: usize,
+        value: &dyn Any,
+    ) -> Result<(), String>;
 
     fn get_output_slot_by_index_mut(&mut self, output_slot_index: usize)
         -> Option<&mut OutputSlot>;
@@ -481,64 +546,95 @@ impl NodeGraph {
     }
 }
 
+#[derive(Debug)]
+struct AddNode {
+    node_name: &'static str,
+    inputs: Vec<InputSlot>,
+    outputs: Vec<OutputSlot>,
+}
+
+impl_node_core!(AddNode);
+
+impl NodeImpl for AddNode {
+    fn initialize() -> Self {
+        Self {
+            node_name: "Addition",
+            inputs: vec![
+                InputSlot {
+                    label: "A",
+                    data_type: DataType::Number,
+                    ..Default::default()
+                },
+                InputSlot {
+                    label: "B",
+                    data_type: DataType::Number,
+                    ..Default::default()
+                },
+            ],
+            outputs: vec![OutputSlot {
+                label: "Result",
+                data_type: DataType::Number,
+                ..Default::default()
+            }],
+        }
+    }
+    fn execute(&self, evaluation_context: &mut EvaluationContext) {
+        let data = self.input_value(evaluation_context, 0);
+        println!("data {:?}", data);
+    }
+}
+
+#[derive(Debug)]
+struct NumberNode {
+    node_name: &'static str,
+    inputs: Vec<InputSlot>,
+    outputs: Vec<OutputSlot>,
+}
+
+impl_primitive_node_core!(NumberNode);
+
+impl NodeImpl for NumberNode {
+    fn initialize() -> Self {
+        Self {
+            node_name: "Number",
+            inputs: vec![],
+            outputs: vec![OutputSlot {
+                label: "Value",
+                data_type: DataType::Number,
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn execute(&self, evaluation_context: &mut EvaluationContext) {}
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Add;
 
     use super::*;
 
-    #[derive(Debug)]
-    struct AddNode {
-        node_name: &'static str,
-        inputs: Vec<InputSlot>,
-        outputs: Vec<OutputSlot>,
-    }
-
-    impl_node_core!(AddNode);
-
-    impl NodeImpl for AddNode {
-        fn initialize() -> Self {
-            Self {
-                node_name: "Addition",
-                inputs: vec![
-                    InputSlot {
-                        label: "A",
-                        data_type: DataType::Number,
-                        ..Default::default()
-                    },
-                    InputSlot {
-                        label: "B",
-                        data_type: DataType::Number,
-                        ..Default::default()
-                    },
-                ],
-                outputs: vec![OutputSlot {
-                    label: "Result",
-                    data_type: DataType::Number,
-                    ..Default::default()
-                }],
-            }
-        }
-        fn execute(&self, evaluation_context: &mut EvaluationContext) {
-            let data = self.input_value(evaluation_context, 0);
-            println!("test");
-        }
-    }
-
     #[test]
     fn test_execute() {
         let mut node_graph = NodeGraph::new();
 
-        let node1 = AddNode::initialize();
-        let node2 = AddNode::initialize();
+        let node1 = NumberNode::initialize();
+        node1
+            .set_default_value(&mut node_graph.context, &10.0f32)
+            .unwrap();
+        let node2 = NumberNode::initialize();
+        node2
+            .set_default_value(&mut node_graph.context, &20.0f32)
+            .unwrap();
         let node3 = AddNode::initialize();
 
         let node1_id = node_graph.add_node(node1);
         let node2_id = node_graph.add_node(node2);
         let node3_id = node_graph.add_node(node3);
 
-        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
-        let edge_2_3 = node_graph.create_edge(node2_id, 0, node3_id, 0).unwrap();
+        let edge_1_2 = node_graph.create_edge(node1_id, 0, node3_id, 0).unwrap();
+        let edge_2_3 = node_graph.create_edge(node2_id, 0, node3_id, 1).unwrap();
 
         node_graph.add_edge(edge_1_2).unwrap();
         node_graph.add_edge(edge_2_3).unwrap();

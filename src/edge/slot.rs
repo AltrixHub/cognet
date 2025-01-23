@@ -52,12 +52,19 @@ pub enum DataType {
     String,
 }
 
+#[derive(Debug, Clone)]
+pub enum Data {
+    Number(f32),
+    String(String),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct InputSlot {
     pub id: InputSlotId,
     pub label: &'static str,
     pub data_type: DataType,
     pub connected_edges: Vec<EdgeId>,
+    pub is_executable: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -66,4 +73,5 @@ pub struct OutputSlot {
     pub label: &'static str,
     pub data_type: DataType,
     pub connected_edges: Vec<EdgeId>,
+    pub is_executable: bool,
 }
