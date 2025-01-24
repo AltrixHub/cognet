@@ -44,38 +44,28 @@ macro_rules! impl_node_core {
                 &self,
                 evaluation_context: &mut EvaluationContext,
                 slot_index: usize,
-                value: &dyn Any,
+                value: Data,
             ) -> Result<(), String> {
                 match self.outputs().get(slot_index) {
-                    Some(slot) => match slot.data_type {
-                        DataType::Number => {
-                            if let Some(value) = value.downcast_ref::<f32>() {
-                                evaluation_context
-                                    .outputs
-                                    .insert(OutputSlotId::new(), Data::Number(*value));
-                                Ok(())
-                            } else {
-                                return Err(format!(
-                                    "Type mismatch: expected f32, but got {:?}",
-                                    value.type_id()
-                                ));
-                            }
+                    Some(slot) => match (&slot.data_type, &value) {
+                        (DataType::Number, Data::Number(number)) => {
+                            evaluation_context
+                                .outputs
+                                .insert(slot.id.clone(), Data::Number(*number));
+                            Ok(())
                         }
-                        DataType::String => {
-                            if let Some(value) = value.downcast_ref::<String>() {
-                                evaluation_context
-                                    .outputs
-                                    .insert(OutputSlotId::new(), Data::String(value.clone()));
-                                Ok(())
-                            } else {
-                                return Err(format!(
-                                    "Type mismatch: expected String, but got {:?}",
-                                    value.type_id()
-                                ));
-                            }
+                        (DataType::String, Data::String(string)) => {
+                            evaluation_context
+                                .outputs
+                                .insert(slot.id.clone(), Data::String(string.clone()));
+                            Ok(())
                         }
+                        (expected, actual) => Err(format!(
+                            "Type mismatch: expected {:?}, but got {:?}",
+                            expected, actual
+                        )),
                     },
-                    None => return Err("Invalid value index".to_string()),
+                    None => Err("Invalid value index".to_string()),
                 }
             }
 
@@ -125,14 +115,14 @@ pub trait NodeImpl: Debug + AsAny + Send + Sync + NodeCore {
     where
         Self: Sized;
 
-    fn execute(&self, evaluation_context: &mut EvaluationContext);
+    fn execute(&self, evaluation_context: &mut EvaluationContext) -> Result<(), String>;
 }
 
 pub trait NodePrimitive: NodeCore {
     fn set_default_value(
         &self,
         evaluation_context: &mut EvaluationContext,
-        value: &dyn Any,
+        value: Data,
     ) -> Result<(), String> {
         self.set_output_value(evaluation_context, 0, value)
     }
@@ -155,7 +145,7 @@ pub trait NodeCore {
         &self,
         evaluation_context: &mut EvaluationContext,
         slot_index: usize,
-        value: &dyn Any,
+        value: Data,
     ) -> Result<(), String>;
 
     fn get_output_slot_by_index_mut(&mut self, output_slot_index: usize)
@@ -189,7 +179,7 @@ impl<T: 'static + NodeImpl> AsAny for T {
 pub type NodeId = Ulid;
 pub type EdgeId = Ulid;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Data {
     Number(f32),
     String(String),
@@ -544,6 +534,12 @@ impl NodeGraph {
 
         affected.into_iter().collect()
     }
+
+    fn get_output_value(&self, node_id: NodeId, output_slot_index: usize) -> Option<&Data> {
+        let node = self.get_node_by_id(node_id)?;
+        let slot = node.outputs().get(output_slot_index)?;
+        self.context.outputs.get(&slot.id)
+    }
 }
 
 #[derive(Debug)]
@@ -559,18 +555,11 @@ impl NodeImpl for AddNode {
     fn initialize() -> Self {
         Self {
             node_name: "Addition",
-            inputs: vec![
-                InputSlot {
-                    label: "A",
-                    data_type: DataType::Number,
-                    ..Default::default()
-                },
-                InputSlot {
-                    label: "B",
-                    data_type: DataType::Number,
-                    ..Default::default()
-                },
-            ],
+            inputs: vec![InputSlot {
+                label: "Number List",
+                data_type: DataType::Number,
+                ..Default::default()
+            }],
             outputs: vec![OutputSlot {
                 label: "Result",
                 data_type: DataType::Number,
@@ -578,9 +567,17 @@ impl NodeImpl for AddNode {
             }],
         }
     }
-    fn execute(&self, evaluation_context: &mut EvaluationContext) {
-        let data = self.input_value(evaluation_context, 0);
-        println!("data {:?}", data);
+    fn execute(&self, evaluation_context: &mut EvaluationContext) -> Result<(), String> {
+        let data = self.input_value(evaluation_context, 0)?;
+        let mut result = 0.;
+        for d in data {
+            match d {
+                Data::Number(value) => result += value,
+                _ => return Err("Expected number".to_string()),
+            }
+        }
+        self.set_output_value(evaluation_context, 0, Data::Number(result))?;
+        Ok(())
     }
 }
 
@@ -606,13 +603,13 @@ impl NodeImpl for NumberNode {
         }
     }
 
-    fn execute(&self, evaluation_context: &mut EvaluationContext) {}
+    fn execute(&self, _evaluation_context: &mut EvaluationContext) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Add;
-
     use super::*;
 
     #[test]
@@ -621,11 +618,11 @@ mod tests {
 
         let node1 = NumberNode::initialize();
         node1
-            .set_default_value(&mut node_graph.context, &10.0f32)
+            .set_default_value(&mut node_graph.context, Data::Number(10.))
             .unwrap();
         let node2 = NumberNode::initialize();
         node2
-            .set_default_value(&mut node_graph.context, &20.0f32)
+            .set_default_value(&mut node_graph.context, Data::Number(20.))
             .unwrap();
         let node3 = AddNode::initialize();
 
@@ -633,13 +630,15 @@ mod tests {
         let node2_id = node_graph.add_node(node2);
         let node3_id = node_graph.add_node(node3);
 
-        let edge_1_2 = node_graph.create_edge(node1_id, 0, node3_id, 0).unwrap();
-        let edge_2_3 = node_graph.create_edge(node2_id, 0, node3_id, 1).unwrap();
+        let edge_1_3 = node_graph.create_edge(node1_id, 0, node3_id, 0).unwrap();
+        let edge_2_3 = node_graph.create_edge(node2_id, 0, node3_id, 0).unwrap();
 
-        node_graph.add_edge(edge_1_2).unwrap();
+        node_graph.add_edge(edge_1_3).unwrap();
         node_graph.add_edge(edge_2_3).unwrap();
 
         assert!(node_graph.execute().is_ok());
+        let res = node_graph.get_output_value(node3_id, 0).unwrap();
+        assert_eq!(res, &Data::Number(30.));
     }
 
     #[test]
@@ -756,7 +755,6 @@ mod tests {
         node_graph.execute().unwrap();
 
         println!("--- first execute finished---");
-        println!("{:?}", node_graph);
 
         node_graph
             .update_node(node2_id, AddNode::initialize())

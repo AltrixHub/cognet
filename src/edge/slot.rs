@@ -4,18 +4,24 @@ use ulid::Ulid;
 
 use crate::EdgeId;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct TypedId<T: ?Sized> {
     id: Ulid,
     _marker: PhantomData<T>,
 }
 
-impl<T: ?Sized> TypedId<T> {
-    pub fn new() -> Self {
+impl<T: ?Sized> Default for TypedId<T> {
+    fn default() -> Self {
         Self {
             id: Ulid::new(),
             _marker: PhantomData,
         }
+    }
+}
+
+impl<T: ?Sized> TypedId<T> {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn as_ulid(&self) -> Ulid {
