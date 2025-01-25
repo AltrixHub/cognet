@@ -1,8 +1,6 @@
 use ulid::Ulid;
 
-use crate::{Data, Edge, EdgeId, NodeGraph, NodeId, NodeImpl};
-
-use super::NodeGraphSystem;
+use crate::{system::NodeGraphSystem, Data, Edge, EdgeId, NodeGraph, NodeId, NodeImpl};
 
 pub trait NodeGraphAPI {
     fn new() -> Self;

@@ -58,6 +58,8 @@ pub trait NodeCore {
     fn get_output_slot_by_index_mut(&mut self, output_slot_index: usize)
         -> Option<&mut OutputSlot>;
 
+    fn node_name(&self) -> &'static str;
+
     fn inputs(&self) -> &Vec<InputSlot>;
 
     fn inputs_mut(&mut self) -> &mut Vec<InputSlot>;
@@ -154,6 +156,10 @@ macro_rules! impl_node_core {
                 output_slot_index: usize,
             ) -> Option<&mut OutputSlot> {
                 self.outputs.get_mut(output_slot_index)
+            }
+
+            fn node_name(&self) -> &'static str {
+                self.node_name
             }
 
             fn inputs(&self) -> &Vec<InputSlot> {

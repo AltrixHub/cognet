@@ -2,7 +2,6 @@ pub mod api;
 pub mod system;
 
 pub use api::*;
-pub use system::*;
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,7 +22,7 @@ pub struct NodeGraph {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AddListNode, NodePrimitive, NumberNode};
+    use crate::{AddListNode, NodeCore, NodePrimitive, NumberNode};
 
     use super::*;
 

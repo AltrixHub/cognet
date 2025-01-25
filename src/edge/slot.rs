@@ -21,6 +21,26 @@ pub enum Data {
     String(String),
 }
 
+impl Data {
+    pub fn value<T: Clone>(&self) -> Option<T>
+    where
+        T: 'static,
+    {
+        if let Some(value) = self.as_any().downcast_ref::<T>() {
+            Some(value.clone())
+        } else {
+            None
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        match self {
+            Data::Number(n) => n as &dyn std::any::Any,
+            Data::String(s) => s as &dyn std::any::Any,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct InputSlot {
     pub id: InputSlotId,
