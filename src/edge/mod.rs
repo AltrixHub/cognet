@@ -1,7 +1,10 @@
 pub mod slot;
 pub use slot::*;
+use ulid::Ulid;
 
 use crate::NodeId;
+
+pub type EdgeId = Ulid;
 
 #[derive(Debug)]
 pub struct Edge {
