@@ -23,5 +23,5 @@ fn main() {
     node_graph.execute().unwrap();
 
     let res = node_graph.get_output_value(node3_id, 0);
-    assert_eq!(res.unwrap(), &Data::Number(30.));
+    assert_eq!(res.unwrap().value::<f32>(), Some(30.));
 }
