@@ -70,7 +70,6 @@ pub struct InputSlot {
     pub label: &'static str,
     pub data_type: DataType,
     pub connected_edges: Vec<EdgeId>,
-    pub is_executable: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -79,5 +78,4 @@ pub struct OutputSlot {
     pub label: &'static str,
     pub data_type: DataType,
     pub connected_edges: Vec<EdgeId>,
-    pub is_executable: bool,
 }

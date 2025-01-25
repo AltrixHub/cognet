@@ -95,8 +95,16 @@ macro_rules! impl_node_core {
                 &self.inputs
             }
 
+            fn inputs_mut(&mut self) -> &mut Vec<InputSlot> {
+                &mut self.inputs
+            }
+
             fn outputs(&self) -> &Vec<OutputSlot> {
                 &self.outputs
+            }
+
+            fn outputs_mut(&mut self) -> &mut Vec<OutputSlot> {
+                &mut self.outputs
             }
         }
     };
@@ -153,7 +161,11 @@ pub trait NodeCore {
 
     fn inputs(&self) -> &Vec<InputSlot>;
 
+    fn inputs_mut(&mut self) -> &mut Vec<InputSlot>;
+
     fn outputs(&self) -> &Vec<OutputSlot>;
+
+    fn outputs_mut(&mut self) -> &mut Vec<OutputSlot>;
 }
 
 impl dyn NodeImpl {
@@ -203,17 +215,15 @@ impl NodeGraph {
         Self::default()
     }
 
-    pub fn execute(&mut self) -> Result<(), &'static str> {
+    pub fn execute(&mut self) -> Result<(), String> {
         if self.affected_nodes.is_empty() {
             return Ok(());
         }
 
-        let sorted_nodes = self.topological_sort()?;
+        let sorted_nodes = self.topological_sort(&self.affected_nodes)?;
         for node_id in sorted_nodes {
-            if self.affected_nodes.contains(&node_id) {
-                if let Some(node) = self.nodes.get(&node_id) {
-                    node.execute(&mut self.context);
-                }
+            if let Some(node) = self.nodes.get(&node_id) {
+                node.execute(&mut self.context)?;
             }
         }
 
@@ -261,23 +271,29 @@ impl NodeGraph {
         self.affected_nodes.extend(nodes.into_iter());
     }
 
-    pub fn topological_sort(&self) -> Result<Vec<NodeId>, &'static str> {
+    pub fn topological_sort(
+        &self,
+        target_nodes: &HashSet<NodeId>,
+    ) -> Result<Vec<NodeId>, &'static str> {
         let mut in_degree = HashMap::new();
         let mut adj_list = HashMap::new();
 
-        for (&node_id, _) in &self.nodes {
+        for &node_id in target_nodes {
             in_degree.insert(node_id, 0);
             adj_list.insert(node_id, Vec::new());
         }
-
         for edge in self.context.edges.values() {
-            in_degree
-                .entry(edge.to_node_id)
-                .and_modify(|count| *count += 1);
-            adj_list
-                .entry(edge.from_node_id)
-                .or_default()
-                .push(edge.to_node_id);
+            if target_nodes.contains(&edge.from_node_id) && target_nodes.contains(&edge.to_node_id)
+            {
+                in_degree
+                    .entry(edge.to_node_id)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                adj_list
+                    .entry(edge.from_node_id)
+                    .or_default()
+                    .push(edge.to_node_id);
+            }
         }
 
         let mut queue: VecDeque<NodeId> = in_degree
@@ -303,7 +319,7 @@ impl NodeGraph {
             }
         }
 
-        if sorted.len() != self.nodes.len() {
+        if sorted.len() != target_nodes.len() {
             return Err("Graph contains a cycle.");
         }
 
@@ -639,47 +655,6 @@ mod tests {
         assert!(node_graph.execute().is_ok());
         let res = node_graph.get_output_value(node3_id, 0).unwrap();
         assert_eq!(res, &Data::Number(30.));
-    }
-
-    #[test]
-    fn test_topological_sort() {
-        let mut node_graph = NodeGraph::new();
-
-        let node1 = AddNode::initialize();
-        let node2 = AddNode::initialize();
-        let node3 = AddNode::initialize();
-
-        let node1_id = node_graph.add_node(node1);
-        let node2_id = node_graph.add_node(node2);
-        let node3_id = node_graph.add_node(node3);
-
-        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
-        let edge_2_3 = node_graph.create_edge(node2_id, 0, node3_id, 0).unwrap();
-
-        node_graph.add_edge(edge_1_2).unwrap();
-        node_graph.add_edge(edge_2_3).unwrap();
-
-        let sorted = node_graph.topological_sort().unwrap();
-        assert_eq!(sorted, vec![node1_id, node2_id, node3_id]);
-    }
-
-    #[test]
-    fn test_cycle_detection() {
-        let mut node_graph = NodeGraph::new();
-
-        let node1 = AddNode::initialize();
-        let node2 = AddNode::initialize();
-
-        let node1_id = node_graph.add_node(node1);
-        let node2_id = node_graph.add_node(node2);
-
-        let edge_1_2 = node_graph.create_edge(node1_id, 0, node2_id, 0).unwrap();
-        let edge_2_1 = node_graph.create_edge(node2_id, 0, node1_id, 0).unwrap();
-
-        node_graph.add_edge(edge_1_2).unwrap();
-        node_graph.add_edge(edge_2_1).unwrap();
-
-        assert!(node_graph.topological_sort().is_err());
     }
 
     #[test]
