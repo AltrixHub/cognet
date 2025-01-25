@@ -95,8 +95,16 @@ macro_rules! impl_node_core {
                 &self.inputs
             }
 
+            fn inputs_mut(&mut self) -> &mut Vec<InputSlot> {
+                &mut self.inputs
+            }
+
             fn outputs(&self) -> &Vec<OutputSlot> {
                 &self.outputs
+            }
+
+            fn outputs_mut(&mut self) -> &mut Vec<OutputSlot> {
+                &mut self.outputs
             }
         }
     };
@@ -153,7 +161,11 @@ pub trait NodeCore {
 
     fn inputs(&self) -> &Vec<InputSlot>;
 
+    fn inputs_mut(&mut self) -> &mut Vec<InputSlot>;
+
     fn outputs(&self) -> &Vec<OutputSlot>;
+
+    fn outputs_mut(&mut self) -> &mut Vec<OutputSlot>;
 }
 
 impl dyn NodeImpl {
