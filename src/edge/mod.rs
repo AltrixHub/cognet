@@ -1,12 +1,11 @@
 pub mod slot;
 pub use slot::*;
-use ulid::Ulid;
 
-use crate::NodeId;
+use crate::{NodeId, TypedId};
 
-pub type EdgeId = Ulid;
+pub type EdgeId = TypedId<Edge>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Edge {
     pub from_node_id: NodeId,
     pub from_output_slot_index: usize,

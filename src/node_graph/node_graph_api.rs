@@ -134,13 +134,13 @@ impl NodeGraphAPI for NodeGraph {
 
         if let Some(node) = self.node_manager.nodes_mut().get_mut(&from_node_id) {
             if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
-                slot.connected_edges.retain(|&id| id != edge_id);
+                slot.connected_edges.retain(|id| id.clone() != edge_id);
             }
         }
 
         if let Some(node) = self.node_manager.nodes_mut().get_mut(&to_node_id) {
             if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-                slot.connected_edges.retain(|&id| id != edge_id);
+                slot.connected_edges.retain(|id| id.clone() != edge_id);
             }
         }
 

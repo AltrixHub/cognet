@@ -157,19 +157,19 @@ impl NodeGraphSystem for NodeGraph {
 
         if let Some(node) = self.node_manager.nodes_mut().get_mut(&from_node_id) {
             if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
-                slot.connected_edges.push(edge_id);
+                slot.connected_edges.push(edge_id.clone());
             }
         }
 
         if let Some(node) = self.node_manager.nodes_mut().get_mut(&to_node_id) {
             if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-                slot.connected_edges.push(edge_id);
+                slot.connected_edges.push(edge_id.clone());
             }
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id]);
         self.mark_dirty_nodes(dirty_nodes);
-        self.context.edges.insert(edge_id, edge);
+        self.context.edges.insert(edge_id.clone(), edge);
 
         Ok(edge_id)
     }
