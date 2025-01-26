@@ -1,27 +1,25 @@
-use cognet::{AddListNode, Data, NodeGraph, NodeGraphAPI, NodeImpl, NodePrimitive, NumberNode};
+use cognet::{AddListNode, Data, NodeGraph, NodeGraphAPI, NumberNode};
 
-fn main() {
+fn main() -> Result<(), String> {
     let mut node_graph = NodeGraph::new();
 
-    let node1 = NumberNode::initialize();
-    node1
-        .set_default_value(&mut node_graph.context, Data::Number(10.))
-        .unwrap();
-    let node2 = NumberNode::initialize();
-    node2
-        .set_default_value(&mut node_graph.context, Data::Number(20.))
-        .unwrap();
-    let node3 = AddListNode::initialize();
-
-    let node1_id = node_graph.add_node(node1);
-    let node2_id = node_graph.add_node(node2);
-    let node3_id = node_graph.add_node(node3);
+    let node1_id = node_graph.node_manager_mut().create_node::<NumberNode>()?;
+    node_graph.set_default_value::<NumberNode>(node1_id, Data::Number(10.))?;
+    let node2_id = node_graph.node_manager_mut().create_node::<NumberNode>()?;
+    node_graph.set_default_value::<NumberNode>(node2_id, Data::Number(20.))?;
+    let node3_id = node_graph.node_manager_mut().create_node::<AddListNode>()?;
 
     node_graph.connect_nodes(node1_id, 0, node3_id, 0).unwrap();
     node_graph.connect_nodes(node2_id, 0, node3_id, 0).unwrap();
 
-    node_graph.execute().unwrap();
+    node_graph.execute()?;
 
-    let res = node_graph.get_output_value(node3_id, 0);
-    assert_eq!(res.unwrap().value::<f32>(), Some(30.));
+    let output = node_graph
+        .get_output_value(node3_id, 0)
+        .unwrap()
+        .value::<f32>()
+        .unwrap();
+    assert_eq!(output, 30.);
+
+    Ok(())
 }

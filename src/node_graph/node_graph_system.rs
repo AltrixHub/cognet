@@ -1,6 +1,5 @@
+use crate::{Edge, EdgeId, EvaluationContext, NodeGraph, NodeGraphAPI, NodeId, NodeManager};
 use std::collections::{HashMap, HashSet, VecDeque};
-
-use crate::{Edge, EdgeId, NodeGraph, NodeGraphAPI, NodeId};
 
 pub(crate) trait NodeGraphSystem {
     fn topological_sort(&self, target_nodes: &HashSet<NodeId>)
@@ -19,6 +18,8 @@ pub(crate) trait NodeGraphSystem {
     fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Vec<NodeId>;
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>);
+
+    fn resources_mut(&mut self) -> (&mut NodeManager, &mut EvaluationContext);
 }
 
 impl NodeGraphSystem for NodeGraph {
@@ -192,5 +193,9 @@ impl NodeGraphSystem for NodeGraph {
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>) {
         self.dirty_nodes.extend(nodes.into_iter());
+    }
+
+    fn resources_mut(&mut self) -> (&mut NodeManager, &mut EvaluationContext) {
+        (&mut self.node_manager, &mut self.context)
     }
 }
