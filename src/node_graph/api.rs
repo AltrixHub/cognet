@@ -1,13 +1,9 @@
-use ulid::Ulid;
-
 use crate::{system::NodeGraphSystem, Data, Edge, EdgeId, NodeGraph, NodeId, NodeImpl};
 
 pub trait NodeGraphAPI {
     fn new() -> Self;
 
     fn execute(&mut self) -> Result<(), String>;
-
-    fn add_node<T: 'static + NodeImpl>(&mut self, node: T) -> NodeId;
 
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), &'static str>;
 
@@ -50,7 +46,7 @@ impl NodeGraphAPI for NodeGraph {
 
         let sorted_nodes = self.topological_sort(&self.dirty_nodes)?;
         for node_id in sorted_nodes {
-            if let Some(node) = self.nodes.get(&node_id) {
+            if let Some(node) = self.node_manager.nodes().get(&node_id) {
                 node.execute(&mut self.context)?;
             }
         }
@@ -59,16 +55,8 @@ impl NodeGraphAPI for NodeGraph {
         Ok(())
     }
 
-    fn add_node<T: 'static + NodeImpl>(&mut self, node: T) -> NodeId {
-        let node_id = Ulid::new();
-        let node_box = Box::new(node);
-        self.nodes.insert(node_id, node_box);
-        self.mark_dirty_nodes(vec![node_id]);
-        node_id
-    }
-
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), &'static str> {
-        if self.nodes.remove(&node_id).is_some() {
+        if self.node_manager.nodes_mut().remove(&node_id).is_some() {
             let dirty_nodes = self.collect_dirty_nodes(vec![node_id]);
             self.context
                 .edges
@@ -85,9 +73,9 @@ impl NodeGraphAPI for NodeGraph {
         node_id: NodeId,
         new_node: T,
     ) -> Result<(), &'static str> {
-        if self.nodes.contains_key(&node_id) {
+        if self.node_manager.nodes().contains_key(&node_id) {
             let node_box = Box::new(new_node);
-            self.nodes.insert(node_id, node_box);
+            self.node_manager.nodes_mut().insert(node_id, node_box);
             let dirty_nodes = self.collect_dirty_nodes(vec![node_id]);
             self.mark_dirty_nodes(dirty_nodes);
             Ok(())
@@ -123,13 +111,13 @@ impl NodeGraphAPI for NodeGraph {
         let from_node_id = edge.from_node_id;
         let to_node_id = edge.to_node_id;
 
-        if let Some(node) = self.nodes.get_mut(&from_node_id) {
+        if let Some(node) = self.node_manager.nodes_mut().get_mut(&from_node_id) {
             if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
                 slot.connected_edges.retain(|&id| id != edge_id);
             }
         }
 
-        if let Some(node) = self.nodes.get_mut(&to_node_id) {
+        if let Some(node) = self.node_manager.nodes_mut().get_mut(&to_node_id) {
             if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
                 slot.connected_edges.retain(|&id| id != edge_id);
             }
@@ -146,18 +134,23 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     fn get_node_by_id(&self, node_id: NodeId) -> Option<&Box<dyn NodeImpl>> {
-        self.nodes.get(&node_id).map(|node| node)
+        self.node_manager.nodes().get(&node_id).map(|node| node)
     }
 
     fn get_nodes_by_type<T: NodeImpl + 'static>(&self) -> Vec<(NodeId, &T)> {
-        self.nodes
+        self.node_manager
+            .nodes()
             .iter()
             .filter_map(|(&id, node)| node.downcast_ref::<T>().map(|typed_node| (id, typed_node)))
             .collect()
     }
 
     fn get_all_nodes(&self) -> Vec<(NodeId, &Box<dyn NodeImpl>)> {
-        self.nodes.iter().map(|(&id, node)| (id, node)).collect()
+        self.node_manager
+            .nodes()
+            .iter()
+            .map(|(&id, node)| (id, node))
+            .collect()
     }
 
     fn get_output_value(&self, node_id: NodeId, output_slot_index: usize) -> Option<&Data> {

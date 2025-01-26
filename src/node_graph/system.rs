@@ -118,11 +118,13 @@ impl NodeGraphSystem for NodeGraph {
         let to_node_id = edge.to_node_id;
 
         let from_node = self
-            .nodes
+            .node_manager
+            .nodes()
             .get(&from_node_id)
             .ok_or_else(|| format!("From node {:?} does not exist", edge.from_node_id))?;
         let to_node = self
-            .nodes
+            .node_manager
+            .nodes()
             .get(&to_node_id)
             .ok_or_else(|| format!("To node {:?} does not exist", edge.to_node_id))?;
 
@@ -152,13 +154,13 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        if let Some(node) = self.nodes.get_mut(&from_node_id) {
+        if let Some(node) = self.node_manager.nodes_mut().get_mut(&from_node_id) {
             if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
                 slot.connected_edges.push(edge_id);
             }
         }
 
-        if let Some(node) = self.nodes.get_mut(&to_node_id) {
+        if let Some(node) = self.node_manager.nodes_mut().get_mut(&to_node_id) {
             if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
                 slot.connected_edges.push(edge_id);
             }

@@ -1,16 +1,11 @@
-use crate::{
-    impl_node_core, impl_primitive_node_core, Data, DataType, EvaluationContext, InputSlot,
-    NodeCore, NodeImpl, OutputSlot,
-};
+use crate::{DataType, EvaluationContext, InputSlot, NodeImpl, OutputSlot};
 
 #[derive(Debug)]
 pub struct NumberNode {
-    node_name: &'static str,
-    inputs: Vec<InputSlot>,
-    outputs: Vec<OutputSlot>,
+    pub node_name: &'static str,
+    pub inputs: Vec<InputSlot>,
+    pub outputs: Vec<OutputSlot>,
 }
-
-impl_primitive_node_core!(NumberNode);
 
 impl NodeImpl for NumberNode {
     fn initialize() -> Self {
