@@ -1,6 +1,5 @@
 use crate::{impl_node_core, impl_primitive_node_core, AddListNode, NodeId, NodeImpl, NumberNode};
 use std::{any::TypeId, collections::HashMap, sync::Arc};
-use ulid::Ulid;
 
 type NodeFactory = Arc<dyn Fn() -> Box<dyn NodeImpl> + Send + Sync>;
 
@@ -42,8 +41,8 @@ impl NodeManager {
     {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
             let node = factory();
-            let node_id = Ulid::new();
-            self.nodes.insert(node_id, node);
+            let node_id = NodeId::new();
+            self.nodes.insert(node_id.clone(), node);
             Ok(node_id)
         } else {
             Err(format!("{:?} is not registered", TypeId::of::<T>()))

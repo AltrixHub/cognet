@@ -7,9 +7,9 @@ pub(crate) trait NodeGraphSystem {
 
     fn create_edge(
         &self,
-        from_node_id: NodeId,
+        from_node_id: &NodeId,
         from_output_slot_index: usize,
-        to_node_id: NodeId,
+        to_node_id: &NodeId,
         to_input_slot_index: usize,
     ) -> Result<Edge, &'static str>;
 
@@ -30,41 +30,41 @@ impl NodeGraphSystem for NodeGraph {
         let mut in_degree = HashMap::new();
         let mut adj_list = HashMap::new();
 
-        for &node_id in target_nodes {
-            in_degree.insert(node_id, 0);
-            adj_list.insert(node_id, Vec::new());
+        for node_id in target_nodes {
+            in_degree.insert(node_id.clone(), 0);
+            adj_list.insert(node_id.clone(), Vec::new());
         }
         for edge in self.context.edges.values() {
             if target_nodes.contains(&edge.from_node_id) && target_nodes.contains(&edge.to_node_id)
             {
                 in_degree
-                    .entry(edge.to_node_id)
+                    .entry(edge.to_node_id.clone())
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
                 adj_list
-                    .entry(edge.from_node_id)
+                    .entry(edge.from_node_id.clone())
                     .or_default()
-                    .push(edge.to_node_id);
+                    .push(edge.to_node_id.clone());
             }
         }
 
         let mut queue: VecDeque<NodeId> = in_degree
             .iter()
             .filter(|&(_, &deg)| deg == 0)
-            .map(|(&node_id, _)| node_id)
+            .map(|(node_id, _)| node_id.clone())
             .collect();
 
         let mut sorted = Vec::new();
 
         while let Some(node_id) = queue.pop_front() {
-            sorted.push(node_id);
+            sorted.push(node_id.clone());
 
             if let Some(neighbors) = adj_list.get(&node_id) {
-                for &neighbor in neighbors {
+                for neighbor in neighbors {
                     if let Some(deg) = in_degree.get_mut(&neighbor) {
                         *deg -= 1;
                         if *deg == 0 {
-                            queue.push_back(neighbor);
+                            queue.push_back(neighbor.clone());
                         }
                     }
                 }
@@ -80,9 +80,9 @@ impl NodeGraphSystem for NodeGraph {
 
     fn create_edge(
         &self,
-        from_node_id: NodeId,
+        from_node_id: &NodeId,
         from_output_slot_index: usize,
-        to_node_id: NodeId,
+        to_node_id: &NodeId,
         to_input_slot_index: usize,
     ) -> Result<Edge, &'static str> {
         let from_output_slot_id = {
@@ -105,18 +105,18 @@ impl NodeGraphSystem for NodeGraph {
                 .clone()
         };
         Ok(Edge {
-            from_node_id,
+            from_node_id: from_node_id.clone(),
             from_output_slot_index,
             from_output_slot_id,
-            to_node_id,
+            to_node_id: to_node_id.clone(),
             to_input_slot_index,
             to_input_slot_id,
         })
     }
 
     fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
-        let from_node_id = edge.from_node_id;
-        let to_node_id = edge.to_node_id;
+        let from_node_id = edge.from_node_id.clone();
+        let to_node_id = edge.to_node_id.clone();
 
         let from_node = self
             .node_manager
@@ -157,19 +157,19 @@ impl NodeGraphSystem for NodeGraph {
 
         if let Some(node) = self.node_manager.nodes_mut().get_mut(&from_node_id) {
             if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
-                slot.connected_edges.push(edge_id);
+                slot.connected_edges.push(edge_id.clone());
             }
         }
 
         if let Some(node) = self.node_manager.nodes_mut().get_mut(&to_node_id) {
             if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-                slot.connected_edges.push(edge_id);
+                slot.connected_edges.push(edge_id.clone());
             }
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id]);
         self.mark_dirty_nodes(dirty_nodes);
-        self.context.edges.insert(edge_id, edge);
+        self.context.edges.insert(edge_id.clone(), edge);
 
         Ok(edge_id)
     }
@@ -179,10 +179,10 @@ impl NodeGraphSystem for NodeGraph {
         let mut queue = VecDeque::from(initial_nodes);
 
         while let Some(node_id) = queue.pop_front() {
-            if affected.insert(node_id) {
+            if affected.insert(node_id.clone()) {
                 for edge in self.context.edges.values() {
                     if edge.from_node_id == node_id && !affected.contains(&edge.to_node_id) {
-                        queue.push_back(edge.to_node_id);
+                        queue.push_back(edge.to_node_id.clone());
                     }
                 }
             }
