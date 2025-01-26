@@ -2,8 +2,10 @@ use crate::{Edge, EdgeId, EvaluationContext, NodeGraph, NodeGraphAPI, NodeId, No
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
-    fn topological_sort(&self, target_nodes: &HashSet<NodeId>)
-        -> Result<Vec<NodeId>, &'static str>;
+    fn topological_sort(
+        &self,
+        target_nodes: &HashSet<NodeId>,
+    ) -> Result<Vec<Vec<NodeId>>, &'static str>;
 
     fn create_edge(
         &self,
@@ -19,14 +21,20 @@ pub(crate) trait NodeGraphSystem {
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>);
 
-    fn resources_mut(&mut self) -> (&mut NodeManager, &mut EvaluationContext);
+    fn resources_mut(
+        &mut self,
+    ) -> (
+        &mut NodeManager,
+        &mut EvaluationContext,
+        &mut HashSet<NodeId>,
+    );
 }
 
 impl NodeGraphSystem for NodeGraph {
     fn topological_sort(
         &self,
         target_nodes: &HashSet<NodeId>,
-    ) -> Result<Vec<NodeId>, &'static str> {
+    ) -> Result<Vec<Vec<NodeId>>, &'static str> {
         let mut in_degree = HashMap::new();
         let mut adj_list = HashMap::new();
 
@@ -56,22 +64,31 @@ impl NodeGraphSystem for NodeGraph {
 
         let mut sorted = Vec::new();
 
-        while let Some(node_id) = queue.pop_front() {
-            sorted.push(node_id.clone());
+        while !queue.is_empty() {
+            let mut current_level = Vec::new();
 
-            if let Some(neighbors) = adj_list.get(&node_id) {
-                for neighbor in neighbors {
-                    if let Some(deg) = in_degree.get_mut(&neighbor) {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push_back(neighbor.clone());
+            for _ in 0..queue.len() {
+                if let Some(node_id) = queue.pop_front() {
+                    current_level.push(node_id.clone());
+
+                    if let Some(neighbors) = adj_list.get(&node_id) {
+                        for neighbor in neighbors {
+                            if let Some(deg) = in_degree.get_mut(neighbor) {
+                                *deg -= 1;
+                                if *deg == 0 {
+                                    queue.push_back(neighbor.clone());
+                                }
+                            }
                         }
                     }
                 }
             }
+
+            sorted.push(current_level);
         }
 
-        if sorted.len() != target_nodes.len() {
+        let total_count: usize = sorted.iter().map(|level| level.len()).sum();
+        if total_count != target_nodes.len() {
             return Err("Graph contains a cycle.");
         }
 
@@ -195,7 +212,17 @@ impl NodeGraphSystem for NodeGraph {
         self.dirty_nodes.extend(nodes.into_iter());
     }
 
-    fn resources_mut(&mut self) -> (&mut NodeManager, &mut EvaluationContext) {
-        (&mut self.node_manager, &mut self.context)
+    fn resources_mut(
+        &mut self,
+    ) -> (
+        &mut NodeManager,
+        &mut EvaluationContext,
+        &mut HashSet<NodeId>,
+    ) {
+        (
+            &mut self.node_manager,
+            &mut self.context,
+            &mut self.dirty_nodes,
+        )
     }
 }
