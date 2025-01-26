@@ -4,10 +4,10 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use crate::{AsAny, Data, EvaluationContext, InputSlot, OutputSlot, TypedId};
+use crate::{AsAny, Data, EntityId, EvaluationContext, InputSlot, OutputSlot};
 use std::{any::Any, fmt::Debug, sync::Arc};
 
-pub type NodeId = TypedId<Arc<dyn NodeImpl>>;
+pub type NodeId = EntityId<Arc<dyn NodeImpl>>;
 
 pub trait NodeImpl: Debug + Send + Sync + NodeCore {
     fn initialize() -> Self

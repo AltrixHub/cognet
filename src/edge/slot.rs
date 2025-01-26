@@ -1,7 +1,7 @@
-use crate::{EdgeId, TypedId};
+use crate::{EdgeId, EntityId};
 
-pub type InputSlotId = TypedId<InputSlot>;
-pub type OutputSlotId = TypedId<OutputSlot>;
+pub type InputSlotId = EntityId<InputSlot>;
+pub type OutputSlotId = EntityId<OutputSlot>;
 
 pub enum SlotId {
     Input(InputSlotId),
