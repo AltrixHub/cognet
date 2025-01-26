@@ -4,11 +4,9 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use std::fmt::Debug;
-
-use ulid::Ulid;
-
 use crate::{AsAny, Data, EvaluationContext, InputSlot, OutputSlot};
+use std::{any::Any, fmt::Debug};
+use ulid::Ulid;
 
 pub type NodeId = Ulid;
 
@@ -18,6 +16,16 @@ pub trait NodeImpl: Debug + Send + Sync + NodeCore {
         Self: Sized;
 
     fn execute(&self, evaluation_context: &mut EvaluationContext) -> Result<(), String>;
+}
+
+impl dyn NodeImpl {
+    pub fn downcast_ref<T: NodeImpl + 'static>(&self) -> Option<&T> {
+        self.as_any().downcast_ref::<T>()
+    }
+
+    pub fn downcast_mut<T: NodeImpl + 'static>(&mut self) -> Option<&mut T> {
+        self.as_any_mut().downcast_mut::<T>()
+    }
 }
 
 pub trait NodeCore: Debug + Send + Sync + AsAny {
@@ -54,16 +62,26 @@ pub trait NodeCore: Debug + Send + Sync + AsAny {
     fn outputs_mut(&mut self) -> &mut Vec<OutputSlot>;
 }
 
+impl<T: 'static + NodeCore> AsAny for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 #[macro_export]
 macro_rules! impl_node_core {
     ($($struct_name:ident),*) => {
         $(
-            impl NodeCore for $struct_name {
+            impl $crate::NodeCore for $struct_name {
                 fn input_value<'a>(
                     &'a self,
-                    evaluation_context: &'a EvaluationContext,
+                    evaluation_context: &'a $crate::EvaluationContext,
                     slot_index: usize,
-                ) -> Result<Vec<&'a Data>, String> {
+                ) -> Result<Vec<&'a $crate::Data>, String> {
                     let mut result = Vec::new();
                     let input_slot = match self.inputs().get(slot_index) {
                         Some(slot) => slot,
@@ -85,22 +103,22 @@ macro_rules! impl_node_core {
 
                 fn set_output_value(
                     &self,
-                    evaluation_context: &mut EvaluationContext,
+                    evaluation_context: &mut $crate::EvaluationContext,
                     slot_index: usize,
-                    value: Data,
+                    value: $crate::Data,
                 ) -> Result<(), String> {
                     match self.outputs().get(slot_index) {
                         Some(slot) => match (&slot.data_type, &value) {
-                            ($crate::DataType::Number, Data::Number(number)) => {
+                            ($crate::DataType::Number, $crate::Data::Number(number)) => {
                                 evaluation_context
                                     .outputs
-                                    .insert(slot.id.clone(), Data::Number(number.clone()));
+                                    .insert(slot.id.clone(), $crate::Data::Number(number.clone()));
                                 Ok(())
                             }
-                            ($crate::DataType::String, Data::String(string)) => {
+                            ($crate::DataType::String, $crate::Data::String(string)) => {
                                 evaluation_context
                                     .outputs
-                                    .insert(slot.id.clone(), Data::String(string.clone()));
+                                    .insert(slot.id.clone(), $crate::Data::String(string.clone()));
                                 Ok(())
                             }
                             (expected, actual) => Err(format!(

@@ -1,7 +1,14 @@
-use crate::{system::NodeGraphSystem, Data, Edge, EdgeId, NodeGraph, NodeId, NodeImpl};
+use crate::{
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeGraph, NodeId, NodeImpl,
+    NodeManager, NodePrimitive,
+};
 
 pub trait NodeGraphAPI {
     fn new() -> Self;
+
+    fn node_manager(&self) -> &NodeManager;
+
+    fn node_manager_mut(&mut self) -> &mut NodeManager;
 
     fn execute(&mut self) -> Result<(), String>;
 
@@ -32,11 +39,25 @@ pub trait NodeGraphAPI {
     fn get_edge(&self, edge_id: EdgeId) -> Option<&Edge>;
 
     fn get_output_value(&self, node_id: NodeId, output_slot_index: usize) -> Option<&Data>;
+
+    fn set_default_value<T: 'static + NodePrimitive + NodeImpl>(
+        &mut self,
+        node_id: NodeId,
+        value: Data,
+    ) -> Result<(), String>;
 }
 
 impl NodeGraphAPI for NodeGraph {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn node_manager(&self) -> &NodeManager {
+        &self.node_manager
+    }
+
+    fn node_manager_mut(&mut self) -> &mut NodeManager {
+        &mut self.node_manager
     }
 
     fn execute(&mut self) -> Result<(), String> {
@@ -157,5 +178,29 @@ impl NodeGraphAPI for NodeGraph {
         let node = self.get_node_by_id(node_id)?;
         let slot = node.outputs().get(output_slot_index)?;
         self.context.outputs.get(&slot.id)
+    }
+
+    fn set_default_value<T: 'static + NodePrimitive + NodeImpl>(
+        &mut self,
+        node_id: NodeId,
+        value: Data,
+    ) -> Result<(), String> {
+        let (node_manager, context) = self.resources_mut();
+
+        let node = node_manager
+            .nodes_mut()
+            .get_mut(&node_id)
+            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
+
+        let downcast_node = node.downcast_mut::<T>().ok_or_else(|| {
+            format!(
+                "Invalid Node: expected implementation of NodePrimitive for {:?}",
+                node_id
+            )
+        })?;
+
+        downcast_node.set_default_value(context, value)?;
+
+        Ok(())
     }
 }
