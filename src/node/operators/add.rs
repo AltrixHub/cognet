@@ -7,6 +7,7 @@ pub struct AddListNode {
     pub outputs: Vec<OutputSlot>,
 }
 
+#[async_trait::async_trait]
 impl NodeImpl for AddListNode {
     fn initialize() -> Self {
         Self {
@@ -24,7 +25,7 @@ impl NodeImpl for AddListNode {
         }
     }
 
-    fn execute(&self, evaluation_context: &mut EvaluationContext) -> Result<(), String> {
+    async fn execute(&self, evaluation_context: &mut EvaluationContext) -> Result<(), String> {
         let data_list = self.input_value(evaluation_context, 0)?;
         let mut result = 0.;
         for data in data_list {

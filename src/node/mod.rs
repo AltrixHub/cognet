@@ -9,12 +9,13 @@ use std::{any::Any, fmt::Debug, sync::Arc};
 
 pub type NodeId = EntityId<Arc<dyn NodeImpl>>;
 
+#[async_trait::async_trait]
 pub trait NodeImpl: Debug + Send + Sync + NodeCore {
     fn initialize() -> Self
     where
         Self: Sized;
 
-    fn execute(&self, evaluation_context: &mut EvaluationContext) -> Result<(), String>;
+    async fn execute(&self, evaluation_context: &mut EvaluationContext) -> Result<(), String>;
 }
 
 impl dyn NodeImpl {
