@@ -1,4 +1,4 @@
-use crate::{Edge, EdgeId, EvaluationContext, NodeGraph, NodeGraphAPI, NodeId, NodeManager};
+use crate::{Edge, EdgeId, NodeGraph, NodeGraphAPI, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
@@ -17,17 +17,13 @@ pub(crate) trait NodeGraphSystem {
 
     fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
 
-    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Vec<NodeId>;
+    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String>;
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>);
 
-    fn resources_mut(
-        &mut self,
-    ) -> (
-        &mut NodeManager,
-        &mut EvaluationContext,
-        &mut HashSet<NodeId>,
-    );
+    fn remove_edges_from_context(&self, node_id: &NodeId) -> Result<(), &'static str>;
+
+    fn remove_edge_from_context(&self, edge_id: &EdgeId) -> Result<Edge, &'static str>;
 }
 
 impl NodeGraphSystem for NodeGraph {
@@ -42,7 +38,9 @@ impl NodeGraphSystem for NodeGraph {
             in_degree.insert(node_id.clone(), 0);
             adj_list.insert(node_id.clone(), Vec::new());
         }
-        for edge in self.context.edges.values() {
+
+        let context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        for edge in context.edges.values() {
             if target_nodes.contains(&edge.from_node_id) && target_nodes.contains(&edge.to_node_id)
             {
                 in_degree
@@ -184,20 +182,23 @@ impl NodeGraphSystem for NodeGraph {
             }
         }
 
-        let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id]);
+        let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
-        self.context.edges.insert(edge_id.clone(), edge);
+        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        context.edges.insert(edge_id.clone(), edge);
 
         Ok(edge_id)
     }
 
-    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Vec<NodeId> {
+    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String> {
         let mut affected = HashSet::new();
         let mut queue = VecDeque::from(initial_nodes);
 
+        let context = self.context.lock().map_err(|_| "Failed to lock context")?;
+
         while let Some(node_id) = queue.pop_front() {
             if affected.insert(node_id.clone()) {
-                for edge in self.context.edges.values() {
+                for edge in context.edges.values() {
                     if edge.from_node_id == node_id && !affected.contains(&edge.to_node_id) {
                         queue.push_back(edge.to_node_id.clone());
                     }
@@ -205,24 +206,23 @@ impl NodeGraphSystem for NodeGraph {
             }
         }
 
-        affected.into_iter().collect()
+        Ok(affected.into_iter().collect())
+    }
+
+    fn remove_edges_from_context(&self, node_id: &NodeId) -> Result<(), &'static str> {
+        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        context
+            .edges
+            .retain(|_, edge| edge.from_node_id != *node_id && edge.to_node_id != *node_id);
+        Ok(())
+    }
+
+    fn remove_edge_from_context(&self, edge_id: &EdgeId) -> Result<Edge, &'static str> {
+        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        context.edges.remove(edge_id).ok_or("Edge does not exist")
     }
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>) {
         self.dirty_nodes.extend(nodes.into_iter());
-    }
-
-    fn resources_mut(
-        &mut self,
-    ) -> (
-        &mut NodeManager,
-        &mut EvaluationContext,
-        &mut HashSet<NodeId>,
-    ) {
-        (
-            &mut self.node_manager,
-            &mut self.context,
-            &mut self.dirty_nodes,
-        )
     }
 }

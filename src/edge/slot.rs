@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{EdgeId, EntityId};
 
 pub type InputSlotId = EntityId<InputSlot>;
@@ -20,6 +22,8 @@ pub enum Data {
     Number(f32),
     String(String),
 }
+
+pub type SharedData = Arc<Data>;
 
 impl Data {
     pub fn value<T: Clone>(&self) -> Option<T>

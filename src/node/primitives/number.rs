@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use crate::{DataType, EvaluationContext, InputSlot, NodeImpl, OutputSlot};
 
 #[derive(Debug)]
@@ -21,7 +23,10 @@ impl NodeImpl for NumberNode {
         }
     }
 
-    async fn execute(&self, _evaluation_context: &mut EvaluationContext) -> Result<(), String> {
+    async fn execute(
+        &self,
+        _evaluation_context: Arc<Mutex<EvaluationContext>>,
+    ) -> Result<(), String> {
         Ok(())
     }
 }

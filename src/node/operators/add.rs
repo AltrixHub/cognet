@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use crate::{Data, DataType, EvaluationContext, InputSlot, NodeCore, NodeImpl, OutputSlot};
 
 #[derive(Debug)]
@@ -25,12 +27,15 @@ impl NodeImpl for AddListNode {
         }
     }
 
-    async fn execute(&self, evaluation_context: &mut EvaluationContext) -> Result<(), String> {
-        let data_list = self.input_value(evaluation_context, 0)?;
+    async fn execute(
+        &self,
+        evaluation_context: Arc<Mutex<EvaluationContext>>,
+    ) -> Result<(), String> {
+        let data_list = self.input_value(Arc::clone(&evaluation_context), 0)?;
         let mut result = 0.;
         for data in data_list {
-            match data {
-                Data::Number(value) => result += value,
+            match data.value() {
+                Some(Data::Number(value)) => result += value,
                 _ => return Err("Expected number".to_string()),
             }
         }
