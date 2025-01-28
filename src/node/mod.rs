@@ -4,7 +4,9 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use crate::{AsAny, Data, EntityId, InputSlot, OutputSlot, SharedData, SharedExecutionCache};
+use crate::{
+    AsAny, Data, DataType, EntityId, InputSlot, OutputSlot, SharedData, SharedExecutionCache,
+};
 use std::{any::Any, fmt::Debug, sync::Arc};
 
 pub type NodeId = EntityId<Arc<dyn NodeImpl>>;
@@ -33,23 +35,78 @@ pub trait NodeCore: Debug + Send + Sync + AsAny {
         &self,
         cache: SharedExecutionCache,
         slot_index: usize,
-    ) -> Result<Vec<SharedData>, String>;
+    ) -> Result<Vec<SharedData>, String> {
+        let input_slot = self
+            .inputs()
+            .get(slot_index)
+            .ok_or_else(|| "Invalid slot index".to_string())?;
 
-    fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot>;
+        let cache = cache.lock()?;
+        let result: Vec<SharedData> = input_slot
+            .connected_edges
+            .iter()
+            .filter_map(|edge_id| {
+                cache.edges.get(edge_id).and_then(|edge| {
+                    cache
+                        .outputs
+                        .get(&edge.from_output_slot_id)
+                        .map(|shared_data| shared_data.share())
+                })
+            })
+            .collect();
 
-    fn get_output_slot_by_index(&self, output_slot_index: usize) -> Option<&OutputSlot>;
+        Ok(result)
+    }
 
-    fn get_input_slot_by_index_mut(&mut self, input_slot_index: usize) -> Option<&mut InputSlot>;
+    fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot> {
+        self.inputs().get(input_slot_index)
+    }
 
     fn set_output_value(
         &self,
         cache: SharedExecutionCache,
         slot_index: usize,
         value: Data,
-    ) -> Result<(), String>;
+    ) -> Result<(), String> {
+        match self.outputs().get(slot_index) {
+            Some(slot) => match (&slot.data_type, value) {
+                (DataType::Number, Data::Number(number)) => {
+                    cache
+                        .lock()?
+                        .outputs
+                        .insert(slot.id.clone(), SharedData::new(Data::Number(number)));
+                    Ok(())
+                }
+                (DataType::String, Data::String(string)) => {
+                    cache
+                        .lock()?
+                        .outputs
+                        .insert(slot.id.clone(), SharedData::new(Data::String(string)));
+                    Ok(())
+                }
+                (expected, actual) => Err(format!(
+                    "Type mismatch: expected {:?}, but got {:?}",
+                    expected, actual
+                )),
+            },
+            None => Err("Invalid value index".to_string()),
+        }
+    }
 
-    fn get_output_slot_by_index_mut(&mut self, output_slot_index: usize)
-        -> Option<&mut OutputSlot>;
+    fn get_output_slot_by_index(&self, output_slot_index: usize) -> Option<&OutputSlot> {
+        self.outputs().get(output_slot_index)
+    }
+
+    fn get_input_slot_by_index_mut(&mut self, input_slot_index: usize) -> Option<&mut InputSlot> {
+        self.inputs_mut().get_mut(input_slot_index)
+    }
+
+    fn get_output_slot_by_index_mut(
+        &mut self,
+        output_slot_index: usize,
+    ) -> Option<&mut OutputSlot> {
+        self.outputs_mut().get_mut(output_slot_index)
+    }
 
     fn node_name(&self) -> &'static str;
 
@@ -77,80 +134,6 @@ macro_rules! impl_node_core {
     ($($struct_name:ident),*) => {
         $(
             impl $crate::NodeCore for $struct_name {
-                fn input_value(
-                    &self,
-                    cache: $crate::SharedExecutionCache,
-                    slot_index: usize,
-                ) ->  Result<Vec<$crate::SharedData>, String> {
-                    let input_slot = self.inputs().get(slot_index).ok_or_else(|| "Invalid slot index".to_string())?;
-
-                    let cache = cache.lock()?;
-                    let result: Vec<$crate::SharedData> = input_slot
-                        .connected_edges
-                        .iter()
-                        .filter_map(|edge_id| {
-                            cache.edges.get(edge_id).and_then(|edge| {
-                                cache.outputs.get(&edge.from_output_slot_id).map(|shared_data| shared_data.share())
-                            })
-                        })
-                        .collect();
-
-                    Ok(result)
-                }
-
-                fn set_output_value(
-                    &self,
-                    cache: $crate::SharedExecutionCache,
-                    slot_index: usize,
-                    value: $crate::Data,
-                ) -> Result<(), String> {
-                    match self.outputs().get(slot_index) {
-                        Some(slot) => match (&slot.data_type, value) {
-                            ($crate::DataType::Number, $crate::Data::Number(number)) => {
-                                cache.lock()?.outputs.insert(slot.id.clone(), $crate::SharedData::new($crate::Data::Number(number)));
-                                Ok(())
-                            }
-                            ($crate::DataType::String, $crate::Data::String(string)) => {
-                                cache.lock()?.outputs.insert(slot.id.clone(), $crate::SharedData::new($crate::Data::String(string)));
-                                Ok(())
-                            }
-                            (expected, actual) => Err(format!(
-                                "Type mismatch: expected {:?}, but got {:?}",
-                                expected, actual
-                            )),
-                        },
-                        None => Err("Invalid value index".to_string()),
-                    }
-                }
-
-                fn get_input_slot_by_index(
-                    &self,
-                    input_slot_index: usize,
-                ) -> Option<&$crate::InputSlot> {
-                    self.inputs().get(input_slot_index)
-                }
-
-                fn get_output_slot_by_index(
-                    &self,
-                    output_slot_index: usize,
-                ) -> Option<&$crate::OutputSlot> {
-                    self.outputs().get(output_slot_index)
-                }
-
-                fn get_input_slot_by_index_mut(
-                    &mut self,
-                    input_slot_index: usize,
-                ) -> Option<&mut $crate::InputSlot> {
-                    self.inputs.get_mut(input_slot_index)
-                }
-
-                fn get_output_slot_by_index_mut(
-                    &mut self,
-                    output_slot_index: usize,
-                ) -> Option<&mut $crate::OutputSlot> {
-                    self.outputs.get_mut(output_slot_index)
-                }
-
                 fn node_name(&self) -> &'static str {
                     self.node_name
                 }
