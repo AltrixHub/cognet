@@ -29,9 +29,9 @@ impl NodeImpl for AddListNode {
         let data_list = self.input_value(cache.share(), 0)?;
         let mut result = 0.;
         for data in data_list {
-            match *data {
+            match data.get() {
                 Data::Number(value) => result += value,
-                _ => return Err("Expected number".to_string()),
+                _ => return Err("Failed get data: expected number".to_string()),
             }
         }
         self.set_output_value(cache, 0, Data::Number(result))?;

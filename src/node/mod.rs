@@ -85,9 +85,15 @@ macro_rules! impl_node_core {
                     let input_slot = self.inputs().get(slot_index).ok_or_else(|| "Invalid slot index".to_string())?;
 
                     let cache = cache.lock()?;
-                    let result = input_slot.connected_edges.iter().filter_map(|edge_id| {
-                        cache.edges.get(edge_id).and_then(|edge| cache.outputs.get(&edge.from_output_slot_id).map(Arc::clone))
-                    }).collect();
+                    let result: Vec<$crate::SharedData> = input_slot
+                        .connected_edges
+                        .iter()
+                        .filter_map(|edge_id| {
+                            cache.edges.get(edge_id).and_then(|edge| {
+                                cache.outputs.get(&edge.from_output_slot_id).map(|shared_data| shared_data.share())
+                            })
+                        })
+                        .collect();
 
                     Ok(result)
                 }
@@ -99,13 +105,13 @@ macro_rules! impl_node_core {
                     value: $crate::Data,
                 ) -> Result<(), String> {
                     match self.outputs().get(slot_index) {
-                        Some(slot) => match (&slot.data_type, &value) {
+                        Some(slot) => match (&slot.data_type, value) {
                             ($crate::DataType::Number, $crate::Data::Number(number)) => {
-                                cache.lock()?.outputs.insert(slot.id.clone(), $crate::Data::Number(number.clone()).into());
+                                cache.lock()?.outputs.insert(slot.id.clone(), $crate::SharedData::new($crate::Data::Number(number)));
                                 Ok(())
                             }
                             ($crate::DataType::String, $crate::Data::String(string)) => {
-                                cache.lock()?.outputs.insert(slot.id.clone(), $crate::Data::String(string.clone()).into());
+                                cache.lock()?.outputs.insert(slot.id.clone(), $crate::SharedData::new($crate::Data::String(string)));
                                 Ok(())
                             }
                             (expected, actual) => Err(format!(

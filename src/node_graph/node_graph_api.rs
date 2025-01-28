@@ -219,7 +219,7 @@ impl NodeGraphAPI for NodeGraph {
         let slot = read_node.outputs().get(output_slot_index)?;
 
         let cache = self.cache.lock().ok()?;
-        cache.outputs.get(&slot.id).cloned()
+        cache.outputs.get(&slot.id).map(|data| data.share())
     }
 
     async fn set_default_value<T: 'static + NodePrimitive + NodeImpl>(
