@@ -4,12 +4,8 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use crate::{AsAny, Data, EntityId, EvaluationContext, InputSlot, OutputSlot, SharedData};
-use std::{
-    any::Any,
-    fmt::Debug,
-    sync::{Arc, Mutex},
-};
+use crate::{AsAny, Data, EntityId, InputSlot, OutputSlot, SharedData, SharedExecutionCache};
+use std::{any::Any, fmt::Debug, sync::Arc};
 
 pub type NodeId = EntityId<Arc<dyn NodeImpl>>;
 
@@ -19,10 +15,7 @@ pub trait NodeImpl: Debug + Send + Sync + NodeCore {
     where
         Self: Sized;
 
-    async fn execute(
-        &self,
-        evaluation_context: Arc<Mutex<EvaluationContext>>,
-    ) -> Result<(), String>;
+    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String>;
 }
 
 impl dyn NodeImpl {
@@ -38,7 +31,7 @@ impl dyn NodeImpl {
 pub trait NodeCore: Debug + Send + Sync + AsAny {
     fn input_value(
         &self,
-        evaluation_context: Arc<Mutex<EvaluationContext>>,
+        cache: SharedExecutionCache,
         slot_index: usize,
     ) -> Result<Vec<SharedData>, String>;
 
@@ -50,7 +43,7 @@ pub trait NodeCore: Debug + Send + Sync + AsAny {
 
     fn set_output_value(
         &self,
-        evaluation_context: Arc<Mutex<EvaluationContext>>,
+        cache: SharedExecutionCache,
         slot_index: usize,
         value: Data,
     ) -> Result<(), String>;
@@ -86,16 +79,14 @@ macro_rules! impl_node_core {
             impl $crate::NodeCore for $struct_name {
                 fn input_value(
                     &self,
-                    evaluation_context: Arc<std::sync::Mutex<$crate::EvaluationContext>>,
+                    cache: $crate::SharedExecutionCache,
                     slot_index: usize,
                 ) ->  Result<Vec<$crate::SharedData>, String> {
                     let input_slot = self.inputs().get(slot_index).ok_or_else(|| "Invalid slot index".to_string())?;
 
-                    let context = evaluation_context
-                        .lock()
-                        .map_err(|_| "Failed to lock context")?;
+                    let cache = cache.lock()?;
                     let result = input_slot.connected_edges.iter().filter_map(|edge_id| {
-                        context.edges.get(edge_id).and_then(|edge| context.outputs.get(&edge.from_output_slot_id).map(Arc::clone))
+                        cache.edges.get(edge_id).and_then(|edge| cache.outputs.get(&edge.from_output_slot_id).map(Arc::clone))
                     }).collect();
 
                     Ok(result)
@@ -103,24 +94,18 @@ macro_rules! impl_node_core {
 
                 fn set_output_value(
                     &self,
-                    evaluation_context: Arc<std::sync::Mutex<$crate::EvaluationContext>>,
+                    cache: $crate::SharedExecutionCache,
                     slot_index: usize,
                     value: $crate::Data,
                 ) -> Result<(), String> {
                     match self.outputs().get(slot_index) {
                         Some(slot) => match (&slot.data_type, &value) {
                             ($crate::DataType::Number, $crate::Data::Number(number)) => {
-                                let mut context = evaluation_context.lock().map_err(|_| "Failed to lock context")?;
-                                context
-                                    .outputs
-                                    .insert(slot.id.clone(), $crate::Data::Number(number.clone()).into());
+                                cache.lock()?.outputs.insert(slot.id.clone(), $crate::Data::Number(number.clone()).into());
                                 Ok(())
                             }
                             ($crate::DataType::String, $crate::Data::String(string)) => {
-                                let mut context = evaluation_context.lock().map_err(|_| "Failed to lock context")?;
-                                context
-                                    .outputs
-                                    .insert(slot.id.clone(), $crate::Data::String(string.clone()).into());
+                                cache.lock()?.outputs.insert(slot.id.clone(), $crate::Data::String(string.clone()).into());
                                 Ok(())
                             }
                             (expected, actual) => Err(format!(
@@ -185,12 +170,8 @@ macro_rules! impl_node_core {
 }
 
 pub trait NodePrimitive: NodeCore {
-    fn set_default_value(
-        &self,
-        evaluation_context: Arc<Mutex<EvaluationContext>>,
-        value: Data,
-    ) -> Result<(), String> {
-        self.set_output_value(evaluation_context, 0, value)
+    fn set_default_value(&self, cache: SharedExecutionCache, value: Data) -> Result<(), String> {
+        self.set_output_value(cache, 0, value)
     }
 }
 

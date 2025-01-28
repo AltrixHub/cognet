@@ -1,6 +1,4 @@
-use std::sync::{Arc, Mutex};
-
-use crate::{Data, DataType, EvaluationContext, InputSlot, NodeCore, NodeImpl, OutputSlot};
+use crate::{Data, DataType, InputSlot, NodeCore, NodeImpl, OutputSlot, SharedExecutionCache};
 
 #[derive(Debug)]
 pub struct AddListNode {
@@ -27,11 +25,8 @@ impl NodeImpl for AddListNode {
         }
     }
 
-    async fn execute(
-        &self,
-        evaluation_context: Arc<Mutex<EvaluationContext>>,
-    ) -> Result<(), String> {
-        let data_list = self.input_value(Arc::clone(&evaluation_context), 0)?;
+    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
+        let data_list = self.input_value(cache.share(), 0)?;
         let mut result = 0.;
         for data in data_list {
             match *data {
@@ -39,7 +34,7 @@ impl NodeImpl for AddListNode {
                 _ => return Err("Expected number".to_string()),
             }
         }
-        self.set_output_value(evaluation_context, 0, Data::Number(result))?;
+        self.set_output_value(cache, 0, Data::Number(result))?;
         Ok(())
     }
 }

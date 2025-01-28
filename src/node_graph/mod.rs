@@ -1,21 +1,18 @@
-pub mod evaluation_context;
+pub mod execution_cache;
 pub mod node_graph_api;
 pub mod node_graph_system;
 pub mod node_manager;
 
-pub use evaluation_context::*;
+pub use execution_cache::*;
 pub use node_graph_api::*;
 pub use node_manager::*;
 
 use crate::NodeId;
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use std::collections::HashSet;
 
 pub struct NodeGraph {
     node_manager: NodeManager,
-    context: Arc<Mutex<EvaluationContext>>,
+    cache: SharedExecutionCache,
     dirty_nodes: HashSet<NodeId>,
 }
 
@@ -23,7 +20,7 @@ impl Default for NodeGraph {
     fn default() -> Self {
         Self {
             node_manager: NodeManager::new(),
-            context: Default::default(),
+            cache: Default::default(),
             dirty_nodes: Default::default(),
         }
     }
