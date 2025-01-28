@@ -8,11 +8,14 @@ pub use node_graph_api::*;
 pub use node_manager::*;
 
 use crate::NodeId;
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 pub struct NodeGraph {
     node_manager: NodeManager,
-    context: EvaluationContext,
+    context: Arc<Mutex<EvaluationContext>>,
     dirty_nodes: HashSet<NodeId>,
 }
 

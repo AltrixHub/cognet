@@ -1,11 +1,13 @@
-use crate::{Edge, EdgeId, EvaluationContext, NodeGraph, NodeGraphAPI, NodeId, NodeManager};
+use crate::{Edge, EdgeId, NodeGraph, NodeGraphAPI, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
-    fn topological_sort(&self, target_nodes: &HashSet<NodeId>)
-        -> Result<Vec<NodeId>, &'static str>;
+    fn topological_sort(
+        &self,
+        target_nodes: &HashSet<NodeId>,
+    ) -> Result<Vec<Vec<NodeId>>, &'static str>;
 
-    fn create_edge(
+    async fn create_edge(
         &self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
@@ -13,20 +15,22 @@ pub(crate) trait NodeGraphSystem {
         to_input_slot_index: usize,
     ) -> Result<Edge, &'static str>;
 
-    fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
+    async fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
 
-    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Vec<NodeId>;
+    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String>;
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>);
 
-    fn resources_mut(&mut self) -> (&mut NodeManager, &mut EvaluationContext);
+    fn remove_edges_from_context(&self, node_id: &NodeId) -> Result<(), &'static str>;
+
+    fn remove_edge_from_context(&self, edge_id: &EdgeId) -> Result<Edge, &'static str>;
 }
 
 impl NodeGraphSystem for NodeGraph {
     fn topological_sort(
         &self,
         target_nodes: &HashSet<NodeId>,
-    ) -> Result<Vec<NodeId>, &'static str> {
+    ) -> Result<Vec<Vec<NodeId>>, &'static str> {
         let mut in_degree = HashMap::new();
         let mut adj_list = HashMap::new();
 
@@ -34,7 +38,9 @@ impl NodeGraphSystem for NodeGraph {
             in_degree.insert(node_id.clone(), 0);
             adj_list.insert(node_id.clone(), Vec::new());
         }
-        for edge in self.context.edges.values() {
+
+        let context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        for edge in context.edges.values() {
             if target_nodes.contains(&edge.from_node_id) && target_nodes.contains(&edge.to_node_id)
             {
                 in_degree
@@ -56,29 +62,38 @@ impl NodeGraphSystem for NodeGraph {
 
         let mut sorted = Vec::new();
 
-        while let Some(node_id) = queue.pop_front() {
-            sorted.push(node_id.clone());
+        while !queue.is_empty() {
+            let mut current_level = Vec::new();
 
-            if let Some(neighbors) = adj_list.get(&node_id) {
-                for neighbor in neighbors {
-                    if let Some(deg) = in_degree.get_mut(&neighbor) {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push_back(neighbor.clone());
+            for _ in 0..queue.len() {
+                if let Some(node_id) = queue.pop_front() {
+                    current_level.push(node_id.clone());
+
+                    if let Some(neighbors) = adj_list.get(&node_id) {
+                        for neighbor in neighbors {
+                            if let Some(deg) = in_degree.get_mut(neighbor) {
+                                *deg -= 1;
+                                if *deg == 0 {
+                                    queue.push_back(neighbor.clone());
+                                }
+                            }
                         }
                     }
                 }
             }
+
+            sorted.push(current_level);
         }
 
-        if sorted.len() != target_nodes.len() {
+        let total_count: usize = sorted.iter().map(|level| level.len()).sum();
+        if total_count != target_nodes.len() {
             return Err("Graph contains a cycle.");
         }
 
         Ok(sorted)
     }
 
-    fn create_edge(
+    async fn create_edge(
         &self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
@@ -88,8 +103,11 @@ impl NodeGraphSystem for NodeGraph {
         let from_output_slot_id = {
             let node = self
                 .get_node_by_id(from_node_id)
+                .await
                 .ok_or("From node not found")?;
-            node.outputs()
+            let read_node = node.read().await;
+            read_node
+                .outputs()
                 .get(from_output_slot_index)
                 .ok_or("Invalid output slot index")?
                 .id
@@ -97,13 +115,19 @@ impl NodeGraphSystem for NodeGraph {
         };
 
         let to_input_slot_id = {
-            let node = self.get_node_by_id(to_node_id).ok_or("To node not found")?;
-            node.inputs()
+            let node = self
+                .get_node_by_id(to_node_id)
+                .await
+                .ok_or("To node not found")?;
+            let read_node = node.read().await;
+            read_node
+                .inputs()
                 .get(to_input_slot_index)
                 .ok_or("Invalid input slot index")?
                 .id
                 .clone()
         };
+
         Ok(Edge {
             from_node_id: from_node_id.clone(),
             from_output_slot_index,
@@ -114,22 +138,23 @@ impl NodeGraphSystem for NodeGraph {
         })
     }
 
-    fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
+    async fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
         let from_node_id = edge.from_node_id.clone();
         let to_node_id = edge.to_node_id.clone();
 
         let from_node = self
             .node_manager
-            .nodes()
-            .get(&from_node_id)
+            .get_node_by_id(&from_node_id)
+            .await
             .ok_or_else(|| format!("From node {:?} does not exist", edge.from_node_id))?;
         let to_node = self
             .node_manager
-            .nodes()
-            .get(&to_node_id)
+            .get_node_by_id(&to_node_id)
+            .await
             .ok_or_else(|| format!("To node {:?} does not exist", edge.to_node_id))?;
 
-        let from_slot = from_node
+        let mut write_from_node = from_node.write().await;
+        let from_slot = write_from_node
             .get_output_slot_by_index(edge.from_output_slot_index)
             .ok_or_else(|| {
                 format!(
@@ -137,7 +162,9 @@ impl NodeGraphSystem for NodeGraph {
                     edge.from_output_slot_index, edge.from_node_id
                 )
             })?;
-        let to_slot = to_node
+
+        let mut write_to_node = to_node.write().await;
+        let to_slot = write_to_node
             .get_input_slot_by_index(edge.to_input_slot_index)
             .ok_or_else(|| {
                 format!(
@@ -155,32 +182,33 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        if let Some(node) = self.node_manager.nodes_mut().get_mut(&from_node_id) {
-            if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
-                slot.connected_edges.push(edge_id.clone());
-            }
+        if let Some(slot) =
+            write_from_node.get_output_slot_by_index_mut(edge.from_output_slot_index)
+        {
+            slot.connected_edges.push(edge_id.clone());
         }
 
-        if let Some(node) = self.node_manager.nodes_mut().get_mut(&to_node_id) {
-            if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-                slot.connected_edges.push(edge_id.clone());
-            }
+        if let Some(slot) = write_to_node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
+            slot.connected_edges.push(edge_id.clone());
         }
 
-        let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id]);
+        let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
-        self.context.edges.insert(edge_id.clone(), edge);
+        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        context.edges.insert(edge_id.clone(), edge);
 
         Ok(edge_id)
     }
 
-    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Vec<NodeId> {
+    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String> {
         let mut affected = HashSet::new();
         let mut queue = VecDeque::from(initial_nodes);
 
+        let context = self.context.lock().map_err(|_| "Failed to lock context")?;
+
         while let Some(node_id) = queue.pop_front() {
             if affected.insert(node_id.clone()) {
-                for edge in self.context.edges.values() {
+                for edge in context.edges.values() {
                     if edge.from_node_id == node_id && !affected.contains(&edge.to_node_id) {
                         queue.push_back(edge.to_node_id.clone());
                     }
@@ -188,14 +216,23 @@ impl NodeGraphSystem for NodeGraph {
             }
         }
 
-        affected.into_iter().collect()
+        Ok(affected.into_iter().collect())
+    }
+
+    fn remove_edges_from_context(&self, node_id: &NodeId) -> Result<(), &'static str> {
+        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        context
+            .edges
+            .retain(|_, edge| edge.from_node_id != *node_id && edge.to_node_id != *node_id);
+        Ok(())
+    }
+
+    fn remove_edge_from_context(&self, edge_id: &EdgeId) -> Result<Edge, &'static str> {
+        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        context.edges.remove(edge_id).ok_or("Edge does not exist")
     }
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>) {
         self.dirty_nodes.extend(nodes.into_iter());
-    }
-
-    fn resources_mut(&mut self) -> (&mut NodeManager, &mut EvaluationContext) {
-        (&mut self.node_manager, &mut self.context)
     }
 }

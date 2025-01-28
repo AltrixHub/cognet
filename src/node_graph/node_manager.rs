@@ -1,11 +1,18 @@
-use crate::{impl_node_core, impl_primitive_node_core, AddListNode, NodeId, NodeImpl, NumberNode};
-use std::{any::TypeId, collections::HashMap, sync::Arc};
+use tokio::sync::{Mutex, RwLock};
 
-type NodeFactory = Arc<dyn Fn() -> Box<dyn NodeImpl> + Send + Sync>;
+use crate::{impl_node_core, impl_primitive_node_core, AddListNode, NodeId, NodeImpl, NumberNode};
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    sync::Arc,
+};
+
+pub type NodeEntity = Arc<RwLock<dyn NodeImpl>>;
+type NodeFactory = Arc<dyn Fn() -> NodeEntity + Send + Sync>;
 
 #[derive(Default)]
 pub struct NodeManager {
-    nodes: HashMap<NodeId, Box<dyn NodeImpl>>,
+    nodes: Arc<Mutex<HashMap<NodeId, NodeEntity>>>,
     node_registry: HashMap<TypeId, NodeFactory>,
 }
 
@@ -15,17 +22,60 @@ impl_primitive_node_core!(NumberNode);
 impl NodeManager {
     pub fn new() -> Self {
         let mut manager = Self::default();
-        manager.register::<AddListNode>(Arc::new(|| Box::new(AddListNode::initialize())));
-        manager.register::<NumberNode>(Arc::new(|| Box::new(NumberNode::initialize())));
+        manager.register::<AddListNode>(Arc::new(|| {
+            Arc::new(RwLock::new(AddListNode::initialize()))
+        }));
+        manager
+            .register::<NumberNode>(Arc::new(|| Arc::new(RwLock::new(NumberNode::initialize()))));
         manager
     }
 
-    pub fn nodes(&self) -> &HashMap<NodeId, Box<dyn NodeImpl>> {
-        &self.nodes
+    pub fn nodes(&self) -> Arc<Mutex<HashMap<NodeId, NodeEntity>>> {
+        Arc::clone(&self.nodes)
     }
 
-    pub fn nodes_mut(&mut self) -> &mut HashMap<NodeId, Box<dyn NodeImpl>> {
-        &mut self.nodes
+    pub async fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
+        let nodes = self.nodes.lock().await;
+        nodes.get(id).cloned()
+    }
+
+    pub async fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
+        let nodes = self.nodes.lock().await;
+
+        ids.into_iter()
+            .filter_map(|id| {
+                nodes.get(&id).map(|node| (id, Arc::clone(node))) // 指定されたNodeIdのNodeEntityを取得
+            })
+            .collect()
+    }
+
+    pub async fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
+        let nodes = self.nodes.lock().await;
+
+        let mut result: Vec<NodeId> = Vec::new();
+
+        for (id, node) in nodes.iter() {
+            if TypeId::of::<T>() == node.type_id() {
+                result.push(id.clone());
+            }
+        }
+
+        result
+    }
+
+    pub async fn contains_key(&self, id: &NodeId) -> bool {
+        let nodes = self.nodes.lock().await;
+        nodes.contains_key(id)
+    }
+
+    pub async fn node_insert(&self, node_id: NodeId, node: NodeEntity) -> Option<NodeEntity> {
+        let mut nodes = self.nodes.lock().await;
+        nodes.insert(node_id.clone(), node)
+    }
+
+    pub async fn node_remove(&self, node_id: &NodeId) -> Option<NodeEntity> {
+        let mut nodes = self.nodes.lock().await;
+        nodes.remove(node_id)
     }
 
     pub fn register<T>(&mut self, factory: NodeFactory)
@@ -35,14 +85,14 @@ impl NodeManager {
         self.node_registry.insert(TypeId::of::<T>(), factory);
     }
 
-    pub fn create_node<T>(&mut self) -> Result<NodeId, String>
+    pub async fn create_node<T>(&mut self) -> Result<NodeId, String>
     where
         T: NodeImpl + 'static,
     {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
             let node = factory();
             let node_id = NodeId::new();
-            self.nodes.insert(node_id.clone(), node);
+            self.node_insert(node_id.clone(), node).await;
             Ok(node_id)
         } else {
             Err(format!("{:?} is not registered", TypeId::of::<T>()))

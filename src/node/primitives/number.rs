@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use crate::{DataType, EvaluationContext, InputSlot, NodeImpl, OutputSlot};
 
 #[derive(Debug)]
@@ -7,6 +9,7 @@ pub struct NumberNode {
     pub outputs: Vec<OutputSlot>,
 }
 
+#[async_trait::async_trait]
 impl NodeImpl for NumberNode {
     fn initialize() -> Self {
         Self {
@@ -20,7 +23,10 @@ impl NodeImpl for NumberNode {
         }
     }
 
-    fn execute(&self, _evaluation_context: &mut EvaluationContext) -> Result<(), String> {
+    async fn execute(
+        &self,
+        _evaluation_context: Arc<Mutex<EvaluationContext>>,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
