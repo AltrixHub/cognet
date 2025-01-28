@@ -34,8 +34,8 @@ impl NodeImpl for AddListNode {
         let data_list = self.input_value(Arc::clone(&evaluation_context), 0)?;
         let mut result = 0.;
         for data in data_list {
-            match data.value() {
-                Some(Data::Number(value)) => result += value,
+            match *data {
+                Data::Number(value) => result += value,
                 _ => return Err("Expected number".to_string()),
             }
         }

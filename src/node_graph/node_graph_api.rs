@@ -1,4 +1,4 @@
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use futures::future::join_all;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -79,8 +79,8 @@ impl NodeGraphAPI for NodeGraph {
         let context = Arc::clone(&self.context);
 
         for level_nodes in sorted_node_levels {
-            let tasks: Vec<_> = level_nodes
-                .into_par_iter()
+            let tasks = level_nodes
+                .into_iter()
                 .map(|node_id| {
                     let nodes = Arc::clone(&nodes);
                     let context = Arc::clone(&context);
@@ -94,10 +94,12 @@ impl NodeGraphAPI for NodeGraph {
                         Ok::<(), String>(())
                     })
                 })
-                .collect();
+                .collect::<Vec<_>>();
 
-            for task in tasks {
-                task.await.map_err(|e| e.to_string())??;
+            let results = join_all(tasks).await;
+
+            for result in results {
+                result.map_err(|e| e.to_string())??;
             }
         }
 

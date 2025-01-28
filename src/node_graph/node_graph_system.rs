@@ -153,8 +153,8 @@ impl NodeGraphSystem for NodeGraph {
             .await
             .ok_or_else(|| format!("To node {:?} does not exist", edge.to_node_id))?;
 
-        let read_from_node = from_node.read().await;
-        let from_slot = read_from_node
+        let mut write_from_node = from_node.write().await;
+        let from_slot = write_from_node
             .get_output_slot_by_index(edge.from_output_slot_index)
             .ok_or_else(|| {
                 format!(
@@ -163,8 +163,8 @@ impl NodeGraphSystem for NodeGraph {
                 )
             })?;
 
-        let read_to_node = to_node.read().await;
-        let to_slot = read_to_node
+        let mut write_to_node = to_node.write().await;
+        let to_slot = write_to_node
             .get_input_slot_by_index(edge.to_input_slot_index)
             .ok_or_else(|| {
                 format!(
@@ -182,20 +182,14 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        if let Some(node) = self.node_manager.get_node_by_id(&from_node_id).await {
-            let mut write_node = node.write().await;
-
-            if let Some(slot) = write_node.get_output_slot_by_index_mut(edge.from_output_slot_index)
-            {
-                slot.connected_edges.push(edge_id.clone());
-            }
+        if let Some(slot) =
+            write_from_node.get_output_slot_by_index_mut(edge.from_output_slot_index)
+        {
+            slot.connected_edges.push(edge_id.clone());
         }
 
-        if let Some(node) = self.node_manager.get_node_by_id(&to_node_id).await {
-            let mut write_node = node.write().await;
-            if let Some(slot) = write_node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-                slot.connected_edges.push(edge_id.clone());
-            }
+        if let Some(slot) = write_to_node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
+            slot.connected_edges.push(edge_id.clone());
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
