@@ -78,17 +78,17 @@ impl NodeGraphAPI for NodeGraph {
 
         let sorted_node_levels = self.topological_sort(&self.dirty_nodes)?;
 
-        let nodes = self.node_manager.nodes();
+        let shared_nodes = self.node_manager.nodes();
         let shared_cache = self.cache.share();
 
         for level_nodes in sorted_node_levels {
             let tasks = level_nodes
                 .into_iter()
                 .map(|node_id| {
-                    let nodes = Arc::clone(&nodes);
+                    let shared_nodes = shared_nodes.share();
                     let shared_cache = shared_cache.share();
                     tokio::spawn(async move {
-                        let nodes = nodes.lock().await;
+                        let nodes = shared_nodes.lock().await;
                         let node = nodes.get(&node_id).cloned();
                         if let Some(node) = node {
                             let node_write = node.read().await;
