@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -7,6 +8,7 @@ use crate::{
     NodeImpl, NodeManager, NodePrimitive, SharedData,
 };
 
+#[async_trait]
 pub trait NodeGraphAPI {
     fn new() -> Self;
 
@@ -55,6 +57,7 @@ pub trait NodeGraphAPI {
     ) -> Result<(), String>;
 }
 
+#[async_trait]
 impl NodeGraphAPI for NodeGraph {
     fn new() -> Self {
         Self::default()
