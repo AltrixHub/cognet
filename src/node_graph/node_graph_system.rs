@@ -7,7 +7,7 @@ pub(crate) trait NodeGraphSystem {
         target_nodes: &HashSet<NodeId>,
     ) -> Result<Vec<Vec<NodeId>>, &'static str>;
 
-    fn create_edge(
+    async fn create_edge(
         &self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
@@ -15,7 +15,7 @@ pub(crate) trait NodeGraphSystem {
         to_input_slot_index: usize,
     ) -> Result<Edge, &'static str>;
 
-    fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
+    async fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
 
     fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String>;
 
@@ -93,7 +93,7 @@ impl NodeGraphSystem for NodeGraph {
         Ok(sorted)
     }
 
-    fn create_edge(
+    async fn create_edge(
         &self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
@@ -103,8 +103,11 @@ impl NodeGraphSystem for NodeGraph {
         let from_output_slot_id = {
             let node = self
                 .get_node_by_id(from_node_id)
+                .await
                 .ok_or("From node not found")?;
-            node.outputs()
+            let read_node = node.read().await;
+            read_node
+                .outputs()
                 .get(from_output_slot_index)
                 .ok_or("Invalid output slot index")?
                 .id
@@ -112,13 +115,19 @@ impl NodeGraphSystem for NodeGraph {
         };
 
         let to_input_slot_id = {
-            let node = self.get_node_by_id(to_node_id).ok_or("To node not found")?;
-            node.inputs()
+            let node = self
+                .get_node_by_id(to_node_id)
+                .await
+                .ok_or("To node not found")?;
+            let read_node = node.read().await;
+            read_node
+                .inputs()
                 .get(to_input_slot_index)
                 .ok_or("Invalid input slot index")?
                 .id
                 .clone()
         };
+
         Ok(Edge {
             from_node_id: from_node_id.clone(),
             from_output_slot_index,
@@ -129,22 +138,23 @@ impl NodeGraphSystem for NodeGraph {
         })
     }
 
-    fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
+    async fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
         let from_node_id = edge.from_node_id.clone();
         let to_node_id = edge.to_node_id.clone();
 
         let from_node = self
             .node_manager
-            .nodes()
-            .get(&from_node_id)
+            .get_node_by_id(&from_node_id)
+            .await
             .ok_or_else(|| format!("From node {:?} does not exist", edge.from_node_id))?;
         let to_node = self
             .node_manager
-            .nodes()
-            .get(&to_node_id)
+            .get_node_by_id(&to_node_id)
+            .await
             .ok_or_else(|| format!("To node {:?} does not exist", edge.to_node_id))?;
 
-        let from_slot = from_node
+        let read_from_node = from_node.read().await;
+        let from_slot = read_from_node
             .get_output_slot_by_index(edge.from_output_slot_index)
             .ok_or_else(|| {
                 format!(
@@ -152,7 +162,9 @@ impl NodeGraphSystem for NodeGraph {
                     edge.from_output_slot_index, edge.from_node_id
                 )
             })?;
-        let to_slot = to_node
+
+        let read_to_node = to_node.read().await;
+        let to_slot = read_to_node
             .get_input_slot_by_index(edge.to_input_slot_index)
             .ok_or_else(|| {
                 format!(
@@ -170,14 +182,18 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        if let Some(node) = self.node_manager.nodes_mut().get_mut(&from_node_id) {
-            if let Some(slot) = node.get_output_slot_by_index_mut(edge.from_output_slot_index) {
+        if let Some(node) = self.node_manager.get_node_by_id(&from_node_id).await {
+            let mut write_node = node.write().await;
+
+            if let Some(slot) = write_node.get_output_slot_by_index_mut(edge.from_output_slot_index)
+            {
                 slot.connected_edges.push(edge_id.clone());
             }
         }
 
-        if let Some(node) = self.node_manager.nodes_mut().get_mut(&to_node_id) {
-            if let Some(slot) = node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
+        if let Some(node) = self.node_manager.get_node_by_id(&to_node_id).await {
+            let mut write_node = node.write().await;
+            if let Some(slot) = write_node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
                 slot.connected_edges.push(edge_id.clone());
             }
         }
