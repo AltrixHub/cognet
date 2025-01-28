@@ -1,4 +1,4 @@
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 
 use crate::{impl_node_core, impl_primitive_node_core, AddListNode, NodeId, NodeImpl, NumberNode};
 use std::{
@@ -11,8 +11,31 @@ pub type NodeEntity = Arc<RwLock<dyn NodeImpl>>;
 type NodeFactory = Arc<dyn Fn() -> NodeEntity + Send + Sync>;
 
 #[derive(Default)]
+pub struct SharedNodes {
+    inner: Arc<Mutex<HashMap<NodeId, NodeEntity>>>,
+}
+
+impl SharedNodes {
+    pub fn new(nodes: HashMap<NodeId, NodeEntity>) -> Self {
+        SharedNodes {
+            inner: Arc::new(Mutex::new(nodes)),
+        }
+    }
+
+    pub async fn lock(&self) -> MutexGuard<HashMap<NodeId, NodeEntity>> {
+        self.inner.lock().await
+    }
+
+    pub fn share(&self) -> Self {
+        SharedNodes {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[derive(Default)]
 pub struct NodeManager {
-    nodes: Arc<Mutex<HashMap<NodeId, NodeEntity>>>,
+    nodes: SharedNodes,
     node_registry: HashMap<TypeId, NodeFactory>,
 }
 
@@ -30,8 +53,8 @@ impl NodeManager {
         manager
     }
 
-    pub fn nodes(&self) -> Arc<Mutex<HashMap<NodeId, NodeEntity>>> {
-        Arc::clone(&self.nodes)
+    pub fn nodes(&self) -> SharedNodes {
+        self.nodes.share()
     }
 
     pub async fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {

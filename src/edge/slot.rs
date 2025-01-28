@@ -23,15 +23,31 @@ pub enum Data {
     String(String),
 }
 
-pub type SharedData = Arc<Data>;
+#[derive(Debug)]
+pub struct SharedData(Arc<Data>);
+
+impl SharedData {
+    pub fn new(data: Data) -> Self {
+        SharedData(Arc::new(data))
+    }
+
+    pub fn share(&self) -> Self {
+        SharedData(Arc::clone(&self.0))
+    }
+
+    pub fn get(&self) -> &Data {
+        &self.0
+    }
+
+    pub fn value<T: 'static>(&self) -> Option<&T> {
+        self.get().value()
+    }
+}
 
 impl Data {
-    pub fn value<T: Clone>(&self) -> Option<T>
-    where
-        T: 'static,
-    {
+    pub fn value<T: 'static>(&self) -> Option<&T> {
         if let Some(value) = self.as_any().downcast_ref::<T>() {
-            Some(value.clone())
+            Some(value)
         } else {
             None
         }

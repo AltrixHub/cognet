@@ -42,7 +42,7 @@ pub trait NodeGraphAPI {
 
     async fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String>;
 
-    fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, &'static str>;
+    fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
 
     async fn get_output_value(
         &self,
@@ -78,21 +78,21 @@ impl NodeGraphAPI for NodeGraph {
 
         let sorted_node_levels = self.topological_sort(&self.dirty_nodes)?;
 
-        let nodes = self.node_manager.nodes();
-        let context = Arc::clone(&self.context);
+        let shared_nodes = self.node_manager.nodes();
+        let shared_cache = self.cache.share();
 
         for level_nodes in sorted_node_levels {
             let tasks = level_nodes
                 .into_iter()
                 .map(|node_id| {
-                    let nodes = Arc::clone(&nodes);
-                    let context = Arc::clone(&context);
+                    let shared_nodes = shared_nodes.share();
+                    let shared_cache = shared_cache.share();
                     tokio::spawn(async move {
-                        let nodes = nodes.lock().await;
+                        let nodes = shared_nodes.lock().await;
                         let node = nodes.get(&node_id).cloned();
                         if let Some(node) = node {
                             let node_write = node.read().await;
-                            node_write.execute(context).await?;
+                            node_write.execute(shared_cache).await?;
                         }
                         Ok::<(), String>(())
                     })
@@ -113,7 +113,7 @@ impl NodeGraphAPI for NodeGraph {
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
         if self.node_manager.node_remove(&node_id).await.is_some() {
             let dirty_nodes = self.collect_dirty_nodes(vec![node_id.clone()])?;
-            self.remove_edges_from_context(&node_id)?;
+            self.remove_edges_from_cache(&node_id)?;
             self.mark_dirty_nodes(dirty_nodes);
             Ok(())
         } else {
@@ -159,7 +159,7 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     async fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
-        let edge = self.remove_edge_from_context(&edge_id)?;
+        let edge = self.remove_edge_from_cache(&edge_id)?;
 
         let from_node_id = edge.from_node_id;
         let to_node_id = edge.to_node_id;
@@ -185,9 +185,13 @@ impl NodeGraphAPI for NodeGraph {
         Ok(())
     }
 
-    fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, &'static str> {
-        let context = self.context.lock().map_err(|_| "Failed to lock context")?;
-        context.edges.get(&edge_id).cloned().ok_or("Edge not found")
+    fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String> {
+        let cache = self.cache.lock()?;
+        cache
+            .edges
+            .get(&edge_id)
+            .cloned()
+            .ok_or(format!("Edge not found: id {:?}", edge_id))
     }
 
     async fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity> {
@@ -214,8 +218,8 @@ impl NodeGraphAPI for NodeGraph {
         let read_node = node.read().await;
         let slot = read_node.outputs().get(output_slot_index)?;
 
-        let context = self.context.lock().ok()?;
-        context.outputs.get(&slot.id).cloned()
+        let cache = self.cache.lock().ok()?;
+        cache.outputs.get(&slot.id).map(|data| data.share())
     }
 
     async fn set_default_value<T: 'static + NodePrimitive + NodeImpl>(
@@ -237,7 +241,7 @@ impl NodeGraphAPI for NodeGraph {
             )
         })?;
 
-        downcast_node.set_default_value(self.context.clone(), value)?;
+        downcast_node.set_default_value(self.cache.share(), value)?;
 
         Ok(())
     }

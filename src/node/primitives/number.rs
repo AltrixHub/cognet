@@ -1,6 +1,4 @@
-use std::sync::{Arc, Mutex};
-
-use crate::{DataType, EvaluationContext, InputSlot, NodeImpl, OutputSlot};
+use crate::{DataType, InputSlot, NodeImpl, OutputSlot, SharedExecutionCache};
 
 #[derive(Debug)]
 pub struct NumberNode {
@@ -23,10 +21,7 @@ impl NodeImpl for NumberNode {
         }
     }
 
-    async fn execute(
-        &self,
-        _evaluation_context: Arc<Mutex<EvaluationContext>>,
-    ) -> Result<(), String> {
+    async fn execute(&self, _cache: SharedExecutionCache) -> Result<(), String> {
         Ok(())
     }
 }

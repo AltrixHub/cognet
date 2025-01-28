@@ -2,10 +2,7 @@ use crate::{Edge, EdgeId, NodeGraph, NodeGraphAPI, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
-    fn topological_sort(
-        &self,
-        target_nodes: &HashSet<NodeId>,
-    ) -> Result<Vec<Vec<NodeId>>, &'static str>;
+    fn topological_sort(&self, target_nodes: &HashSet<NodeId>) -> Result<Vec<Vec<NodeId>>, String>;
 
     async fn create_edge(
         &self,
@@ -21,16 +18,13 @@ pub(crate) trait NodeGraphSystem {
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>);
 
-    fn remove_edges_from_context(&self, node_id: &NodeId) -> Result<(), &'static str>;
+    fn remove_edges_from_cache(&self, node_id: &NodeId) -> Result<(), String>;
 
-    fn remove_edge_from_context(&self, edge_id: &EdgeId) -> Result<Edge, &'static str>;
+    fn remove_edge_from_cache(&self, edge_id: &EdgeId) -> Result<Edge, String>;
 }
 
 impl NodeGraphSystem for NodeGraph {
-    fn topological_sort(
-        &self,
-        target_nodes: &HashSet<NodeId>,
-    ) -> Result<Vec<Vec<NodeId>>, &'static str> {
+    fn topological_sort(&self, target_nodes: &HashSet<NodeId>) -> Result<Vec<Vec<NodeId>>, String> {
         let mut in_degree = HashMap::new();
         let mut adj_list = HashMap::new();
 
@@ -39,8 +33,8 @@ impl NodeGraphSystem for NodeGraph {
             adj_list.insert(node_id.clone(), Vec::new());
         }
 
-        let context = self.context.lock().map_err(|_| "Failed to lock context")?;
-        for edge in context.edges.values() {
+        let cache = self.cache.lock()?;
+        for edge in cache.edges.values() {
             if target_nodes.contains(&edge.from_node_id) && target_nodes.contains(&edge.to_node_id)
             {
                 in_degree
@@ -87,7 +81,7 @@ impl NodeGraphSystem for NodeGraph {
 
         let total_count: usize = sorted.iter().map(|level| level.len()).sum();
         if total_count != target_nodes.len() {
-            return Err("Graph contains a cycle.");
+            return Err("Graph contains a cycle.".to_string());
         }
 
         Ok(sorted)
@@ -194,8 +188,8 @@ impl NodeGraphSystem for NodeGraph {
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
-        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
-        context.edges.insert(edge_id.clone(), edge);
+        let mut cache = self.cache.lock()?;
+        cache.edges.insert(edge_id.clone(), edge);
 
         Ok(edge_id)
     }
@@ -204,11 +198,11 @@ impl NodeGraphSystem for NodeGraph {
         let mut affected = HashSet::new();
         let mut queue = VecDeque::from(initial_nodes);
 
-        let context = self.context.lock().map_err(|_| "Failed to lock context")?;
+        let cache = self.cache.lock()?;
 
         while let Some(node_id) = queue.pop_front() {
             if affected.insert(node_id.clone()) {
-                for edge in context.edges.values() {
+                for edge in cache.edges.values() {
                     if edge.from_node_id == node_id && !affected.contains(&edge.to_node_id) {
                         queue.push_back(edge.to_node_id.clone());
                     }
@@ -219,17 +213,20 @@ impl NodeGraphSystem for NodeGraph {
         Ok(affected.into_iter().collect())
     }
 
-    fn remove_edges_from_context(&self, node_id: &NodeId) -> Result<(), &'static str> {
-        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
-        context
+    fn remove_edges_from_cache(&self, node_id: &NodeId) -> Result<(), String> {
+        let mut cache = self.cache.lock()?;
+        cache
             .edges
             .retain(|_, edge| edge.from_node_id != *node_id && edge.to_node_id != *node_id);
         Ok(())
     }
 
-    fn remove_edge_from_context(&self, edge_id: &EdgeId) -> Result<Edge, &'static str> {
-        let mut context = self.context.lock().map_err(|_| "Failed to lock context")?;
-        context.edges.remove(edge_id).ok_or("Edge does not exist")
+    fn remove_edge_from_cache(&self, edge_id: &EdgeId) -> Result<Edge, String> {
+        let mut cache = self.cache.lock()?;
+        cache
+            .edges
+            .remove(edge_id)
+            .ok_or(format!("Edge does not exist: id: {:?}", edge_id))
     }
 
     fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>) {
