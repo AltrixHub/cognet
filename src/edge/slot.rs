@@ -1,5 +1,6 @@
 use std::{
-    any::{Any, TypeId},
+    any::{type_name, Any, TypeId},
+    fmt::Debug,
     sync::Arc,
 };
 
@@ -20,6 +21,22 @@ pub enum DataType {
     String,
 }
 
+impl DataType {
+    fn type_id(&self) -> TypeId {
+        match self {
+            DataType::Number => TypeId::of::<f64>(),
+            DataType::String => TypeId::of::<String>(),
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            DataType::Number => type_name::<f64>(),
+            DataType::String => type_name::<String>(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Data {
     value: Arc<dyn Any + Send + Sync>,
@@ -27,15 +44,13 @@ pub struct Data {
 }
 
 impl Data {
-    pub fn new<T: Any + Send + Sync>(value: T) -> Result<Self, &'static str> {
+    pub fn new<T: Any + Send + Sync + Debug>(value: T) -> Result<Self, String> {
         let type_id = TypeId::of::<T>();
 
-        let data_type = if type_id == TypeId::of::<f64>() {
-            DataType::Number
-        } else if type_id == TypeId::of::<String>() {
-            DataType::String
-        } else {
-            return Err("Invalid data type");
+        let data_type = match type_id {
+            t if t == TypeId::of::<f64>() => DataType::Number,
+            t if t == TypeId::of::<String>() => DataType::String,
+            _ => return Err(format!("Invalid DataType: {}", type_name::<T>())),
         };
 
         Ok(Data {
@@ -51,8 +66,22 @@ impl Data {
         }
     }
 
-    pub fn value<T: 'static>(&self) -> Option<&T> {
-        self.value.downcast_ref::<T>()
+    pub fn value<T: 'static>(&self) -> Result<&T, String> {
+        if TypeId::of::<T>() == self.data_type.type_id() {
+            self.value.downcast_ref::<T>().ok_or_else(|| {
+                format!(
+                    "Type mismatch: Expected {}, but got {}",
+                    self.data_type.type_name(),
+                    type_name::<T>()
+                )
+            })
+        } else {
+            Err(format!(
+                "Type mismatch: Expected {}, but got {}",
+                self.data_type.type_name(),
+                type_name::<T>()
+            ))
+        }
     }
 
     pub fn get_type(&self) -> DataType {
