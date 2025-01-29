@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    any::{Any, TypeId},
+    sync::Arc,
+};
 
 use crate::{EdgeId, EntityId};
 
@@ -10,54 +13,50 @@ pub enum SlotId {
     Output(OutputSlotId),
 }
 
-#[derive(Debug, PartialEq, Default, Clone)]
+#[derive(Debug, PartialEq, Default, Clone, Copy)]
 pub enum DataType {
     #[default]
     Number,
     String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Data {
-    Number(f32),
-    String(String),
-}
-
 #[derive(Debug)]
-pub struct SharedData(Arc<Data>);
-
-impl SharedData {
-    pub fn new(data: Data) -> Self {
-        SharedData(Arc::new(data))
-    }
-
-    pub fn share(&self) -> Self {
-        SharedData(Arc::clone(&self.0))
-    }
-
-    pub fn get(&self) -> &Data {
-        &self.0
-    }
-
-    pub fn value<T: 'static>(&self) -> Option<&T> {
-        self.get().value()
-    }
+pub struct Data {
+    value: Arc<dyn Any + Send + Sync>,
+    data_type: DataType,
 }
 
 impl Data {
-    pub fn value<T: 'static>(&self) -> Option<&T> {
-        if let Some(value) = self.as_any().downcast_ref::<T>() {
-            Some(value)
+    pub fn new<T: Any + Send + Sync>(value: T) -> Result<Self, &'static str> {
+        let type_id = TypeId::of::<T>();
+
+        let data_type = if type_id == TypeId::of::<f64>() {
+            DataType::Number
+        } else if type_id == TypeId::of::<String>() {
+            DataType::String
         } else {
-            None
+            return Err("Invalid data type");
+        };
+
+        Ok(Data {
+            value: Arc::new(value),
+            data_type,
+        })
+    }
+
+    pub fn share(&self) -> Self {
+        Data {
+            value: Arc::clone(&self.value),
+            data_type: self.data_type,
         }
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        match self {
-            Data::Number(n) => n as &dyn std::any::Any,
-            Data::String(s) => s as &dyn std::any::Any,
-        }
+    pub fn value<T: 'static>(&self) -> Option<&T> {
+        self.value.downcast_ref::<T>()
+    }
+
+    pub fn get_type(&self) -> DataType {
+        self.data_type
     }
 }
 
