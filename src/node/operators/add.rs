@@ -1,16 +1,16 @@
 use crate::{
-    DataType, InputSlot, NodeCore, NodeDataAccess, NodeImpl, OutputSlot, SharedExecutionCache,
+    DataType, InputSlot, NodeCore, NodeImpl, NodeValueSetter, OutputSlot, SharedExecutionCache,
 };
 
 #[derive(Debug)]
-pub struct AddListNode {
+pub struct AddNode {
     pub node_name: &'static str,
     pub inputs: Vec<InputSlot>,
     pub outputs: Vec<OutputSlot>,
 }
 
 #[async_trait::async_trait]
-impl NodeImpl for AddListNode {
+impl NodeImpl for AddNode {
     fn initialize() -> Self {
         Self {
             node_name: "Addition",
@@ -33,7 +33,7 @@ impl NodeImpl for AddListNode {
         for data in data_list {
             result += data.value()?;
         }
-        self.set_output_value(cache, 0, result)?;
+        self.set_output_value(cache, 0, Box::new(result))?;
         Ok(())
     }
 }

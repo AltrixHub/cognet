@@ -10,7 +10,7 @@ use std::{any::Any, fmt::Debug, sync::Arc};
 pub type NodeId = EntityId<Arc<dyn NodeImpl>>;
 
 #[async_trait::async_trait]
-pub trait NodeImpl: Debug + Send + Sync + NodeCore {
+pub trait NodeImpl: Debug + Send + Sync + AsAny {
     fn initialize() -> Self
     where
         Self: Sized;
@@ -28,7 +28,7 @@ impl dyn NodeImpl {
     }
 }
 
-pub trait NodeCore: Debug + Send + Sync + AsAny {
+pub trait NodeCore: Debug {
     fn input_value(
         &self,
         cache: SharedExecutionCache,
@@ -86,30 +86,22 @@ pub trait NodeCore: Debug + Send + Sync + AsAny {
     fn outputs_mut(&mut self) -> &mut Vec<OutputSlot>;
 }
 
-pub trait NodeDataAccess: NodeCore {
-    fn set_output_value<T: Any + Send + Sync + Debug>(
+pub trait NodeValueSetter {
+    fn set_default_value(
         &self,
         cache: SharedExecutionCache,
         slot_index: usize,
-        value: T,
+        value: Box<dyn Any + Send + Sync>,
     ) -> Result<(), String> {
-        let new_data = Data::new::<T>(value)?;
-
-        if let Some(slot) = self.outputs().get(slot_index) {
-            match (slot.data_type, new_data.get_type()) {
-                (expected, actual) if expected == actual => {
-                    cache.lock()?.outputs.insert(slot.id.clone(), new_data);
-                    Ok(())
-                }
-                (expected, actual) => Err(format!(
-                    "Type mismatch: expected {:?}, but got {:?}",
-                    expected, actual
-                )),
-            }
-        } else {
-            Err("Invalid value index".to_string())
-        }
+        self.set_output_value(cache, slot_index, value)
     }
+
+    fn set_output_value(
+        &self,
+        cache: SharedExecutionCache,
+        slot_index: usize,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Result<(), String>;
 }
 
 impl<T: 'static + NodeCore> AsAny for T {
@@ -123,10 +115,35 @@ impl<T: 'static + NodeCore> AsAny for T {
 }
 
 #[macro_export]
-macro_rules! impl_node_core {
+macro_rules! impl_node {
     ($($struct_name:ident),*) => {
         $(
-            impl $crate::NodeDataAccess for $struct_name {}
+            impl $crate::NodeValueSetter for $struct_name {
+                fn set_output_value(
+                    &self,
+                    cache: $crate::SharedExecutionCache,
+                    slot_index: usize,
+                    value: Box<dyn Any + Send + Sync>,
+                ) -> Result<(), String> {
+                    let new_data = $crate::Data::from_any(value)?;
+
+                    if let Some(slot) = self.outputs().get(slot_index) {
+                        if slot.data_type == new_data.get_type() {
+                            cache.lock()?.outputs.insert(slot.id.clone(), new_data);
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "Data type mismatch: expected {:?}, but got {:?} in {}",
+                                slot.data_type,
+                                new_data.get_type(),
+                                std::any::type_name::<Self>()
+                            ))
+                        }
+                    } else {
+                        Err(format!("Index out of range: {} in {}", slot_index, std::any::type_name::<Self>()))
+                    }
+                }
+            }
 
             impl $crate::NodeCore for $struct_name {
                 fn node_name(&self) -> &'static str {
@@ -149,27 +166,6 @@ macro_rules! impl_node_core {
                     &mut self.outputs
                 }
             }
-        )*
-    };
-}
-
-pub trait NodePrimitive: NodeCore + NodeDataAccess {
-    fn set_default_value<T: 'static + Send + Sync + Debug>(
-        &self,
-        cache: SharedExecutionCache,
-        value: T,
-    ) -> Result<(), String> {
-        self.set_output_value(cache, 0, value)
-    }
-}
-
-#[macro_export]
-macro_rules! impl_primitive_node_core {
-    ($($struct_name:ident),*) => {
-        $(
-            impl $crate::NodePrimitive for $struct_name {}
-
-            impl_node_core!($struct_name);
         )*
     };
 }

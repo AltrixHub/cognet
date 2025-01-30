@@ -44,7 +44,7 @@ pub struct Data {
 }
 
 impl Data {
-    pub fn new<T: Any + Send + Sync + Debug>(value: T) -> Result<Self, String> {
+    pub fn new<T: Any + Send + Sync>(value: T) -> Result<Self, String> {
         let type_id = TypeId::of::<T>();
 
         let data_type = match type_id {
@@ -55,6 +55,20 @@ impl Data {
 
         Ok(Data {
             value: Arc::new(value),
+            data_type,
+        })
+    }
+
+    pub fn from_any(value: Box<dyn Any + Send + Sync>) -> Result<Self, String> {
+        let type_id = (*value).type_id();
+        let data_type = match type_id {
+            t if t == TypeId::of::<f64>() => DataType::Number,
+            t if t == TypeId::of::<String>() => DataType::String,
+            _ => return Err("Unsupported data type".to_string()),
+        };
+
+        Ok(Data {
+            value: Arc::from(value),
             data_type,
         })
     }
@@ -70,14 +84,14 @@ impl Data {
         if TypeId::of::<T>() == self.data_type.type_id() {
             self.value.downcast_ref::<T>().ok_or_else(|| {
                 format!(
-                    "Type mismatch: Expected {}, but got {}",
+                    "Data type mismatch: Expected {}, but got {}",
                     self.data_type.type_name(),
                     type_name::<T>()
                 )
             })
         } else {
             Err(format!(
-                "Type mismatch: Expected {}, but got {}",
+                "Data type mismatch: Expected {}, but got {}",
                 self.data_type.type_name(),
                 type_name::<T>()
             ))
