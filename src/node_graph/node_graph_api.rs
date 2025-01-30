@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
-    NodeImpl, NodeManager, NodePrimitive, SharedData,
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, Node, NodeEntity, NodeGraph, NodeId,
+    NodeImpl, NodeManager,
 };
 
 #[async_trait]
@@ -20,7 +20,7 @@ pub trait NodeGraphAPI {
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
 
-    async fn update_node<T: 'static + NodeImpl>(
+    async fn update_node<T: 'static + Node>(
         &mut self,
         node_id: NodeId,
         new_node: T,
@@ -44,16 +44,13 @@ pub trait NodeGraphAPI {
 
     fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
 
-    async fn get_output_value(
-        &self,
-        node_id: &NodeId,
-        output_slot_index: usize,
-    ) -> Option<SharedData>;
+    async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
 
-    async fn set_default_value<T: 'static + NodePrimitive + NodeImpl>(
+    async fn set_default_value<V: 'static + Sync + Send>(
         &mut self,
         node_id: &NodeId,
-        value: Data,
+        slot_index: usize,
+        value: V,
     ) -> Result<(), String>;
 }
 
@@ -121,7 +118,7 @@ impl NodeGraphAPI for NodeGraph {
         }
     }
 
-    async fn update_node<T: 'static + NodeImpl>(
+    async fn update_node<T: 'static + Node>(
         &mut self,
         node_id: NodeId,
         new_node: T,
@@ -209,11 +206,7 @@ impl NodeGraphAPI for NodeGraph {
         self.node_manager.get_nodes_by_ids(ids).await
     }
 
-    async fn get_output_value(
-        &self,
-        node_id: &NodeId,
-        output_slot_index: usize,
-    ) -> Option<SharedData> {
+    async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
         let node = self.get_node_by_id(node_id).await?;
         let read_node = node.read().await;
         let slot = read_node.outputs().get(output_slot_index)?;
@@ -222,10 +215,11 @@ impl NodeGraphAPI for NodeGraph {
         cache.outputs.get(&slot.id).map(|data| data.share())
     }
 
-    async fn set_default_value<T: 'static + NodePrimitive + NodeImpl>(
+    async fn set_default_value<V: 'static + Sync + Send>(
         &mut self,
         node_id: &NodeId,
-        value: Data,
+        slot_index: usize,
+        value: V,
     ) -> Result<(), String> {
         let node = self
             .node_manager
@@ -233,15 +227,9 @@ impl NodeGraphAPI for NodeGraph {
             .await
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
 
-        let mut node_write = node.write().await;
-        let downcast_node = node_write.downcast_mut::<T>().ok_or_else(|| {
-            format!(
-                "Invalid Node: expected implementation of NodePrimitive for {:?}",
-                node_id
-            )
-        })?;
+        let node_write = node.read().await;
 
-        downcast_node.set_default_value(self.cache.share(), value)?;
+        node_write.set_default_value(self.cache.share(), slot_index, Box::new(value))?;
 
         Ok(())
     }

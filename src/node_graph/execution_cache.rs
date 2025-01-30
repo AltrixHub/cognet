@@ -1,4 +1,4 @@
-use crate::{Edge, EdgeId, OutputSlotId, SharedData};
+use crate::{Data, Edge, EdgeId, OutputSlotId};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
@@ -30,5 +30,5 @@ impl SharedExecutionCache {
 #[derive(Default, Debug)]
 pub struct ExecutionCache {
     pub(crate) edges: HashMap<EdgeId, Edge>,
-    pub(crate) outputs: HashMap<OutputSlotId, SharedData>,
+    pub(crate) outputs: HashMap<OutputSlotId, Data>,
 }

@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    any::{type_name, Any, TypeId},
+    fmt::Debug,
+    sync::Arc,
+};
 
 use crate::{EdgeId, EntityId};
 
@@ -10,54 +14,92 @@ pub enum SlotId {
     Output(OutputSlotId),
 }
 
-#[derive(Debug, PartialEq, Default, Clone)]
+#[derive(Debug, PartialEq, Default, Clone, Copy)]
 pub enum DataType {
     #[default]
     Number,
     String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Data {
-    Number(f32),
-    String(String),
+impl DataType {
+    fn type_id(&self) -> TypeId {
+        match self {
+            DataType::Number => TypeId::of::<f64>(),
+            DataType::String => TypeId::of::<String>(),
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            DataType::Number => type_name::<f64>(),
+            DataType::String => type_name::<String>(),
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct SharedData(Arc<Data>);
-
-impl SharedData {
-    pub fn new(data: Data) -> Self {
-        SharedData(Arc::new(data))
-    }
-
-    pub fn share(&self) -> Self {
-        SharedData(Arc::clone(&self.0))
-    }
-
-    pub fn get(&self) -> &Data {
-        &self.0
-    }
-
-    pub fn value<T: 'static>(&self) -> Option<&T> {
-        self.get().value()
-    }
+pub struct Data {
+    value: Arc<dyn Any + Send + Sync>,
+    data_type: DataType,
 }
 
 impl Data {
-    pub fn value<T: 'static>(&self) -> Option<&T> {
-        if let Some(value) = self.as_any().downcast_ref::<T>() {
-            Some(value)
-        } else {
-            None
+    pub fn new<T: Any + Send + Sync>(value: T) -> Result<Self, String> {
+        let type_id = TypeId::of::<T>();
+
+        let data_type = match type_id {
+            t if t == TypeId::of::<f64>() => DataType::Number,
+            t if t == TypeId::of::<String>() => DataType::String,
+            _ => return Err(format!("Invalid DataType: {}", type_name::<T>())),
+        };
+
+        Ok(Data {
+            value: Arc::new(value),
+            data_type,
+        })
+    }
+
+    pub fn from_any(value: Box<dyn Any + Send + Sync>) -> Result<Self, String> {
+        let type_id = (*value).type_id();
+        let data_type = match type_id {
+            t if t == TypeId::of::<f64>() => DataType::Number,
+            t if t == TypeId::of::<String>() => DataType::String,
+            _ => return Err("Unsupported data type".to_string()),
+        };
+
+        Ok(Data {
+            value: Arc::from(value),
+            data_type,
+        })
+    }
+
+    pub fn share(&self) -> Self {
+        Data {
+            value: Arc::clone(&self.value),
+            data_type: self.data_type,
         }
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        match self {
-            Data::Number(n) => n as &dyn std::any::Any,
-            Data::String(s) => s as &dyn std::any::Any,
+    pub fn value<T: 'static>(&self) -> Result<&T, String> {
+        if TypeId::of::<T>() == self.data_type.type_id() {
+            self.value.downcast_ref::<T>().ok_or_else(|| {
+                format!(
+                    "Data type mismatch: Expected {}, but got {}",
+                    self.data_type.type_name(),
+                    type_name::<T>()
+                )
+            })
+        } else {
+            Err(format!(
+                "Data type mismatch: Expected {}, but got {}",
+                self.data_type.type_name(),
+                type_name::<T>()
+            ))
         }
+    }
+
+    pub fn get_type(&self) -> DataType {
+        self.data_type
     }
 }
 

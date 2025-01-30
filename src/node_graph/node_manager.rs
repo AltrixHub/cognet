@@ -1,13 +1,16 @@
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 
-use crate::{impl_node_core, impl_primitive_node_core, AddListNode, NodeId, NodeImpl, NumberNode};
+use crate::{impl_node, AddNode, NodeCore, NodeId, NodeImpl, NodeValueSetter, NumberNode};
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
     sync::Arc,
 };
 
-pub type NodeEntity = Arc<RwLock<dyn NodeImpl>>;
+pub trait Node: NodeImpl + NodeValueSetter + NodeCore {}
+impl<T: NodeImpl + NodeValueSetter + NodeCore> Node for T {}
+
+pub type NodeEntity = Arc<RwLock<dyn Node>>;
 type NodeFactory = Arc<dyn Fn() -> NodeEntity + Send + Sync>;
 
 #[derive(Default)]
@@ -39,15 +42,12 @@ pub struct NodeManager {
     node_registry: HashMap<TypeId, NodeFactory>,
 }
 
-impl_node_core!(AddListNode);
-impl_primitive_node_core!(NumberNode);
+impl_node!(AddNode, NumberNode);
 
 impl NodeManager {
     pub fn new() -> Self {
         let mut manager = Self::default();
-        manager.register::<AddListNode>(Arc::new(|| {
-            Arc::new(RwLock::new(AddListNode::initialize()))
-        }));
+        manager.register::<AddNode>(Arc::new(|| Arc::new(RwLock::new(AddNode::initialize()))));
         manager
             .register::<NumberNode>(Arc::new(|| Arc::new(RwLock::new(NumberNode::initialize()))));
         manager

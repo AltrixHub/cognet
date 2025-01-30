@@ -4,15 +4,13 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use crate::{
-    AsAny, Data, DataType, EntityId, InputSlot, OutputSlot, SharedData, SharedExecutionCache,
-};
+use crate::{AsAny, Data, EntityId, InputSlot, OutputSlot, SharedExecutionCache};
 use std::{any::Any, fmt::Debug, sync::Arc};
 
 pub type NodeId = EntityId<Arc<dyn NodeImpl>>;
 
 #[async_trait::async_trait]
-pub trait NodeImpl: Debug + Send + Sync + NodeCore {
+pub trait NodeImpl: Debug + Send + Sync + AsAny {
     fn initialize() -> Self
     where
         Self: Sized;
@@ -30,19 +28,19 @@ impl dyn NodeImpl {
     }
 }
 
-pub trait NodeCore: Debug + Send + Sync + AsAny {
+pub trait NodeCore: Debug {
     fn input_value(
         &self,
         cache: SharedExecutionCache,
         slot_index: usize,
-    ) -> Result<Vec<SharedData>, String> {
+    ) -> Result<Vec<Data>, String> {
         let input_slot = self
             .inputs()
             .get(slot_index)
             .ok_or_else(|| "Invalid slot index".to_string())?;
 
         let cache = cache.lock()?;
-        let result: Vec<SharedData> = input_slot
+        let result: Vec<Data> = input_slot
             .connected_edges
             .iter()
             .filter_map(|edge_id| {
@@ -50,7 +48,7 @@ pub trait NodeCore: Debug + Send + Sync + AsAny {
                     cache
                         .outputs
                         .get(&edge.from_output_slot_id)
-                        .map(|shared_data| shared_data.share())
+                        .and_then(|data| Some(data.share()))
                 })
             })
             .collect();
@@ -60,37 +58,6 @@ pub trait NodeCore: Debug + Send + Sync + AsAny {
 
     fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot> {
         self.inputs().get(input_slot_index)
-    }
-
-    fn set_output_value(
-        &self,
-        cache: SharedExecutionCache,
-        slot_index: usize,
-        value: Data,
-    ) -> Result<(), String> {
-        match self.outputs().get(slot_index) {
-            Some(slot) => match (&slot.data_type, value) {
-                (DataType::Number, Data::Number(number)) => {
-                    cache
-                        .lock()?
-                        .outputs
-                        .insert(slot.id.clone(), SharedData::new(Data::Number(number)));
-                    Ok(())
-                }
-                (DataType::String, Data::String(string)) => {
-                    cache
-                        .lock()?
-                        .outputs
-                        .insert(slot.id.clone(), SharedData::new(Data::String(string)));
-                    Ok(())
-                }
-                (expected, actual) => Err(format!(
-                    "Type mismatch: expected {:?}, but got {:?}",
-                    expected, actual
-                )),
-            },
-            None => Err("Invalid value index".to_string()),
-        }
     }
 
     fn get_output_slot_by_index(&self, output_slot_index: usize) -> Option<&OutputSlot> {
@@ -119,6 +86,24 @@ pub trait NodeCore: Debug + Send + Sync + AsAny {
     fn outputs_mut(&mut self) -> &mut Vec<OutputSlot>;
 }
 
+pub trait NodeValueSetter {
+    fn set_default_value(
+        &self,
+        cache: SharedExecutionCache,
+        slot_index: usize,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Result<(), String> {
+        self.set_output_value(cache, slot_index, value)
+    }
+
+    fn set_output_value(
+        &self,
+        cache: SharedExecutionCache,
+        slot_index: usize,
+        value: Box<dyn Any + Send + Sync>,
+    ) -> Result<(), String>;
+}
+
 impl<T: 'static + NodeCore> AsAny for T {
     fn as_any(&self) -> &dyn Any {
         self
@@ -130,9 +115,36 @@ impl<T: 'static + NodeCore> AsAny for T {
 }
 
 #[macro_export]
-macro_rules! impl_node_core {
+macro_rules! impl_node {
     ($($struct_name:ident),*) => {
         $(
+            impl $crate::NodeValueSetter for $struct_name {
+                fn set_output_value(
+                    &self,
+                    cache: $crate::SharedExecutionCache,
+                    slot_index: usize,
+                    value: Box<dyn Any + Send + Sync>,
+                ) -> Result<(), String> {
+                    let new_data = $crate::Data::from_any(value)?;
+
+                    if let Some(slot) = self.outputs().get(slot_index) {
+                        if slot.data_type == new_data.get_type() {
+                            cache.lock()?.outputs.insert(slot.id.clone(), new_data);
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "Data type mismatch: expected {:?}, but got {:?} in {}",
+                                slot.data_type,
+                                new_data.get_type(),
+                                std::any::type_name::<Self>()
+                            ))
+                        }
+                    } else {
+                        Err(format!("Index out of range: {} in {}", slot_index, std::any::type_name::<Self>()))
+                    }
+                }
+            }
+
             impl $crate::NodeCore for $struct_name {
                 fn node_name(&self) -> &'static str {
                     self.node_name
@@ -154,23 +166,6 @@ macro_rules! impl_node_core {
                     &mut self.outputs
                 }
             }
-        )*
-    };
-}
-
-pub trait NodePrimitive: NodeCore {
-    fn set_default_value(&self, cache: SharedExecutionCache, value: Data) -> Result<(), String> {
-        self.set_output_value(cache, 0, value)
-    }
-}
-
-#[macro_export]
-macro_rules! impl_primitive_node_core {
-    ($($struct_name:ident),*) => {
-        $(
-            impl $crate::NodePrimitive for $struct_name {}
-
-            impl_node_core!($struct_name);
         )*
     };
 }

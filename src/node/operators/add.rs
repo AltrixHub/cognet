@@ -1,14 +1,16 @@
-use crate::{Data, DataType, InputSlot, NodeCore, NodeImpl, OutputSlot, SharedExecutionCache};
+use crate::{
+    DataType, InputSlot, NodeCore, NodeImpl, NodeValueSetter, OutputSlot, SharedExecutionCache,
+};
 
 #[derive(Debug)]
-pub struct AddListNode {
+pub struct AddNode {
     pub node_name: &'static str,
     pub inputs: Vec<InputSlot>,
     pub outputs: Vec<OutputSlot>,
 }
 
 #[async_trait::async_trait]
-impl NodeImpl for AddListNode {
+impl NodeImpl for AddNode {
     fn initialize() -> Self {
         Self {
             node_name: "Addition",
@@ -29,12 +31,9 @@ impl NodeImpl for AddListNode {
         let data_list = self.input_value(cache.share(), 0)?;
         let mut result = 0.;
         for data in data_list {
-            match data.get() {
-                Data::Number(value) => result += value,
-                _ => return Err("Failed get data: expected number".to_string()),
-            }
+            result += data.value()?;
         }
-        self.set_output_value(cache, 0, Data::Number(result))?;
+        self.set_output_value(cache, 0, Box::new(result))?;
         Ok(())
     }
 }
