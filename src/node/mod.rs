@@ -4,10 +4,10 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use crate::{AsAny, Data, EntityId, InputSlot, OutputSlot, SharedExecutionCache};
+use crate::{AsAny, Data, EntityId, InputSlot, Node, OutputSlot, SharedExecutionCache};
 use std::{any::Any, fmt::Debug, sync::Arc};
 
-pub type NodeId = EntityId<Arc<dyn NodeImpl>>;
+pub type NodeId = EntityId<Arc<dyn Node>>;
 
 #[async_trait::async_trait]
 pub trait NodeImpl: Debug + Send + Sync + AsAny {
@@ -37,7 +37,7 @@ pub trait NodeCore: Debug {
         let input_slot = self
             .inputs()
             .get(slot_index)
-            .ok_or_else(|| "Invalid slot index".to_string())?;
+            .ok_or("Invalid slot index".to_string())?;
 
         let cache = cache.lock()?;
         let result: Vec<Data> = input_slot
@@ -86,21 +86,25 @@ pub trait NodeCore: Debug {
     fn outputs_mut(&mut self) -> &mut Vec<OutputSlot>;
 }
 
-pub trait NodeValueSetter {
+pub trait NodeValueSetter: NodeCore {
     fn set_default_value(
-        &self,
-        cache: SharedExecutionCache,
+        &mut self,
         slot_index: usize,
-        value: Box<dyn Any + Send + Sync>,
+        value: Arc<dyn Any + Send + Sync>,
     ) -> Result<(), String> {
-        self.set_output_value(cache, slot_index, value)
+        let input_slot = self
+            .inputs_mut()
+            .get_mut(slot_index)
+            .ok_or(format!("Invalid slot index: {}", slot_index))?;
+        input_slot.set_default_value(value)?;
+        Ok(())
     }
 
     fn set_output_value(
         &self,
         cache: SharedExecutionCache,
         slot_index: usize,
-        value: Box<dyn Any + Send + Sync>,
+        value: Arc<dyn Any + Send + Sync>,
     ) -> Result<(), String>;
 }
 
@@ -123,7 +127,7 @@ macro_rules! impl_node {
                     &self,
                     cache: $crate::SharedExecutionCache,
                     slot_index: usize,
-                    value: Box<dyn Any + Send + Sync>,
+                    value: Arc<dyn Any + Send + Sync>,
                 ) -> Result<(), String> {
                     let new_data = $crate::Data::from_any(value)?;
 

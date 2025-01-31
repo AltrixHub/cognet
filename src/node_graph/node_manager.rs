@@ -59,16 +59,14 @@ impl NodeManager {
 
     pub async fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
         let nodes = self.nodes.lock().await;
-        nodes.get(id).cloned()
+        nodes.get(id).map(|node| Arc::clone(node))
     }
 
     pub async fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
         let nodes = self.nodes.lock().await;
 
         ids.into_iter()
-            .filter_map(|id| {
-                nodes.get(&id).map(|node| (id, Arc::clone(node))) // 指定されたNodeIdのNodeEntityを取得
-            })
+            .filter_map(|id| nodes.get(&id).map(|node| (id, Arc::clone(node))))
             .collect()
     }
 

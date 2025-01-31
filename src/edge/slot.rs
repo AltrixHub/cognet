@@ -6,8 +6,8 @@ use std::{
 
 use crate::{EdgeId, EntityId};
 
-pub type InputSlotId = EntityId<InputSlot>;
-pub type OutputSlotId = EntityId<OutputSlot>;
+pub type InputSlotId = EntityId<Arc<InputSlot>>;
+pub type OutputSlotId = EntityId<Arc<OutputSlot>>;
 
 pub enum SlotId {
     Input(InputSlotId),
@@ -35,6 +35,13 @@ impl DataType {
             DataType::String => type_name::<String>(),
         }
     }
+
+    fn valid_data_type_from_any(&self, value: &Arc<dyn Any + Send + Sync>) -> bool {
+        match self {
+            DataType::Number => value.downcast_ref::<f64>().is_some(),
+            DataType::String => value.downcast_ref::<String>().is_some(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -59,7 +66,7 @@ impl Data {
         })
     }
 
-    pub fn from_any(value: Box<dyn Any + Send + Sync>) -> Result<Self, String> {
+    pub fn from_any(value: Arc<dyn Any + Send + Sync>) -> Result<Self, String> {
         let type_id = (*value).type_id();
         let data_type = match type_id {
             t if t == TypeId::of::<f64>() => DataType::Number,
@@ -103,15 +110,33 @@ impl Data {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct InputSlot {
     pub id: InputSlotId,
     pub label: &'static str,
     pub data_type: DataType,
+    pub default_value: Option<Arc<dyn Any + Send + Sync>>,
     pub connected_edges: Vec<EdgeId>,
 }
 
-#[derive(Debug, Default, Clone)]
+impl InputSlot {
+    pub fn default_value(&self) -> &Option<Arc<dyn Any + Send + Sync>> {
+        &self.default_value
+    }
+
+    pub fn set_default_value(&mut self, value: Arc<dyn Any + Send + Sync>) -> Result<(), String> {
+        if !self.data_type.valid_data_type_from_any(&value) {
+            return Err(format!(
+                "Failed set default value due to type mismatch: expected {}",
+                self.data_type.type_name(),
+            ));
+        }
+        self.default_value = Some(value);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct OutputSlot {
     pub id: OutputSlotId,
     pub label: &'static str,
