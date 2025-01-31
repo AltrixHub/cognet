@@ -4,10 +4,10 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use crate::{AsAny, Data, EntityId, InputSlot, OutputSlot, SharedExecutionCache};
+use crate::{AsAny, Data, EntityId, InputSlot, Node, OutputSlot, SharedExecutionCache};
 use std::{any::Any, fmt::Debug, sync::Arc};
 
-pub type NodeId = EntityId<Arc<dyn NodeImpl>>;
+pub type NodeId = EntityId<Arc<dyn Node>>;
 
 #[async_trait::async_trait]
 pub trait NodeImpl: Debug + Send + Sync + AsAny {

@@ -6,8 +6,8 @@ use std::{
 
 use crate::{EdgeId, EntityId};
 
-pub type InputSlotId = EntityId<InputSlot>;
-pub type OutputSlotId = EntityId<OutputSlot>;
+pub type InputSlotId = EntityId<Arc<InputSlot>>;
+pub type OutputSlotId = EntityId<Arc<OutputSlot>>;
 
 pub enum SlotId {
     Input(InputSlotId),
@@ -110,7 +110,7 @@ impl Data {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct InputSlot {
     pub id: InputSlotId,
     pub label: &'static str,
@@ -136,7 +136,7 @@ impl InputSlot {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct OutputSlot {
     pub id: OutputSlotId,
     pub label: &'static str,
