@@ -77,7 +77,7 @@ impl NodeManager {
 
         for (id, node) in nodes.iter() {
             if TypeId::of::<T>() == node.type_id() {
-                result.push(id.clone());
+                result.push(*id);
             }
         }
 
@@ -91,7 +91,7 @@ impl NodeManager {
 
     pub async fn node_insert(&self, node_id: NodeId, node: NodeEntity) -> Option<NodeEntity> {
         let mut nodes = self.nodes.lock().await;
-        nodes.insert(node_id.clone(), node)
+        nodes.insert(node_id, node)
     }
 
     pub async fn node_remove(&self, node_id: &NodeId) -> Option<NodeEntity> {
@@ -113,7 +113,7 @@ impl NodeManager {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
             let node = factory();
             let node_id = NodeId::new();
-            self.node_insert(node_id.clone(), node).await;
+            self.node_insert(node_id, node).await;
             Ok(node_id)
         } else {
             Err(format!("{:?} is not registered", TypeId::of::<T>()))

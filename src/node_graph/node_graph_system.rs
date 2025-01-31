@@ -29,8 +29,8 @@ impl NodeGraphSystem for NodeGraph {
         let mut adj_list = HashMap::new();
 
         for node_id in target_nodes {
-            in_degree.insert(node_id.clone(), 0);
-            adj_list.insert(node_id.clone(), Vec::new());
+            in_degree.insert(node_id, 0);
+            adj_list.insert(node_id, Vec::new());
         }
 
         let cache = self.cache.lock()?;
@@ -38,20 +38,20 @@ impl NodeGraphSystem for NodeGraph {
             if target_nodes.contains(&edge.from_node_id) && target_nodes.contains(&edge.to_node_id)
             {
                 in_degree
-                    .entry(edge.to_node_id.clone())
+                    .entry(&edge.to_node_id)
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
                 adj_list
-                    .entry(edge.from_node_id.clone())
+                    .entry(&edge.from_node_id)
                     .or_default()
-                    .push(edge.to_node_id.clone());
+                    .push(edge.to_node_id);
             }
         }
 
         let mut queue: VecDeque<NodeId> = in_degree
             .iter()
             .filter(|&(_, &deg)| deg == 0)
-            .map(|(node_id, _)| node_id.clone())
+            .map(|(node_id, _)| **node_id)
             .collect();
 
         let mut sorted = Vec::new();
@@ -61,14 +61,14 @@ impl NodeGraphSystem for NodeGraph {
 
             for _ in 0..queue.len() {
                 if let Some(node_id) = queue.pop_front() {
-                    current_level.push(node_id.clone());
+                    current_level.push(node_id);
 
                     if let Some(neighbors) = adj_list.get(&node_id) {
                         for neighbor in neighbors {
                             if let Some(deg) = in_degree.get_mut(neighbor) {
                                 *deg -= 1;
                                 if *deg == 0 {
-                                    queue.push_back(neighbor.clone());
+                                    queue.push_back(*neighbor);
                                 }
                             }
                         }
@@ -123,18 +123,18 @@ impl NodeGraphSystem for NodeGraph {
         };
 
         Ok(Edge {
-            from_node_id: from_node_id.clone(),
+            from_node_id: *from_node_id,
             from_output_slot_index,
             from_output_slot_id,
-            to_node_id: to_node_id.clone(),
+            to_node_id: *to_node_id,
             to_input_slot_index,
             to_input_slot_id,
         })
     }
 
     async fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
-        let from_node_id = edge.from_node_id.clone();
-        let to_node_id = edge.to_node_id.clone();
+        let from_node_id = edge.from_node_id;
+        let to_node_id = edge.to_node_id;
 
         let from_node = self
             .node_manager
@@ -179,17 +179,17 @@ impl NodeGraphSystem for NodeGraph {
         if let Some(slot) =
             write_from_node.get_output_slot_by_index_mut(edge.from_output_slot_index)
         {
-            slot.connected_edges.push(edge_id.clone());
+            slot.connected_edges.push(edge_id);
         }
 
         if let Some(slot) = write_to_node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-            slot.connected_edges.push(edge_id.clone());
+            slot.connected_edges.push(edge_id);
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
         let mut cache = self.cache.lock()?;
-        cache.edges.insert(edge_id.clone(), edge);
+        cache.edges.insert(edge_id, edge);
 
         Ok(edge_id)
     }
@@ -201,10 +201,10 @@ impl NodeGraphSystem for NodeGraph {
         let cache = self.cache.lock()?;
 
         while let Some(node_id) = queue.pop_front() {
-            if affected.insert(node_id.clone()) {
+            if affected.insert(node_id) {
                 for edge in cache.edges.values() {
                     if edge.from_node_id == node_id && !affected.contains(&edge.to_node_id) {
-                        queue.push_back(edge.to_node_id.clone());
+                        queue.push_back(edge.to_node_id);
                     }
                 }
             }

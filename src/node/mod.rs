@@ -4,10 +4,10 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use crate::{AsAny, Data, EntityId, InputSlot, Node, OutputSlot, SharedExecutionCache};
+use crate::{impl_entity_id, AsAny, Data, InputSlot, OutputSlot, SharedExecutionCache};
 use std::{any::Any, fmt::Debug, sync::Arc};
 
-pub type NodeId = EntityId<Arc<dyn Node>>;
+impl_entity_id!(NodeId);
 
 #[async_trait::async_trait]
 pub trait NodeImpl: Debug + Send + Sync + AsAny {
@@ -133,7 +133,7 @@ macro_rules! impl_node {
 
                     if let Some(slot) = self.outputs().get(slot_index) {
                         if slot.data_type == new_data.get_type() {
-                            cache.lock()?.outputs.insert(slot.id.clone(), new_data);
+                            cache.lock()?.outputs.insert(slot.id, new_data);
                             Ok(())
                         } else {
                             Err(format!(

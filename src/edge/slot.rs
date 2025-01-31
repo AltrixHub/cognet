@@ -4,10 +4,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::{EdgeId, EntityId};
+use crate::{impl_entity_id, EdgeId};
 
-pub type InputSlotId = EntityId<Arc<InputSlot>>;
-pub type OutputSlotId = EntityId<Arc<OutputSlot>>;
+impl_entity_id!(InputSlotId);
+impl_entity_id!(OutputSlotId);
 
 pub enum SlotId {
     Input(InputSlotId),
