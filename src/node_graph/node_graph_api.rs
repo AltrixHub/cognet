@@ -109,7 +109,7 @@ impl NodeGraphAPI for NodeGraph {
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
         if self.node_manager.node_remove(&node_id).await.is_some() {
-            let dirty_nodes = self.collect_dirty_nodes(vec![node_id.clone()])?;
+            let dirty_nodes = self.collect_dirty_nodes(vec![node_id])?;
             self.remove_edges_from_cache(&node_id)?;
             self.mark_dirty_nodes(dirty_nodes);
             Ok(())
@@ -164,14 +164,14 @@ impl NodeGraphAPI for NodeGraph {
             let mut node_write = node.write().await;
             if let Some(slot) = node_write.get_output_slot_by_index_mut(edge.from_output_slot_index)
             {
-                slot.connected_edges.retain(|id| id.clone() != edge_id);
+                slot.connected_edges.retain(|id| *id != edge_id);
             }
         }
 
         if let Some(node) = self.node_manager.get_node_by_id(&to_node_id).await {
             let mut node_write = node.write().await;
             if let Some(slot) = node_write.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-                slot.connected_edges.retain(|id| id.clone() != edge_id);
+                slot.connected_edges.retain(|id| *id != edge_id);
             }
         }
 

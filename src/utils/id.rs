@@ -1,44 +1,38 @@
-use std::{
-    hash::{Hash, Hasher},
-    marker::PhantomData,
-};
+use std::hash::Hash;
 use ulid::Ulid;
 
-#[derive(Debug, Clone, Copy)]
-pub struct EntityId<T: ?Sized> {
-    id: Ulid,
-    _marker: PhantomData<T>,
+pub trait EntityId: Clone + Copy + PartialEq + Eq + Hash + Default {
+    fn new() -> Self;
+
+    fn id(&self) -> Ulid;
 }
 
-impl<T: ?Sized> Default for EntityId<T> {
-    fn default() -> Self {
-        Self {
-            id: Ulid::new(),
-            _marker: PhantomData,
+#[macro_export]
+macro_rules! impl_entity_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $name(ulid::Ulid);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(ulid::Ulid::new())
+            }
         }
-    }
-}
 
-impl<T: ?Sized> EntityId<T> {
-    pub fn new() -> Self {
-        Self::default()
-    }
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
 
-    pub fn as_ulid(&self) -> Ulid {
-        self.id
-    }
-}
+        impl $crate::EntityId for $name {
+            fn new() -> Self {
+                Self::new()
+            }
 
-impl<T: ?Sized> PartialEq for EntityId<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl<T: ?Sized> Eq for EntityId<T> {}
-
-impl<T: ?Sized> Hash for EntityId<T> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
+            fn id(&self) -> ulid::Ulid {
+                self.0
+            }
+        }
+    };
 }
