@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, Node, NodeEntity, NodeGraph, NodeId,
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
     NodeImpl, NodeManager,
 };
 
@@ -20,10 +19,11 @@ pub trait NodeGraphAPI {
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
 
-    async fn update_node<T: 'static + Node>(
+    async fn update_node_value<V: 'static + Sync + Send>(
         &mut self,
         node_id: NodeId,
-        new_node: T,
+        slot_index: usize,
+        value: V,
     ) -> Result<(), String>;
 
     async fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
@@ -118,16 +118,15 @@ impl NodeGraphAPI for NodeGraph {
         }
     }
 
-    async fn update_node<T: 'static + Node>(
+    async fn update_node_value<V: 'static + Sync + Send>(
         &mut self,
         node_id: NodeId,
-        new_node: T,
+        slot_index: usize,
+        value: V,
     ) -> Result<(), String> {
-        if self.node_manager.contains_key(&node_id).await {
-            let node_arc = Arc::new(RwLock::new(new_node));
-            self.node_manager
-                .node_insert(node_id.clone(), node_arc)
-                .await;
+        if let Some(node) = self.node_manager.get_node_by_id(&node_id).await {
+            let write_node = node.write().await;
+            write_node.set_output_value(self.cache.share(), slot_index, Arc::new(value))?;
             let dirty_nodes = self.collect_dirty_nodes(vec![node_id])?;
             self.mark_dirty_nodes(dirty_nodes);
             Ok(())
@@ -227,9 +226,9 @@ impl NodeGraphAPI for NodeGraph {
             .await
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
 
-        let node_write = node.read().await;
+        let mut node_write = node.write().await;
 
-        node_write.set_default_value(self.cache.share(), slot_index, Box::new(value))?;
+        node_write.set_default_value(slot_index, Arc::new(value))?;
 
         Ok(())
     }

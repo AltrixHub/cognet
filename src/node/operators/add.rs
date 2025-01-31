@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     DataType, InputSlot, NodeCore, NodeImpl, NodeValueSetter, OutputSlot, SharedExecutionCache,
 };
@@ -33,7 +35,7 @@ impl NodeImpl for AddNode {
         for data in data_list {
             result += data.value()?;
         }
-        self.set_output_value(cache, 0, Box::new(result))?;
+        self.set_output_value(cache, 0, Arc::new(result))?;
         Ok(())
     }
 }
