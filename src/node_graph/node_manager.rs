@@ -1,6 +1,6 @@
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 
-use crate::{impl_node, AddNode, NodeCore, NodeId, NodeImpl, NodeValueSetter, NumberNode};
+use crate::{NodeCore, NodeId, NodeImpl, NodeValueSetter};
 use std::{
     any::{Any, TypeId},
     collections::HashMap,
@@ -42,17 +42,20 @@ pub struct NodeManager {
     node_registry: HashMap<TypeId, NodeFactory>,
 }
 
-impl_node!(AddNode, NumberNode);
+pub type NodeRegistrationFn = fn(&mut NodeManager) -> Result<(), String>;
+
+pub struct NodeRegistrationEntry {
+    pub register: NodeRegistrationFn,
+}
+
+inventory::collect!(NodeRegistrationEntry);
 
 impl NodeManager {
     pub fn new() -> Result<Self, String> {
         let mut manager = Self::default();
-        manager.register::<AddNode>(Arc::new(|| {
-            AddNode::initialize().map(|node| Arc::new(RwLock::new(node)) as NodeEntity)
-        }))?;
-        manager.register::<NumberNode>(Arc::new(|| {
-            NumberNode::initialize().map(|node| Arc::new(RwLock::new(node)) as NodeEntity)
-        }))?;
+        for entry in inventory::iter::<NodeRegistrationEntry> {
+            (entry.register)(&mut manager)?;
+        }
         Ok(manager)
     }
 
@@ -102,7 +105,7 @@ impl NodeManager {
         nodes.remove(node_id)
     }
 
-    pub fn register<T>(&mut self, factory: NodeFactory) -> Result<(), String>
+    pub fn register_factory<T>(&mut self, factory: NodeFactory) -> Result<(), String>
     where
         T: NodeImpl + 'static,
     {

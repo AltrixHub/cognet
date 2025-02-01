@@ -4,7 +4,9 @@ pub mod primitives;
 pub use operators::*;
 pub use primitives::*;
 
-use crate::{impl_entity_id, AsAny, Data, InputSlot, OutputSlot, SharedExecutionCache};
+use crate::{
+    impl_entity_id, AsAny, Data, InputSlot, NodeManager, OutputSlot, SharedExecutionCache,
+};
 use std::{any::Any, fmt::Debug};
 
 impl_entity_id!(NodeId);
@@ -88,6 +90,10 @@ pub trait NodeCore: Debug {
     fn outputs(&self) -> &Vec<OutputSlot>;
 
     fn outputs_mut(&mut self) -> &mut Vec<OutputSlot>;
+
+    fn register_in(manager: &mut NodeManager) -> Result<(), String>
+    where
+        Self: Sized;
 }
 
 pub trait NodeValueSetter: NodeCore {
@@ -144,7 +150,7 @@ impl<T: 'static + NodeCore> AsAny for T {
 }
 
 #[macro_export]
-macro_rules! impl_node {
+macro_rules! register_nodes {
     ($($struct_name:ident),*) => {
         $(
             impl $crate::NodeValueSetter for $struct_name {}
@@ -179,6 +185,18 @@ macro_rules! impl_node {
 
                 fn outputs_mut(&mut self) -> &mut Vec<$crate::OutputSlot> {
                     &mut self.outputs
+                }
+
+                fn register_in(manager: &mut $crate::NodeManager) -> Result<(), String> {
+                    manager.register_factory::<$struct_name>(std::sync::Arc::new(|| {
+                        $struct_name::initialize().map(|node| std::sync::Arc::new(tokio::sync::RwLock::new(node)) as $crate::NodeEntity)
+                    }))
+                }
+            }
+
+            inventory::submit! {
+                $crate::NodeRegistrationEntry {
+                    register: $struct_name::register_in,
                 }
             }
         )*
