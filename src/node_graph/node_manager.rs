@@ -47,12 +47,8 @@ impl_node!(AddNode, NumberNode);
 impl NodeManager {
     pub fn new() -> Result<Self, String> {
         let mut manager = Self::default();
-        manager.register::<AddNode>(Arc::new(|| {
-            AddNode::initialize().map(|node| Arc::new(RwLock::new(node)) as NodeEntity)
-        }))?;
-        manager.register::<NumberNode>(Arc::new(|| {
-            NumberNode::initialize().map(|node| Arc::new(RwLock::new(node)) as NodeEntity)
-        }))?;
+        manager.register_node::<AddNode>()?;
+        manager.register_node::<NumberNode>()?;
         Ok(manager)
     }
 
@@ -102,7 +98,16 @@ impl NodeManager {
         nodes.remove(node_id)
     }
 
-    pub fn register<T>(&mut self, factory: NodeFactory) -> Result<(), String>
+    fn register_node<T>(&mut self) -> Result<(), String>
+    where
+        T: Node + 'static,
+    {
+        self.register_factory::<T>(Arc::new(|| {
+            T::initialize().map(|node| Arc::new(RwLock::new(node)) as NodeEntity)
+        }))
+    }
+
+    pub fn register_factory<T>(&mut self, factory: NodeFactory) -> Result<(), String>
     where
         T: NodeImpl + 'static,
     {
