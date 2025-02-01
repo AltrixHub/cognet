@@ -9,7 +9,9 @@ use crate::{
 
 #[async_trait]
 pub trait NodeGraphAPI {
-    fn new() -> Self;
+    fn new() -> Result<Self, String>
+    where
+        Self: Sized;
 
     fn node_manager(&self) -> &NodeManager;
 
@@ -19,11 +21,13 @@ pub trait NodeGraphAPI {
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
 
-    async fn update_node_value<V: 'static + Sync + Send>(
+    async fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String>;
+
+    async fn update_input_slot_default_data(
         &mut self,
-        node_id: NodeId,
+        node_id: &NodeId,
         slot_index: usize,
-        value: V,
+        data: Data,
     ) -> Result<(), String>;
 
     async fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
@@ -45,19 +49,16 @@ pub trait NodeGraphAPI {
     fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
 
     async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
-
-    async fn set_default_value<V: 'static + Sync + Send>(
-        &mut self,
-        node_id: &NodeId,
-        slot_index: usize,
-        value: V,
-    ) -> Result<(), String>;
 }
 
 #[async_trait]
 impl NodeGraphAPI for NodeGraph {
-    fn new() -> Self {
-        Self::default()
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            node_manager: NodeManager::new()?,
+            cache: Default::default(),
+            dirty_nodes: Default::default(),
+        })
     }
 
     fn node_manager(&self) -> &NodeManager {
@@ -118,21 +119,35 @@ impl NodeGraphAPI for NodeGraph {
         }
     }
 
-    async fn update_node_value<V: 'static + Sync + Send>(
+    async fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
+        let node = self
+            .node_manager
+            .get_node_by_id(node_id)
+            .await
+            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
+        let mut write_node = node.write().await;
+        write_node.set_node_data(data)?;
+        let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
+        self.mark_dirty_nodes(dirty_nodes);
+        Ok(())
+    }
+
+    async fn update_input_slot_default_data(
         &mut self,
-        node_id: NodeId,
+        node_id: &NodeId,
         slot_index: usize,
-        value: V,
+        data: Data,
     ) -> Result<(), String> {
-        if let Some(node) = self.node_manager.get_node_by_id(&node_id).await {
-            let write_node = node.write().await;
-            write_node.set_output_value(self.cache.share(), slot_index, Arc::new(value))?;
-            let dirty_nodes = self.collect_dirty_nodes(vec![node_id])?;
-            self.mark_dirty_nodes(dirty_nodes);
-            Ok(())
-        } else {
-            Err("Node not found.".to_string())
-        }
+        let node = self
+            .node_manager
+            .get_node_by_id(node_id)
+            .await
+            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
+        let mut write_node = node.write().await;
+        write_node.set_input_slot_default_data(slot_index, data)?;
+        let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
+        self.mark_dirty_nodes(dirty_nodes);
+        Ok(())
     }
 
     async fn connect_nodes(
@@ -212,24 +227,5 @@ impl NodeGraphAPI for NodeGraph {
 
         let cache = self.cache.lock().ok()?;
         cache.outputs.get(&slot.id).map(|data| data.share())
-    }
-
-    async fn set_default_value<V: 'static + Sync + Send>(
-        &mut self,
-        node_id: &NodeId,
-        slot_index: usize,
-        value: V,
-    ) -> Result<(), String> {
-        let node = self
-            .node_manager
-            .get_node_by_id(node_id)
-            .await
-            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-
-        let mut node_write = node.write().await;
-
-        node_write.set_default_value(slot_index, Arc::new(value))?;
-
-        Ok(())
     }
 }

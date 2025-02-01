@@ -11,7 +11,7 @@ pub trait Node: NodeImpl + NodeValueSetter + NodeCore {}
 impl<T: NodeImpl + NodeValueSetter + NodeCore> Node for T {}
 
 pub type NodeEntity = Arc<RwLock<dyn Node>>;
-type NodeFactory = Arc<dyn Fn() -> NodeEntity + Send + Sync>;
+type NodeFactory = Arc<dyn Fn() -> Result<NodeEntity, String> + Send + Sync>;
 
 #[derive(Default)]
 pub struct SharedNodes {
@@ -45,12 +45,15 @@ pub struct NodeManager {
 impl_node!(AddNode, NumberNode);
 
 impl NodeManager {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, String> {
         let mut manager = Self::default();
-        manager.register::<AddNode>(Arc::new(|| Arc::new(RwLock::new(AddNode::initialize()))));
-        manager
-            .register::<NumberNode>(Arc::new(|| Arc::new(RwLock::new(NumberNode::initialize()))));
-        manager
+        manager.register::<AddNode>(Arc::new(|| {
+            AddNode::initialize().map(|node| Arc::new(RwLock::new(node)) as NodeEntity)
+        }))?;
+        manager.register::<NumberNode>(Arc::new(|| {
+            NumberNode::initialize().map(|node| Arc::new(RwLock::new(node)) as NodeEntity)
+        }))?;
+        Ok(manager)
     }
 
     pub fn nodes(&self) -> SharedNodes {
@@ -99,11 +102,22 @@ impl NodeManager {
         nodes.remove(node_id)
     }
 
-    pub fn register<T>(&mut self, factory: NodeFactory)
+    pub fn register<T>(&mut self, factory: NodeFactory) -> Result<(), String>
     where
         T: NodeImpl + 'static,
     {
-        self.node_registry.insert(TypeId::of::<T>(), factory);
+        if self
+            .node_registry
+            .insert(TypeId::of::<T>(), factory)
+            .is_some()
+        {
+            Err(format!(
+                "Type {:?} is already registered",
+                TypeId::of::<T>()
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn create_node<T>(&mut self) -> Result<NodeId, String>
@@ -111,7 +125,7 @@ impl NodeManager {
         T: NodeImpl + 'static,
     {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
-            let node = factory();
+            let node = factory()?;
             let node_id = NodeId::new();
             self.node_insert(node_id, node).await;
             Ok(node_id)

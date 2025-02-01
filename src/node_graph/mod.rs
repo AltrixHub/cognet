@@ -16,16 +16,6 @@ pub struct NodeGraph {
     dirty_nodes: HashSet<NodeId>,
 }
 
-impl Default for NodeGraph {
-    fn default() -> Self {
-        Self {
-            node_manager: NodeManager::new(),
-            cache: Default::default(),
-            dirty_nodes: Default::default(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

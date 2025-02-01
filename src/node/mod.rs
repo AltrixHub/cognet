@@ -5,13 +5,13 @@ pub use operators::*;
 pub use primitives::*;
 
 use crate::{impl_entity_id, AsAny, Data, InputSlot, OutputSlot, SharedExecutionCache};
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{any::Any, fmt::Debug};
 
 impl_entity_id!(NodeId);
 
 #[async_trait::async_trait]
 pub trait NodeImpl: Debug + Send + Sync + AsAny {
-    fn initialize() -> Self
+    fn initialize() -> Result<Self, String>
     where
         Self: Sized;
 
@@ -77,6 +77,10 @@ pub trait NodeCore: Debug {
 
     fn node_name(&self) -> &'static str;
 
+    fn node_data(&self) -> Option<Data>;
+
+    fn node_data_mut(&mut self) -> &mut Option<Data>;
+
     fn inputs(&self) -> &Vec<InputSlot>;
 
     fn inputs_mut(&mut self) -> &mut Vec<InputSlot>;
@@ -87,25 +91,46 @@ pub trait NodeCore: Debug {
 }
 
 pub trait NodeValueSetter: NodeCore {
-    fn set_default_value(
-        &mut self,
-        slot_index: usize,
-        value: Arc<dyn Any + Send + Sync>,
-    ) -> Result<(), String> {
+    fn set_input_slot_default_data(&mut self, slot_index: usize, data: Data) -> Result<(), String> {
         let input_slot = self
             .inputs_mut()
             .get_mut(slot_index)
             .ok_or(format!("Invalid slot index: {}", slot_index))?;
-        input_slot.set_default_value(value)?;
+        input_slot.set_default_value(data)?;
         Ok(())
     }
 
-    fn set_output_value(
+    fn set_node_data(&mut self, data: Data) -> Result<(), String> {
+        *self.node_data_mut() = Some(data);
+        Ok(())
+    }
+
+    fn set_output_data(
         &self,
         cache: SharedExecutionCache,
         slot_index: usize,
-        value: Arc<dyn Any + Send + Sync>,
-    ) -> Result<(), String>;
+        data: Data,
+    ) -> Result<(), String> {
+        if let Some(slot) = self.outputs().get(slot_index) {
+            if slot.data_type == data.get_type() {
+                cache.lock()?.outputs.insert(slot.id, data);
+                Ok(())
+            } else {
+                Err(format!(
+                    "Data type mismatch: expected {:?}, but got {:?} in {}",
+                    slot.data_type,
+                    data.get_type(),
+                    std::any::type_name::<Self>()
+                ))
+            }
+        } else {
+            Err(format!(
+                "Index out of range: {} in {}",
+                slot_index,
+                std::any::type_name::<Self>()
+            ))
+        }
+    }
 }
 
 impl<T: 'static + NodeCore> AsAny for T {
@@ -122,36 +147,22 @@ impl<T: 'static + NodeCore> AsAny for T {
 macro_rules! impl_node {
     ($($struct_name:ident),*) => {
         $(
-            impl $crate::NodeValueSetter for $struct_name {
-                fn set_output_value(
-                    &self,
-                    cache: $crate::SharedExecutionCache,
-                    slot_index: usize,
-                    value: Arc<dyn Any + Send + Sync>,
-                ) -> Result<(), String> {
-                    let new_data = $crate::Data::from_any(value)?;
-
-                    if let Some(slot) = self.outputs().get(slot_index) {
-                        if slot.data_type == new_data.get_type() {
-                            cache.lock()?.outputs.insert(slot.id, new_data);
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "Data type mismatch: expected {:?}, but got {:?} in {}",
-                                slot.data_type,
-                                new_data.get_type(),
-                                std::any::type_name::<Self>()
-                            ))
-                        }
-                    } else {
-                        Err(format!("Index out of range: {} in {}", slot_index, std::any::type_name::<Self>()))
-                    }
-                }
-            }
+            impl $crate::NodeValueSetter for $struct_name {}
 
             impl $crate::NodeCore for $struct_name {
                 fn node_name(&self) -> &'static str {
                     self.node_name
+                }
+
+                fn node_data(&self) -> Option<$crate::Data> {
+                    match &self.node_data {
+                        Some(data) => Some(data.share()),
+                        None => None
+                    }
+                }
+
+                fn node_data_mut(&mut self) -> &mut Option<$crate::Data> {
+                    &mut self.node_data
                 }
 
                 fn inputs(&self) -> &Vec<$crate::InputSlot> {

@@ -1,21 +1,22 @@
-use std::sync::Arc;
-
 use crate::{
-    DataType, InputSlot, NodeCore, NodeImpl, NodeValueSetter, OutputSlot, SharedExecutionCache,
+    Data, DataType, InputSlot, NodeCore, NodeImpl, NodeValueSetter, OutputSlot,
+    SharedExecutionCache,
 };
 
 #[derive(Debug)]
 pub struct AddNode {
     pub node_name: &'static str,
+    pub node_data: Option<Data>,
     pub inputs: Vec<InputSlot>,
     pub outputs: Vec<OutputSlot>,
 }
 
 #[async_trait::async_trait]
 impl NodeImpl for AddNode {
-    fn initialize() -> Self {
-        Self {
+    fn initialize() -> Result<Self, String> {
+        Ok(Self {
             node_name: "Addition",
+            node_data: None,
             inputs: vec![InputSlot {
                 label: "Number List",
                 data_type: DataType::Number,
@@ -26,7 +27,7 @@ impl NodeImpl for AddNode {
                 data_type: DataType::Number,
                 ..Default::default()
             }],
-        }
+        })
     }
 
     async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
@@ -35,7 +36,7 @@ impl NodeImpl for AddNode {
         for data in data_list {
             result += data.value()?;
         }
-        self.set_output_value(cache, 0, Arc::new(result))?;
+        self.set_output_data(cache, 0, Data::new(result)?)?;
         Ok(())
     }
 }
