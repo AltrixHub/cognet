@@ -1,5 +1,5 @@
 use crate::{
-    Data, DataType, InputSlot, NodeCore, NodeImpl, NodeValueSetter, OutputSlot,
+    register_nodes, Data, DataType, InputSlot, NodeCore, NodeImpl, NodeValueSetter, OutputSlot,
     SharedExecutionCache,
 };
 
@@ -40,3 +40,5 @@ impl NodeImpl for AddNode {
         Ok(())
     }
 }
+
+register_nodes!(AddNode);
