@@ -36,7 +36,11 @@ impl DataType {
         }
     }
 
-    fn valid_data_type_from_any(&self, value: &Arc<dyn Any + Send + Sync>) -> bool {
+    fn valid_data(&self, data: &Data) -> bool {
+        *self == data.data_type
+    }
+
+    fn _valid_data_value_type(&self, value: &DataValue) -> bool {
         match self {
             DataType::Number => value.downcast_ref::<f64>().is_some(),
             DataType::String => value.downcast_ref::<String>().is_some(),
@@ -44,9 +48,11 @@ impl DataType {
     }
 }
 
+pub type DataValue = Arc<dyn Any + Send + Sync>;
+
 #[derive(Debug)]
 pub struct Data {
-    value: Arc<dyn Any + Send + Sync>,
+    value: DataValue,
     data_type: DataType,
 }
 
@@ -115,23 +121,41 @@ pub struct InputSlot {
     pub id: InputSlotId,
     pub label: &'static str,
     pub data_type: DataType,
-    pub default_value: Option<Arc<dyn Any + Send + Sync>>,
+    pub default_value: Option<DataValue>,
     pub connected_edges: Vec<EdgeId>,
 }
 
 impl InputSlot {
-    pub fn default_value(&self) -> &Option<Arc<dyn Any + Send + Sync>> {
-        &self.default_value
+    pub fn default_value<T: 'static>(&self) -> Result<&T, String> {
+        if TypeId::of::<T>() == self.data_type.type_id() {
+            let default_value = self
+                .default_value
+                .as_ref()
+                .ok_or_else(|| format!("Input slot doesn't have default value"))?;
+            default_value.downcast_ref::<T>().ok_or_else(|| {
+                format!(
+                    "Data type mismatch: Expected {}, but got {}",
+                    self.data_type.type_name(),
+                    type_name::<T>()
+                )
+            })
+        } else {
+            Err(format!(
+                "Data type mismatch: Expected {}, but got {}",
+                self.data_type.type_name(),
+                type_name::<T>()
+            ))
+        }
     }
 
-    pub fn set_default_value(&mut self, value: Arc<dyn Any + Send + Sync>) -> Result<(), String> {
-        if !self.data_type.valid_data_type_from_any(&value) {
+    pub fn set_default_value(&mut self, data: Data) -> Result<(), String> {
+        if !self.data_type.valid_data(&data) {
             return Err(format!(
-                "Failed set default value due to type mismatch: expected {}",
+                "Failed set input slot default value due to type mismatch: expected {}",
                 self.data_type.type_name(),
             ));
         }
-        self.default_value = Some(value);
+        self.default_value = Some(data.value);
         Ok(())
     }
 }

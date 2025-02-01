@@ -1,42 +1,34 @@
-use std::sync::Arc;
-
-use crate::{DataType, InputSlot, NodeImpl, NodeValueSetter, OutputSlot, SharedExecutionCache};
+use crate::{
+    Data, DataType, InputSlot, NodeCore, NodeImpl, NodeValueSetter, OutputSlot,
+    SharedExecutionCache,
+};
 
 #[derive(Debug)]
 pub struct NumberNode {
     pub node_name: &'static str,
+    pub node_data: Option<Data>,
     pub inputs: Vec<InputSlot>,
     pub outputs: Vec<OutputSlot>,
 }
 
 #[async_trait::async_trait]
 impl NodeImpl for NumberNode {
-    fn initialize() -> Self {
-        Self {
+    fn initialize() -> Result<Self, String> {
+        Ok(Self {
             node_name: "Number",
-            inputs: vec![InputSlot {
-                label: "Number",
-                data_type: DataType::Number,
-                default_value: Some(Arc::new(10.)),
-                ..Default::default()
-            }],
+            node_data: Some(Data::new(10.)?),
+            inputs: vec![],
             outputs: vec![OutputSlot {
                 label: "Number",
                 data_type: DataType::Number,
                 ..Default::default()
             }],
-        }
+        })
     }
 
     async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        let number_slot = self.inputs.get(0).ok_or("Invalid output slot index")?;
-        let output = number_slot.default_value();
-
-        if let Some(value) = output {
-            self.set_output_value(cache, 0, Arc::clone(value))?;
-            Ok(())
-        } else {
-            Err("Output value is None".to_string())
-        }
+        let node_data = self.node_data().ok_or(format!("Failed to get node data"))?;
+        self.set_output_data(cache, 0, node_data)?;
+        Ok(())
     }
 }
