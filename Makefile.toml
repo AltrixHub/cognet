@@ -1,0 +1,22 @@
+
+
+[tasks.example-wasm]
+dependencies = ["prepare-wasm"]
+description = "Example for wasm"
+script = [
+  "cd examples/wasm/web",
+  "npx vite",
+]
+
+[tasks.prepare-wasm]
+description = "Example for wasm"
+script = [
+  "cd examples/wasm/rust",
+  "wasm-pack build --target web --out-dir ../web/pkg",
+]
+
+[tasks.example-add]
+description = "Example for add node"
+script = [
+  "cargo run --example add",
+]
