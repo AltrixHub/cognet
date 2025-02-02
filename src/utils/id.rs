@@ -5,6 +5,8 @@ pub trait EntityId: Clone + Copy + PartialEq + Eq + Hash + Default {
     fn new() -> Self;
 
     fn id(&self) -> Ulid;
+
+    fn id_string(&self) -> String;
 }
 
 #[macro_export]
@@ -32,6 +34,10 @@ macro_rules! impl_entity_id {
 
             fn id(&self) -> ulid::Ulid {
                 self.0
+            }
+
+            fn id_string(&self) -> String {
+                self.0.to_string()
             }
         }
     };

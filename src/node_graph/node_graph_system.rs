@@ -1,4 +1,4 @@
-use crate::{Edge, EdgeId, NodeGraph, NodeGraphAPI, NodeId};
+use crate::{Edge, EdgeId, EntityId, NodeGraph, NodeGraphAPI, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
@@ -183,6 +183,16 @@ impl NodeGraphSystem for NodeGraph {
         }
 
         if let Some(slot) = write_to_node.get_input_slot_by_index_mut(edge.to_input_slot_index) {
+            if let Some(max) = slot.max_connections() {
+                if slot.connected_edges.len() >= *max {
+                    return Err(format!(
+                        "Input slot index {:?} in node: {} reached maximum connection limit ({})",
+                        edge.to_input_slot_index,
+                        edge.to_node_id.id_string(),
+                        max
+                    ));
+                }
+            }
             slot.connected_edges.push(edge_id);
         }
 
