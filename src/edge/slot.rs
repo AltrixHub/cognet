@@ -122,6 +122,7 @@ pub struct InputSlot {
     pub label: &'static str,
     pub data_type: DataType,
     pub default_value: Option<DataValue>,
+    pub max_connections: Option<usize>,
     pub connected_edges: Vec<EdgeId>,
 }
 
@@ -157,6 +158,14 @@ impl InputSlot {
         }
         self.default_value = Some(data.value);
         Ok(())
+    }
+
+    pub fn max_connections(&self) -> &Option<usize> {
+        &self.max_connections
+    }
+
+    pub fn connected_edges(&self) -> &Vec<EdgeId> {
+        &self.connected_edges
     }
 }
 
