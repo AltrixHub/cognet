@@ -1,7 +1,17 @@
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::task;
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_rayon::init_thread_pool;
+
 use async_trait::async_trait;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
-use tokio::{runtime::Handle, task};
+use tokio::runtime::Handle;
 
 use crate::{
     node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
@@ -80,38 +90,66 @@ impl NodeGraphAPI for NodeGraph {
         let shared_nodes = self.node_manager.nodes();
         let shared_cache = self.cache.share();
 
-        let rt_handle = Arc::new(Handle::current());
+        #[cfg(target_arch = "wasm32")]
+        {
+            init_thread_pool(4).await.unwrap();
 
-        for level_nodes in sorted_node_levels {
-            let results: Vec<Result<(), String>> = task::spawn_blocking({
-                let shared_nodes = shared_nodes.share();
-                let shared_cache = shared_cache.share();
-                let rt_handle = Arc::clone(&rt_handle);
-                move || {
-                    level_nodes
-                        .into_par_iter()
-                        .map(|node_id| {
-                            rt_handle.block_on(async {
-                                let nodes = shared_nodes.lock().await;
-                                let node = nodes.get(&node_id).map(Arc::clone);
-                                drop(nodes);
+            for level_nodes in sorted_node_levels {
+                let futures: Vec<_> = level_nodes
+                    .into_iter()
+                    .map(|node_id| {
+                        let shared_nodes = shared_nodes.clone();
+                        let shared_cache = shared_cache.clone();
+                        async move {
+                            let nodes = shared_nodes.lock().await;
+                            if let Some(node) = nodes.get(&node_id) {
+                                let node_read = node.read().await;
+                                node_read.execute(shared_cache.clone()).await
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    })
+                    .collect();
 
-                                if let Some(node) = node {
-                                    let node_read = node.read().await;
-                                    node_read.execute(shared_cache.share()).await
-                                } else {
-                                    Ok(())
-                                }
+                futures::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .collect::<Result<(), _>>()?;
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let rt_handle = Arc::new(Handle::current());
+            for level_nodes in sorted_node_levels {
+                let results: Vec<Result<(), String>> = task::spawn_blocking({
+                    let shared_nodes = shared_nodes.clone();
+                    let shared_cache = shared_cache.clone();
+                    let rt_handle = Arc::clone(&rt_handle);
+                    move || {
+                        level_nodes
+                            .into_par_iter()
+                            .map(|node_id| {
+                                rt_handle.block_on(async {
+                                    let nodes = shared_nodes.lock().await;
+                                    if let Some(node) = nodes.get(&node_id) {
+                                        let node_read = node.read().await;
+                                        node_read.execute(shared_cache.clone()).await
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
                             })
-                        })
-                        .collect()
-                }
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+                            .collect()
+                    }
+                })
+                .await
+                .map_err(|e| e.to_string())?;
 
-            for res in results {
-                res?;
+                for res in results {
+                    res?;
+                }
             }
         }
 

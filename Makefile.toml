@@ -11,8 +11,7 @@ script = [
 [tasks.prepare-wasm]
 description = "Example for wasm"
 script = [
-  "cd examples/wasm/rust",
-  "wasm-pack build --target web --out-dir ../web/pkg",
+  "wasm-pack build --target web --out-dir ./examples/web/pkg",
 ]
 
 [tasks.example-add]
