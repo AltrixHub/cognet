@@ -1,17 +1,14 @@
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::task;
+use tokio::runtime::{task, Handle};
 
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
+use futures::future::join_all;
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures::spawn_local;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_rayon::init_thread_pool;
+pub use wasm_bindgen_rayon::init_thread_pool;
 
 use async_trait::async_trait;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
-use tokio::runtime::Handle;
 
 use crate::{
     node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
@@ -92,11 +89,9 @@ impl NodeGraphAPI for NodeGraph {
 
         #[cfg(target_arch = "wasm32")]
         {
-            init_thread_pool(4).await.unwrap();
-
             for level_nodes in sorted_node_levels {
                 let futures: Vec<_> = level_nodes
-                    .into_iter()
+                    .into_par_iter()
                     .map(|node_id| {
                         let shared_nodes = shared_nodes.share();
                         let shared_cache = shared_cache.share();
@@ -112,10 +107,10 @@ impl NodeGraphAPI for NodeGraph {
                     })
                     .collect();
 
-                futures::future::join_all(futures)
-                    .await
-                    .into_iter()
-                    .collect::<Result<(), _>>()?;
+                let results = join_all(futures).await;
+                for res in results {
+                    res?;
+                }
             }
         }
 
