@@ -1,5 +1,3 @@
-
-
 [tasks.example-wasm]
 dependencies = ["prepare-wasm"]
 description = "Example for wasm"
@@ -11,7 +9,7 @@ script = [
 [tasks.prepare-wasm]
 description = "Example for wasm"
 script = [
-  "wasm-pack build --target web --out-dir ./examples/web/pkg",
+  "wasm-pack build --target web --out-dir examples/web/pkg",
 ]
 
 [tasks.example-add]
