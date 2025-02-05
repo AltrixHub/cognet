@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::runtime::{task, Handle};
+use tokio::{runtime::Handle, task};
 
 #[cfg(target_arch = "wasm32")]
 use futures::future::join_all;
