@@ -98,13 +98,13 @@ impl NodeGraphAPI for NodeGraph {
                 let futures: Vec<_> = level_nodes
                     .into_iter()
                     .map(|node_id| {
-                        let shared_nodes = shared_nodes.clone();
-                        let shared_cache = shared_cache.clone();
+                        let shared_nodes = shared_nodes.share();
+                        let shared_cache = shared_cache.share();
                         async move {
                             let nodes = shared_nodes.lock().await;
                             if let Some(node) = nodes.get(&node_id) {
                                 let node_read = node.read().await;
-                                node_read.execute(shared_cache.clone()).await
+                                node_read.execute(shared_cache.share()).await
                             } else {
                                 Ok(())
                             }
@@ -124,8 +124,8 @@ impl NodeGraphAPI for NodeGraph {
             let rt_handle = Arc::new(Handle::current());
             for level_nodes in sorted_node_levels {
                 let results: Vec<Result<(), String>> = task::spawn_blocking({
-                    let shared_nodes = shared_nodes.clone();
-                    let shared_cache = shared_cache.clone();
+                    let shared_nodes = shared_nodes.share();
+                    let shared_cache = shared_cache.share();
                     let rt_handle = Arc::clone(&rt_handle);
                     move || {
                         level_nodes
@@ -135,7 +135,7 @@ impl NodeGraphAPI for NodeGraph {
                                     let nodes = shared_nodes.lock().await;
                                     if let Some(node) = nodes.get(&node_id) {
                                         let node_read = node.read().await;
-                                        node_read.execute(shared_cache.clone()).await
+                                        node_read.execute(shared_cache.share()).await
                                     } else {
                                         Ok(())
                                     }

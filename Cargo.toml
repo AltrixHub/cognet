@@ -6,7 +6,7 @@ name = "cognet"
 version = "0.1.0"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 async-trait = "0.1.86"

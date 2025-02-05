@@ -1,0 +1,10 @@
+[package]
+edition = "2021"
+name = "cognet_wasm_example"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cognet = {path = "../../../../cognet"}

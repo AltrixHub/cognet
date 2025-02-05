@@ -1,16 +1,17 @@
 [tasks.example-wasm]
+cwd = "examples/wasm/web"
 dependencies = ["prepare-wasm"]
 description = "Example for wasm"
 script = [
-  "cd examples/wasm/web",
   "npx vite",
 ]
 
 [tasks.prepare-wasm]
+args = ["build", "--target", "web", "--out-dir", "../web/pkg"]
+command = "wasm-pack"
+cwd = "examples/wasm/rust"
 description = "Example for wasm"
-script = [
-  "wasm-pack build --target web --out-dir examples/web/pkg",
-]
+toolchain = "nightly-2024-08-02"
 
 [tasks.example-add]
 description = "Example for add node"
