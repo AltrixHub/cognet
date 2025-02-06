@@ -8,3 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cognet = {path = "../../../../cognet"}
+wasm-bindgen = "0.2.100"
