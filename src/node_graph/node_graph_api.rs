@@ -4,6 +4,12 @@ use tokio::{runtime::Handle, task};
 #[cfg(target_arch = "wasm32")]
 use futures::future::join_all;
 #[cfg(target_arch = "wasm32")]
+pub use num_cpus;
+#[cfg(target_arch = "wasm32")]
+pub use wasm_bindgen;
+#[cfg(target_arch = "wasm32")]
+pub use wasm_bindgen_futures;
+#[cfg(target_arch = "wasm32")]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
 use async_trait::async_trait;

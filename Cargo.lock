@@ -99,6 +99,7 @@ dependencies = [
  "futures",
  "getrandom",
  "inventory",
+ "num_cpus",
  "rayon",
  "strum",
  "thiserror",
@@ -108,6 +109,13 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-rayon",
+]
+
+[[package]]
+name = "cognet_wasm_example"
+version = "0.1.0"
+dependencies = [
+ "cognet",
 ]
 
 [[package]]
@@ -289,6 +297,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 
 [[package]]
+name = "hermit-abi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d231dfb89cfffdbc30e7fc41579ed6066ad03abda9e567ccafae602b97ec5024"
+
+[[package]]
 name = "inventory"
 version = "0.3.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -353,6 +367,16 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "num_cpus"
+version = "1.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4161fcb6d602d4d2081af7c3a45852d875a03dd337a6bfdd6e06407b61342a43"
+dependencies = [
+ "hermit-abi",
+ "libc",
 ]
 
 [[package]]
