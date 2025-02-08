@@ -1,8 +1,7 @@
-import init, { add } from "./pkg/wasm";
+import init from "./pkg/cognet_wasm_example";
 
 async function run() {
   await init();
-  console.log(add(3, 4));
 }
 
 run();

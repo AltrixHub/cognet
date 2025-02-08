@@ -1,4 +1,8 @@
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::{Mutex, MutexGuard, RwLock};
+
+#[cfg(target_arch = "wasm32")]
+use async_lock::{Mutex, MutexGuard, RwLock};
 
 use crate::{NodeCore, NodeId, NodeImpl, NodeValueSetter};
 use std::{

@@ -1,10 +1,11 @@
 [package]
 edition = "2021"
-name = "wasm"
+name = "cognet_wasm_example"
 version = "0.1.0"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-wasm-bindgen = "0.2"
+cognet = {path = "../../../../cognet"}
+web-sys = {version = "0.3.77", features = ["console"]}
