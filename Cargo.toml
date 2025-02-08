@@ -1,36 +1,41 @@
-[package]
-description = "Node Graph Engine for Visual Programming and Data Flow Management"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-name = "cognet"
-version = "0.1.0"
-
 [workspace]
 members = [
-  "examples/wasm/rust",
+  "crates/*",
 ]
+resolver = "2"
 
-[lib]
-crate-type = ["rlib"]
+[workspace.package]
+authors = ["Altrix"]
+description = "Node Graph Engine for Visual Programming and Data Flow Management"
+documentation = "https://altrix.org/"
+edition = "2021"
+homepage = "https://altrix.org/"
+keywords = ["node", "graph", "algorithm"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AltrixHub/cognet"
+version = "0.1.0"
 
-[dependencies]
-async-trait = "0.1.86"
-inventory = "0.3.19"
+[workspace.dependencies]
 rayon = "1.10"
-serde = {version = "1.0", features = ["derive"]}
-strum = "0.26.3"
-thiserror = "2.0.11"
-tracing = "0.1.41"
-ulid = "1.1.4"
+
+[package]
+authors.workspace = true
+description.workspace = true
+documentation.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "cognet_examples"
+publish = false
+repository.workspace = true
+version.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = {version = "1.43.0", features = ["full"]}
 
-[target.wasm32-unknown-unknown.dependencies]
-async-lock = "3.4.0"
-futures = "0.3.31"
-getrandom = {version = "0.2.0", features = ["js"]}
-num_cpus = "1.16.0"
-wasm-bindgen = "0.2.100"
-wasm-bindgen-futures = "0.4.50"
-wasm-bindgen-rayon = "1.3.0"
+[dependencies]
+cognet = {path = "crates/core"}
+
+[[example]]
+name = "add"

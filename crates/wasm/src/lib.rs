@@ -2,12 +2,11 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use cognet::{
-    init_thread_pool, num_cpus,
-    wasm_bindgen::{self, prelude::wasm_bindgen, JsValue},
-    wasm_bindgen_futures::{self, future_to_promise},
-    Data, EntityId, NodeGraph, NodeGraphAPI, NodeId,
-};
+use cognet::{Data, EntityId, NodeGraph, NodeGraphAPI, NodeId};
+use num_cpus;
+use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
+use wasm_bindgen_futures::{self, future_to_promise};
+use wasm_bindgen_rayon::init_thread_pool;
 use web_sys::{console, js_sys::Promise};
 
 #[cfg(target_family = "wasm")]
