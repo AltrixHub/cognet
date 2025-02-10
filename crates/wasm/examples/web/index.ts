@@ -1,4 +1,4 @@
-import init from "./pkg/cognet_wasm_example";
+import init from "./pkg/cognet_wasm";
 
 async function run() {
   await init();
