@@ -9,7 +9,7 @@ script = [
 workspace = false
 
 [tasks.prepare-wasm]
-args = ["build", "--target", "web", "--out-dir", "../web/pkg"]
+args = ["build", "--target", "web", "--out-dir", "examples/web/pkg"]
 command = "wasm-pack"
 description = "Example for wasm"
 toolchain = "nightly-2024-08-02"

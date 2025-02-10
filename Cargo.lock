@@ -94,7 +94,10 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 name = "cognet"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "async-trait",
+ "futures",
+ "getrandom",
  "inventory",
  "rayon",
  "serde",
@@ -103,6 +106,8 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -117,9 +122,7 @@ dependencies = [
 name = "cognet_wasm"
 version = "0.1.0"
 dependencies = [
- "async-lock",
  "cognet",
- "futures",
  "num_cpus",
  "serde",
  "serde-wasm-bindgen",
@@ -295,8 +298,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43a49c392881ce6d5c3b8cb70f98717b7c07aabbdff06687b9030dbfbe2725f8"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi 0.13.3+wasi-0.2.2",
+ "wasm-bindgen",
  "windows-targets",
 ]
 
@@ -619,9 +624,9 @@ dependencies = [
 
 [[package]]
 name = "strum"
-version = "0.26.3"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
+checksum = "ce1475c515a4f03a8a7129bb5228b81a781a86cb0b3fbbc19e1c556d491a401f"
 
 [[package]]
 name = "syn"

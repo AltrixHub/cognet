@@ -17,6 +17,9 @@ version = "0.1.0"
 
 [workspace.dependencies]
 rayon = "1.10"
+wasm-bindgen = "0.2.100"
+wasm-bindgen-futures = "0.4.50"
+wasm-bindgen-rayon = "1.3.0"
 
 [package]
 authors.workspace = true
