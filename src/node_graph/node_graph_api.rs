@@ -3,10 +3,6 @@ use tokio::{runtime::Handle, task};
 
 #[cfg(target_arch = "wasm32")]
 use futures::future::join_all;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures;
 
 use async_trait::async_trait;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};

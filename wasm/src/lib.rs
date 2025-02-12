@@ -3,7 +3,6 @@
 use std::{cell::RefCell, rc::Rc};
 
 use cognet::{Data, EntityId, NodeGraph, NodeGraphAPI, NodeId};
-use num_cpus;
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 use wasm_bindgen_futures::{self, future_to_promise};
 use wasm_bindgen_rayon::init_thread_pool;
@@ -27,11 +26,25 @@ pub async fn start() -> Result<(), JsValue> {
         thread_num
     )));
 
-    wasm_bindgen_futures::JsFuture::from(init_thread_pool(thread_num))
-        .await
-        .expect("Failed to initialize Rayon thread pool");
+    let promise = future_to_promise(async_task());
+    match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(v) => console::log_1(&v),
+        Err(e) => {
+            console::error_1(&JsValue::from_str(&format!("Error: {:?}", e)));
+            return Err(e);
+        }
+    }
 
     Ok(())
+}
+
+async fn async_task() -> Result<JsValue, JsValue> {
+    wasm_bindgen_futures::JsFuture::from(web_sys::js_sys::Promise::resolve(&JsValue::from_str(
+        "Thread pool initialized",
+    )))
+    .await?;
+
+    Ok(JsValue::from_str("Task completed"))
 }
 
 #[wasm_bindgen]

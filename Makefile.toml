@@ -1,6 +1,6 @@
 
 [tasks.example-wasm]
-args = ["make", "--cwd", "crates/wasm", "example-wasm"]
+args = ["make", "--cwd", "wasm", "example-wasm"]
 command = "cargo"
 description = "Example for wasm"
 workspace = false
