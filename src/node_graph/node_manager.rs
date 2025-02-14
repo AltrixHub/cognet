@@ -17,7 +17,7 @@ impl<T: NodeImpl + NodeValueSetter + NodeCore> Node for T {}
 pub type NodeEntity = Arc<RwLock<dyn Node>>;
 type NodeFactory = Arc<dyn Fn() -> Result<NodeEntity, String> + Send + Sync>;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct SharedNodes {
     inner: Arc<Mutex<HashMap<NodeId, NodeEntity>>>,
 }
@@ -109,10 +109,10 @@ impl NodeManager {
         nodes.remove(node_id)
     }
 
-    pub fn register_factory<T>(&mut self, factory: NodeFactory) -> Result<(), String>
-    where
-        T: NodeImpl + 'static,
-    {
+    pub fn register_factory<T: NodeImpl + 'static>(
+        &mut self,
+        factory: NodeFactory,
+    ) -> Result<(), String> {
         if self
             .node_registry
             .insert(TypeId::of::<T>(), factory)
@@ -127,10 +127,7 @@ impl NodeManager {
         }
     }
 
-    pub async fn create_node<T>(&mut self) -> Result<NodeId, String>
-    where
-        T: NodeImpl + 'static,
-    {
+    pub async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
             let node = factory()?;
             let node_id = NodeId::new();

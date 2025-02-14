@@ -19,11 +19,9 @@ pub trait NodeGraphAPI {
     where
         Self: Sized;
 
-    fn node_manager(&self) -> &NodeManager;
-
-    fn node_manager_mut(&mut self) -> &mut NodeManager;
-
     async fn execute(&mut self) -> Result<(), String>;
+
+    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String>;
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
 
@@ -65,14 +63,6 @@ impl NodeGraphAPI for NodeGraph {
             cache: Default::default(),
             dirty_nodes: Default::default(),
         })
-    }
-
-    fn node_manager(&self) -> &NodeManager {
-        &self.node_manager
-    }
-
-    fn node_manager_mut(&mut self) -> &mut NodeManager {
-        &mut self.node_manager
     }
 
     async fn execute(&mut self) -> Result<(), String> {
@@ -148,6 +138,10 @@ impl NodeGraphAPI for NodeGraph {
 
         self.dirty_nodes.clear();
         Ok(())
+    }
+
+    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
+        self.node_manager.create_node::<T>().await
     }
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
