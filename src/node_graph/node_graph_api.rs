@@ -1,6 +1,12 @@
-use async_trait::async_trait;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::{runtime::Handle, task};
+
+#[cfg(target_arch = "wasm32")]
 use futures::future::join_all;
-use std::sync::Arc;
+
+use async_trait::async_trait;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
@@ -13,11 +19,9 @@ pub trait NodeGraphAPI {
     where
         Self: Sized;
 
-    fn node_manager(&self) -> &NodeManager;
-
-    fn node_manager_mut(&mut self) -> &mut NodeManager;
-
     async fn execute(&mut self) -> Result<(), String>;
+
+    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String>;
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
 
@@ -49,6 +53,8 @@ pub trait NodeGraphAPI {
     fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
 
     async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
+
+    fn node_variants(&self) -> &HashSet<String>;
 }
 
 #[async_trait]
@@ -61,14 +67,6 @@ impl NodeGraphAPI for NodeGraph {
         })
     }
 
-    fn node_manager(&self) -> &NodeManager {
-        &self.node_manager
-    }
-
-    fn node_manager_mut(&mut self) -> &mut NodeManager {
-        &mut self.node_manager
-    }
-
     async fn execute(&mut self) -> Result<(), String> {
         if self.dirty_nodes.is_empty() {
             return Ok(());
@@ -79,33 +77,73 @@ impl NodeGraphAPI for NodeGraph {
         let shared_nodes = self.node_manager.nodes();
         let shared_cache = self.cache.share();
 
-        for level_nodes in sorted_node_levels {
-            let tasks = level_nodes
-                .into_iter()
-                .map(|node_id| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            for level_nodes in sorted_node_levels {
+                let futures: Vec<_> = level_nodes
+                    .into_par_iter()
+                    .map(|node_id| {
+                        let shared_nodes = shared_nodes.share();
+                        let shared_cache = shared_cache.share();
+                        async move {
+                            let nodes = shared_nodes.lock().await;
+                            if let Some(node) = nodes.get(&node_id) {
+                                let node_read = node.read().await;
+                                node_read.execute(shared_cache.share()).await
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    })
+                    .collect();
+
+                let results = join_all(futures).await;
+                for res in results {
+                    res?;
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let rt_handle = Arc::new(Handle::current());
+            for level_nodes in sorted_node_levels {
+                let results: Vec<Result<(), String>> = task::spawn_blocking({
                     let shared_nodes = shared_nodes.share();
                     let shared_cache = shared_cache.share();
-                    tokio::spawn(async move {
-                        let nodes = shared_nodes.lock().await;
-                        let node = nodes.get(&node_id).cloned();
-                        if let Some(node) = node {
-                            let node_write = node.read().await;
-                            node_write.execute(shared_cache).await?;
-                        }
-                        Ok::<(), String>(())
-                    })
+                    let rt_handle = Arc::clone(&rt_handle);
+                    move || {
+                        level_nodes
+                            .into_par_iter()
+                            .map(|node_id| {
+                                rt_handle.block_on(async {
+                                    let nodes = shared_nodes.lock().await;
+                                    if let Some(node) = nodes.get(&node_id) {
+                                        let node_read = node.read().await;
+                                        node_read.execute(shared_cache.share()).await
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
+                            })
+                            .collect()
+                    }
                 })
-                .collect::<Vec<_>>();
+                .await
+                .map_err(|e| e.to_string())?;
 
-            let results = join_all(tasks).await;
-
-            for result in results {
-                result.map_err(|e| e.to_string())??;
+                for res in results {
+                    res?;
+                }
             }
         }
 
         self.dirty_nodes.clear();
         Ok(())
+    }
+
+    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
+        self.node_manager.create_node::<T>().await
     }
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
@@ -227,5 +265,9 @@ impl NodeGraphAPI for NodeGraph {
 
         let cache = self.cache.lock().ok()?;
         cache.outputs.get(&slot.id).map(|data| data.share())
+    }
+
+    fn node_variants(&self) -> &HashSet<String> {
+        self.node_manager.variants()
     }
 }

@@ -1,0 +1,16 @@
+
+[tasks.example-wasm]
+cwd = "examples/web"
+dependencies = ["prepare-wasm"]
+description = "Example for wasm"
+script = [
+  "npx vite",
+]
+workspace = false
+
+[tasks.prepare-wasm]
+args = ["build", "--target", "web", "--out-dir", "examples/web/pkg"]
+command = "wasm-pack"
+description = "Example for wasm"
+toolchain = "nightly-2024-08-02"
+workspace = false

@@ -189,7 +189,18 @@ macro_rules! register_nodes {
 
                 fn register_in(manager: &mut $crate::NodeManager) -> Result<(), String> {
                     manager.register_factory::<$struct_name>(std::sync::Arc::new(|| {
-                        $struct_name::initialize().map(|node| std::sync::Arc::new(tokio::sync::RwLock::new(node)) as $crate::NodeEntity)
+                        $struct_name::initialize().map(|node| {
+                            std::sync::Arc::new({
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    async_lock::RwLock::new(node)
+                                }
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    tokio::sync::RwLock::new(node)
+                                }
+                            }) as $crate::NodeEntity
+                        })
                     }))
                 }
             }

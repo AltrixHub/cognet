@@ -1,16 +1,35 @@
 [package]
+authors = ["Altrix"]
 description = "Node Graph Engine for Visual Programming and Data Flow Management"
+documentation = "https://altrix.org/"
 edition = "2021"
+homepage = "https://altrix.org/"
+keywords = ["node", "graph", "algorithm"]
 license = "MIT OR Apache-2.0"
 name = "cognet"
+repository = "https://github.com/AltrixHub/cognet"
 version = "0.1.0"
 
+[lib]
+crate-type = ["rlib"]
+
 [dependencies]
+async-lock = "3.4.0"
 async-trait = "0.1.86"
 futures = "0.3.31"
 inventory = "0.3.19"
-strum = "0.26.3"
+rayon = "1.10"
+serde = {version = "1.0", features = ["derive"]}
+strum = "0.27.0"
 thiserror = "2.0.11"
-tokio = {version = "1.43.0", features = ["full"]}
 tracing = "0.1.41"
-ulid = "1.1.4"
+ulid = "1.2.0"
+wasm-bindgen = "0.2.100"
+wasm-bindgen-futures = "0.4.50"
+wasm-bindgen-rayon = "1.3.0"
+
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = {version = "0.3.1", features = ["wasm_js"]}
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = {version = "1.43.0", features = ["full"]}
