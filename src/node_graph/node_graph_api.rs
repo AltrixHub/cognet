@@ -6,7 +6,7 @@ use futures::future::join_all;
 
 use async_trait::async_trait;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
@@ -53,6 +53,8 @@ pub trait NodeGraphAPI {
     fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
 
     async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
+
+    fn node_variants(&self) -> &HashSet<String>;
 }
 
 #[async_trait]
@@ -263,5 +265,9 @@ impl NodeGraphAPI for NodeGraph {
 
         let cache = self.cache.lock().ok()?;
         cache.outputs.get(&slot.id).map(|data| data.share())
+    }
+
+    fn node_variants(&self) -> &HashSet<String> {
+        self.node_manager.variants()
     }
 }

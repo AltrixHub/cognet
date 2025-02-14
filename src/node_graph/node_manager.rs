@@ -6,8 +6,8 @@ use async_lock::{Mutex, MutexGuard, RwLock};
 
 use crate::{NodeCore, NodeId, NodeImpl, NodeValueSetter};
 use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
+    any::{type_name, Any, TypeId},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -44,6 +44,7 @@ impl SharedNodes {
 pub struct NodeManager {
     nodes: SharedNodes,
     node_registry: HashMap<TypeId, NodeFactory>,
+    variants: HashSet<String>,
 }
 
 pub type NodeRegistrationFn = fn(&mut NodeManager) -> Result<(), String>;
@@ -109,15 +110,26 @@ impl NodeManager {
         nodes.remove(node_id)
     }
 
+    pub fn variants(&self) -> &HashSet<String> {
+        &self.variants
+    }
+
     pub fn register_factory<T: NodeImpl + 'static>(
         &mut self,
         factory: NodeFactory,
     ) -> Result<(), String> {
-        if self
-            .node_registry
-            .insert(TypeId::of::<T>(), factory)
-            .is_some()
-        {
+        let type_id = TypeId::of::<T>();
+        let type_name = type_name::<T>();
+
+        let node_name = type_name
+            .rsplit("::")
+            .next()
+            .ok_or_else(|| format!("Failed to extract type name from {:?}", type_name))?
+            .to_string();
+
+        self.variants.insert(node_name);
+
+        if self.node_registry.insert(type_id, factory).is_some() {
             Err(format!(
                 "Type {:?} is already registered",
                 TypeId::of::<T>()

@@ -3,6 +3,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use cognet::{Data, EntityId, NodeGraph, NodeGraphAPI, NodeId};
+use serde_wasm_bindgen::to_value;
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 use wasm_bindgen_futures::{self, future_to_promise};
 use wasm_bindgen_rayon::init_thread_pool;
@@ -13,7 +14,6 @@ unsafe extern "C" {
     fn __wasm_call_ctors();
 }
 
-#[cfg(target_family = "wasm")]
 #[wasm_bindgen(start)]
 pub async fn start() -> Result<(), JsValue> {
     unsafe {
@@ -136,6 +136,19 @@ impl WasmNodeGraph {
                 .map_err(|e| JsValue::from_str(&e))
         };
         future_to_promise(fut)
+    }
+
+    #[wasm_bindgen]
+    pub fn registered_nodes(&self) -> Result<JsValue, JsValue> {
+        let graph = self.inner.borrow();
+        let variants = graph.node_variants();
+        match to_value(variants) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let error_message = format!("Serialization error: {}", err);
+                Err(JsValue::from_str(&error_message))
+            }
+        }
     }
 
     #[wasm_bindgen]
