@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{impl_entity_id, EdgeId};
+use serde::{Deserialize, Serialize};
 
 impl_entity_id!(InputSlotId);
 impl_entity_id!(OutputSlotId);
@@ -54,6 +55,70 @@ pub type DataValue = Arc<dyn Any + Send + Sync>;
 pub struct Data {
     value: DataValue,
     data_type: DataType,
+}
+
+impl Serialize for Data {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let type_name = self.data_type.type_name();
+        match type_name {
+            "f64" => {
+                let value = self
+                    .value
+                    .downcast_ref::<f64>()
+                    .ok_or_else(|| serde::ser::Error::custom("Failed to downcast value to f64"))?;
+                serializer.serialize_f64(*value)
+            }
+            "alloc::string::String" => {
+                let value = self.value.downcast_ref::<String>().ok_or_else(|| {
+                    serde::ser::Error::custom("Failed to downcast value to String")
+                })?;
+                serializer.serialize_str(value)
+            }
+            _ => Err(serde::ser::Error::custom("Unsupported data type")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Data {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DataVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DataVisitor {
+            type Value = Data;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a valid data type")
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Data {
+                    value: Arc::new(value),
+                    data_type: DataType::Number,
+                })
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Data {
+                    value: Arc::new(value.to_string()),
+                    data_type: DataType::String,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(DataVisitor)
+    }
 }
 
 impl Data {

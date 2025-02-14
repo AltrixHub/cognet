@@ -3,18 +3,10 @@ use tokio::{runtime::Handle, task};
 
 #[cfg(target_arch = "wasm32")]
 use futures::future::join_all;
-#[cfg(target_arch = "wasm32")]
-pub use num_cpus;
-#[cfg(target_arch = "wasm32")]
-pub use wasm_bindgen;
-#[cfg(target_arch = "wasm32")]
-pub use wasm_bindgen_futures;
-#[cfg(target_arch = "wasm32")]
-pub use wasm_bindgen_rayon::init_thread_pool;
 
 use async_trait::async_trait;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
@@ -27,11 +19,9 @@ pub trait NodeGraphAPI {
     where
         Self: Sized;
 
-    fn node_manager(&self) -> &NodeManager;
-
-    fn node_manager_mut(&mut self) -> &mut NodeManager;
-
     async fn execute(&mut self) -> Result<(), String>;
+
+    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String>;
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
 
@@ -63,6 +53,8 @@ pub trait NodeGraphAPI {
     fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
 
     async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
+
+    fn node_variants(&self) -> &HashSet<String>;
 }
 
 #[async_trait]
@@ -73,14 +65,6 @@ impl NodeGraphAPI for NodeGraph {
             cache: Default::default(),
             dirty_nodes: Default::default(),
         })
-    }
-
-    fn node_manager(&self) -> &NodeManager {
-        &self.node_manager
-    }
-
-    fn node_manager_mut(&mut self) -> &mut NodeManager {
-        &mut self.node_manager
     }
 
     async fn execute(&mut self) -> Result<(), String> {
@@ -156,6 +140,10 @@ impl NodeGraphAPI for NodeGraph {
 
         self.dirty_nodes.clear();
         Ok(())
+    }
+
+    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
+        self.node_manager.create_node::<T>().await
     }
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
@@ -277,5 +265,9 @@ impl NodeGraphAPI for NodeGraph {
 
         let cache = self.cache.lock().ok()?;
         cache.outputs.get(&slot.id).map(|data| data.share())
+    }
+
+    fn node_variants(&self) -> &HashSet<String> {
+        self.node_manager.variants()
     }
 }

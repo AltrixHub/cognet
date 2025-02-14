@@ -6,8 +6,8 @@ use async_lock::{Mutex, MutexGuard, RwLock};
 
 use crate::{NodeCore, NodeId, NodeImpl, NodeValueSetter};
 use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
+    any::{type_name, Any, TypeId},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -17,7 +17,7 @@ impl<T: NodeImpl + NodeValueSetter + NodeCore> Node for T {}
 pub type NodeEntity = Arc<RwLock<dyn Node>>;
 type NodeFactory = Arc<dyn Fn() -> Result<NodeEntity, String> + Send + Sync>;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct SharedNodes {
     inner: Arc<Mutex<HashMap<NodeId, NodeEntity>>>,
 }
@@ -44,6 +44,7 @@ impl SharedNodes {
 pub struct NodeManager {
     nodes: SharedNodes,
     node_registry: HashMap<TypeId, NodeFactory>,
+    variants: HashSet<String>,
 }
 
 pub type NodeRegistrationFn = fn(&mut NodeManager) -> Result<(), String>;
@@ -109,15 +110,26 @@ impl NodeManager {
         nodes.remove(node_id)
     }
 
-    pub fn register_factory<T>(&mut self, factory: NodeFactory) -> Result<(), String>
-    where
-        T: NodeImpl + 'static,
-    {
-        if self
-            .node_registry
-            .insert(TypeId::of::<T>(), factory)
-            .is_some()
-        {
+    pub fn variants(&self) -> &HashSet<String> {
+        &self.variants
+    }
+
+    pub fn register_factory<T: NodeImpl + 'static>(
+        &mut self,
+        factory: NodeFactory,
+    ) -> Result<(), String> {
+        let type_id = TypeId::of::<T>();
+        let type_name = type_name::<T>();
+
+        let node_name = type_name
+            .rsplit("::")
+            .next()
+            .ok_or_else(|| format!("Failed to extract type name from {:?}", type_name))?
+            .to_string();
+
+        self.variants.insert(node_name);
+
+        if self.node_registry.insert(type_id, factory).is_some() {
             Err(format!(
                 "Type {:?} is already registered",
                 TypeId::of::<T>()
@@ -127,10 +139,7 @@ impl NodeManager {
         }
     }
 
-    pub async fn create_node<T>(&mut self) -> Result<NodeId, String>
-    where
-        T: NodeImpl + 'static,
-    {
+    pub async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
             let node = factory()?;
             let node_id = NodeId::new();

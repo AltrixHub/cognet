@@ -7,6 +7,8 @@ pub trait EntityId: Clone + Copy + PartialEq + Eq + Hash + Default {
     fn id(&self) -> Ulid;
 
     fn id_string(&self) -> String;
+
+    fn from_string(value: &str) -> Result<Self, String>;
 }
 
 #[macro_export]
@@ -30,6 +32,14 @@ macro_rules! impl_entity_id {
         impl $crate::EntityId for $name {
             fn new() -> Self {
                 Self::new()
+            }
+
+            fn from_string(value: &str) -> Result<Self, String> {
+                let ulid = ulid::Ulid::from_string(value);
+                match ulid {
+                    Ok(id) => Ok(Self(id)),
+                    Err(e) => Err(format!("Id creation error: {e}")),
+                }
             }
 
             fn id(&self) -> ulid::Ulid {
