@@ -1,4 +1,3 @@
-
 [tasks.example-wasm]
 args = ["make", "--cwd", "wasm", "example-wasm"]
 command = "cargo"

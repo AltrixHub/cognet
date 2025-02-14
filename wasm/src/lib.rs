@@ -26,25 +26,7 @@ pub async fn start() -> Result<(), JsValue> {
         thread_num
     )));
 
-    let promise = future_to_promise(async_task());
-    match wasm_bindgen_futures::JsFuture::from(promise).await {
-        Ok(v) => console::log_1(&v),
-        Err(e) => {
-            console::error_1(&JsValue::from_str(&format!("Error: {:?}", e)));
-            return Err(e);
-        }
-    }
-
     Ok(())
-}
-
-async fn async_task() -> Result<JsValue, JsValue> {
-    wasm_bindgen_futures::JsFuture::from(web_sys::js_sys::Promise::resolve(&JsValue::from_str(
-        "Thread pool initialized",
-    )))
-    .await?;
-
-    Ok(JsValue::from_str("Task completed"))
 }
 
 #[wasm_bindgen]
@@ -65,7 +47,7 @@ impl WasmNodeGraph {
 
     #[wasm_bindgen]
     pub fn execute(&self) -> Promise {
-        let inner = self.inner.clone();
+        let inner = Rc::clone(&self.inner);
         let fut = async move {
             let mut graph = inner.borrow_mut();
             graph
@@ -79,7 +61,7 @@ impl WasmNodeGraph {
 
     #[wasm_bindgen]
     pub fn remove_node(&self, node_id: String) -> Promise {
-        let inner = self.inner.clone();
+        let inner = Rc::clone(&self.inner);
         let fut = async move {
             let mut graph = inner.borrow_mut();
             let id = NodeId::from_string(&node_id)?;
@@ -94,7 +76,7 @@ impl WasmNodeGraph {
 
     #[wasm_bindgen]
     pub fn update_node_data(&self, node_id: String, data: JsValue) -> Promise {
-        let inner = self.inner.clone();
+        let inner = Rc::clone(&self.inner);
         let fut = async move {
             let mut graph = inner.borrow_mut();
             let id = NodeId::from_string(&node_id)?;
@@ -115,7 +97,7 @@ impl WasmNodeGraph {
         slot_index: usize,
         data: JsValue,
     ) -> Promise {
-        let inner = self.inner.clone();
+        let inner = Rc::clone(&self.inner);
         let fut = async move {
             let mut graph = inner.borrow_mut();
             let id = NodeId::from_string(&node_id)?;
@@ -137,7 +119,7 @@ impl WasmNodeGraph {
         to_node_id: String,
         to_input_slot_index: usize,
     ) -> Promise {
-        let inner = self.inner.clone();
+        let inner = Rc::clone(&self.inner);
         let fut = async move {
             let mut graph = inner.borrow_mut();
             let from_id = NodeId::from_string(&from_node_id)?;
@@ -154,6 +136,16 @@ impl WasmNodeGraph {
                 .map_err(|e| JsValue::from_str(&e))
         };
         future_to_promise(fut)
+    }
+
+    #[wasm_bindgen]
+    pub fn create_node(&self) -> Promise {
+        let inner = Rc::clone(&self.inner);
+        let fut = async move {
+            let mut graph = inner.borrow_mut();
+        };
+        unimplemented!();
+        // future_to_promise(fut)
     }
 
     // #[wasm_bindgen]
