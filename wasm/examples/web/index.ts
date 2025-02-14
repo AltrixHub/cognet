@@ -4,7 +4,8 @@ async function run() {
   await init();
 
   const nodeGraph =  new WasmNodeGraph();
-  nodeGraph.execute();
+  const nodeVariants = nodeGraph.registered_nodes();
+  console.log("Variants: ",nodeVariants);
 }
 
 run();

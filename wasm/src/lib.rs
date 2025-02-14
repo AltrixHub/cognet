@@ -2,7 +2,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use cognet::{Data, EntityId, NodeGraph, NodeGraphAPI, NodeId};
+use cognet::{Data, EntityId, NodeGraph, NodeGraphAPI, NodeId, NodeRegistrationEntry};
 use serde_wasm_bindgen::to_value;
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 use wasm_bindgen_futures::{self, future_to_promise};
@@ -15,16 +15,10 @@ unsafe extern "C" {
 }
 
 #[wasm_bindgen(start)]
-pub async fn start() -> Result<(), JsValue> {
+pub async fn main() -> Result<(), JsValue> {
     unsafe {
         __wasm_call_ctors();
     }
-
-    let thread_num = num_cpus::get();
-    console::log_1(&JsValue::from_str(&format!(
-        "Initializing thread pool... {:?}",
-        thread_num
-    )));
 
     Ok(())
 }
