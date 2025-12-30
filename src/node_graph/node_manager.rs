@@ -4,7 +4,7 @@ use tokio::sync::{Mutex, MutexGuard, RwLock};
 #[cfg(target_arch = "wasm32")]
 use async_lock::{Mutex, MutexGuard, RwLock};
 
-use crate::{NodeCore, NodeId, NodeImpl, NodeValueSetter};
+use crate::{Data, NodeCore, NodeId, NodeImpl, NodeValueSetter};
 use std::{
     any::{type_name, Any, TypeId},
     collections::{HashMap, HashSet},
@@ -16,6 +16,14 @@ impl<T: NodeImpl + NodeValueSetter + NodeCore> Node for T {}
 
 pub type NodeEntity = Arc<RwLock<dyn Node>>;
 type NodeFactory = Arc<dyn Fn() -> Result<NodeEntity, String> + Send + Sync>;
+
+/// Factory with metadata for name-based node creation.
+pub struct NodeFactoryWithMeta {
+    /// The factory function to create the node.
+    pub factory: NodeFactory,
+    /// Default data for the node (if any).
+    pub default_data: Option<Data>,
+}
 
 #[derive(Default, Debug)]
 pub struct SharedNodes {
@@ -29,7 +37,7 @@ impl SharedNodes {
         }
     }
 
-    pub async fn lock(&self) -> MutexGuard<HashMap<NodeId, NodeEntity>> {
+    pub async fn lock(&self) -> MutexGuard<'_, HashMap<NodeId, NodeEntity>> {
         self.inner.lock().await
     }
 
@@ -44,6 +52,8 @@ impl SharedNodes {
 pub struct NodeManager {
     nodes: SharedNodes,
     node_registry: HashMap<TypeId, NodeFactory>,
+    /// Name-based registry for dynamic node creation.
+    name_registry: HashMap<&'static str, NodeFactoryWithMeta>,
     variants: HashSet<String>,
 }
 
@@ -114,6 +124,7 @@ impl NodeManager {
         &self.variants
     }
 
+    /// Register a factory by type.
     pub fn register_factory<T: NodeImpl + 'static>(
         &mut self,
         factory: NodeFactory,
@@ -139,6 +150,18 @@ impl NodeManager {
         }
     }
 
+    /// Register a factory with name and metadata for dynamic creation.
+    pub fn register_factory_with_name(
+        &mut self,
+        name: &'static str,
+        factory: NodeFactory,
+        default_data: Option<Data>,
+    ) {
+        self.name_registry
+            .insert(name, NodeFactoryWithMeta { factory, default_data });
+    }
+
+    /// Create a node by type (compile-time dispatch).
     pub async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
             let node = factory()?;
@@ -148,5 +171,35 @@ impl NodeManager {
         } else {
             Err(format!("{:?} is not registered", TypeId::of::<T>()))
         }
+    }
+
+    /// Create a node by name (runtime dispatch).
+    ///
+    /// Returns the node ID and default data if successful.
+    pub async fn create_node_by_name(
+        &self,
+        name: &str,
+    ) -> Result<(NodeId, Option<Data>), String> {
+        let factory_meta = self
+            .name_registry
+            .get(name)
+            .ok_or_else(|| format!("Node type '{}' is not registered", name))?;
+
+        let node = (factory_meta.factory)()?;
+        let default_data = factory_meta.default_data.as_ref().map(|d| d.share());
+        let node_id = NodeId::new();
+        self.node_insert(node_id, node).await;
+
+        Ok((node_id, default_data))
+    }
+
+    /// Check if a node type is registered by name.
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.name_registry.contains_key(name)
+    }
+
+    /// Get all registered node type names.
+    pub fn registered_names(&self) -> Vec<&'static str> {
+        self.name_registry.keys().copied().collect()
     }
 }

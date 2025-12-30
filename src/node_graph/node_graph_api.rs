@@ -9,8 +9,8 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
-    NodeImpl, NodeManager,
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, GraphError, NodeEntity, NodeGraph,
+    NodeId, NodeImpl, NodeManager, NodeMeta, SharedNodeStates,
 };
 
 #[async_trait]
@@ -21,7 +21,13 @@ pub trait NodeGraphAPI {
 
     async fn execute(&mut self) -> Result<(), String>;
 
-    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String>;
+    async fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String>;
+
+    /// Create a node by name (runtime dispatch).
+    ///
+    /// This allows creating nodes without knowing the concrete type at compile time.
+    /// The node type must be registered via `register_nodes!` macro.
+    async fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String>;
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
 
@@ -62,8 +68,10 @@ impl NodeGraphAPI for NodeGraph {
     fn new() -> Result<Self, String> {
         Ok(Self {
             node_manager: NodeManager::new()?,
+            node_states: SharedNodeStates::new(),
             cache: Default::default(),
             dirty_nodes: Default::default(),
+            errors: Default::default(),
         })
     }
 
@@ -71,6 +79,9 @@ impl NodeGraphAPI for NodeGraph {
         if self.dirty_nodes.is_empty() {
             return Ok(());
         }
+
+        // Clear previous execution errors before running
+        self.clear_execution_errors();
 
         let sorted_node_levels = self.topological_sort(&self.dirty_nodes)?;
 
@@ -87,19 +98,22 @@ impl NodeGraphAPI for NodeGraph {
                         let shared_cache = shared_cache.share();
                         async move {
                             let nodes = shared_nodes.lock().await;
-                            if let Some(node) = nodes.get(&node_id) {
+                            let result = if let Some(node) = nodes.get(&node_id) {
                                 let node_read = node.read().await;
                                 node_read.execute(shared_cache.share()).await
                             } else {
                                 Ok(())
-                            }
+                            };
+                            (node_id, result)
                         }
                     })
                     .collect();
 
                 let results = join_all(futures).await;
-                for res in results {
-                    res?;
+                for (node_id, res) in results {
+                    if let Err(msg) = res {
+                        self.add_error(GraphError::execution(node_id, msg));
+                    }
                 }
             }
         }
@@ -108,7 +122,7 @@ impl NodeGraphAPI for NodeGraph {
         {
             let rt_handle = Arc::new(Handle::current());
             for level_nodes in sorted_node_levels {
-                let results: Vec<Result<(), String>> = task::spawn_blocking({
+                let results: Vec<(NodeId, Result<(), String>)> = task::spawn_blocking({
                     let shared_nodes = shared_nodes.share();
                     let shared_cache = shared_cache.share();
                     let rt_handle = Arc::clone(&rt_handle);
@@ -116,7 +130,7 @@ impl NodeGraphAPI for NodeGraph {
                         level_nodes
                             .into_par_iter()
                             .map(|node_id| {
-                                rt_handle.block_on(async {
+                                let result = rt_handle.block_on(async {
                                     let nodes = shared_nodes.lock().await;
                                     if let Some(node) = nodes.get(&node_id) {
                                         let node_read = node.read().await;
@@ -124,7 +138,8 @@ impl NodeGraphAPI for NodeGraph {
                                     } else {
                                         Ok(())
                                     }
-                                })
+                                });
+                                (node_id, result)
                             })
                             .collect()
                     }
@@ -132,8 +147,10 @@ impl NodeGraphAPI for NodeGraph {
                 .await
                 .map_err(|e| e.to_string())?;
 
-                for res in results {
-                    res?;
+                for (node_id, res) in results {
+                    if let Err(msg) = res {
+                        self.add_error(GraphError::execution(node_id, msg));
+                    }
                 }
             }
         }
@@ -142,8 +159,45 @@ impl NodeGraphAPI for NodeGraph {
         Ok(())
     }
 
-    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
-        self.node_manager.create_node::<T>().await
+    async fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
+        let node_id = self.node_manager.create_node::<T>().await?;
+
+        // Register in NodeStates for sync UI access
+        self.node_states
+            .write()
+            .map_err(|e| e.to_string())?
+            .add_node(
+                node_id,
+                T::NAME,
+                T::DEFAULT_VALUE.to_data(),
+                T::INPUTS.len(),
+                T::OUTPUTS.len(),
+            );
+
+        Ok(node_id)
+    }
+
+    async fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String> {
+        // Create node and get default data from factory
+        let (node_id, default_data) = self.node_manager.create_node_by_name(name).await?;
+
+        // Get type info for slot counts
+        let type_info = crate::get_node_type_info(name)
+            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
+
+        // Register in NodeStates for sync UI access
+        self.node_states
+            .write()
+            .map_err(|e| e.to_string())?
+            .add_node(
+                node_id,
+                type_info.name,
+                default_data,
+                type_info.inputs.len(),
+                type_info.outputs.len(),
+            );
+
+        Ok(node_id)
     }
 
     async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
@@ -151,6 +205,12 @@ impl NodeGraphAPI for NodeGraph {
             let dirty_nodes = self.collect_dirty_nodes(vec![node_id])?;
             self.remove_edges_from_cache(&node_id)?;
             self.mark_dirty_nodes(dirty_nodes);
+
+            // Clean up NodeStates
+            if let Ok(mut states) = self.node_states.write() {
+                states.remove_node(&node_id);
+            }
+
             Ok(())
         } else {
             Err("Node not found.".to_string())
@@ -164,7 +224,15 @@ impl NodeGraphAPI for NodeGraph {
             .await
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
         let mut write_node = node.write().await;
-        write_node.set_node_data(data)?;
+        write_node.set_node_data(data.share())?;
+
+        // Update NodeStates
+        if let Ok(mut states) = self.node_states.write() {
+            if let Some(state) = states.get_mut(node_id) {
+                state.data = Some(data);
+            }
+        }
+
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
         Ok(())
@@ -213,19 +281,19 @@ impl NodeGraphAPI for NodeGraph {
         let from_node_id = edge.from_node_id;
         let to_node_id = edge.to_node_id;
 
-        if let Some(node) = self.node_manager.get_node_by_id(&from_node_id).await {
-            let mut node_write = node.write().await;
-            if let Some(slot) = node_write.get_output_slot_by_index_mut(edge.from_output_slot_index)
+        // Update NodeStates slot connections and remove edge (single source of truth for UI)
+        if let Ok(mut states) = self.node_states.write() {
+            if let Some(slot_state) =
+                states.output_slot_mut(&from_node_id, edge.from_output_slot_index)
             {
-                slot.connected_edges.retain(|id| *id != edge_id);
+                slot_state.connected_edges.retain(|id| *id != edge_id);
             }
-        }
-
-        if let Some(node) = self.node_manager.get_node_by_id(&to_node_id).await {
-            let mut node_write = node.write().await;
-            if let Some(slot) = node_write.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-                slot.connected_edges.retain(|id| *id != edge_id);
+            if let Some(slot_state) =
+                states.input_slot_mut(&to_node_id, edge.to_input_slot_index)
+            {
+                slot_state.connected_edges.retain(|id| *id != edge_id);
             }
+            states.remove_edge(&edge_id);
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;

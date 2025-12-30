@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{impl_entity_id, EdgeId};
+use crate::impl_entity_id;
 use serde::{Deserialize, Serialize};
 
 impl_entity_id!(InputSlotId);
@@ -15,7 +15,7 @@ pub enum SlotId {
     Output(OutputSlotId),
 }
 
-#[derive(Debug, PartialEq, Default, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum DataType {
     #[default]
     Number,
@@ -188,7 +188,6 @@ pub struct InputSlot {
     pub data_type: DataType,
     pub default_value: Option<DataValue>,
     pub max_connections: Option<usize>,
-    pub connected_edges: Vec<EdgeId>,
 }
 
 impl InputSlot {
@@ -228,10 +227,6 @@ impl InputSlot {
     pub fn max_connections(&self) -> &Option<usize> {
         &self.max_connections
     }
-
-    pub fn connected_edges(&self) -> &Vec<EdgeId> {
-        &self.connected_edges
-    }
 }
 
 #[derive(Debug, Default)]
@@ -239,5 +234,4 @@ pub struct OutputSlot {
     pub id: OutputSlotId,
     pub label: &'static str,
     pub data_type: DataType,
-    pub connected_edges: Vec<EdgeId>,
 }

@@ -1,22 +1,33 @@
 pub mod operators;
+pub mod outputs;
 pub mod primitives;
+pub mod type_info;
 
 pub use operators::*;
+pub use outputs::*;
 pub use primitives::*;
+pub use type_info::*;
 
-use crate::{
-    impl_entity_id, AsAny, Data, InputSlot, NodeManager, OutputSlot, SharedExecutionCache,
-};
+use crate::{impl_entity_id, AsAny, Data, InputSlot, NodeManager, OutputSlot, SharedExecutionCache};
 use std::{any::Any, fmt::Debug};
 
 impl_entity_id!(NodeId);
 
+/// Trait for node initialization.
+/// This is automatically implemented by the `register_nodes!` macro.
+pub trait NodeInit: NodeMeta + Sized {
+    /// Initialize a new node instance.
+    /// The default implementation creates a node with:
+    /// - `node_data` from `NodeMeta::default_data()`
+    /// - `inputs` from `NodeMeta::INPUTS`
+    /// - `outputs` from `NodeMeta::OUTPUTS`
+    fn initialize() -> Result<Self, String>;
+}
+
+/// The core node implementation trait.
+/// Only requires `execute()` - initialization is handled by `NodeInit`.
 #[async_trait::async_trait]
 pub trait NodeImpl: Debug + Send + Sync + AsAny {
-    fn initialize() -> Result<Self, String>
-    where
-        Self: Sized;
-
     async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String>;
 }
 
@@ -41,19 +52,26 @@ pub trait NodeCore: Debug {
             .get(slot_index)
             .ok_or("Invalid slot index".to_string())?;
 
+        let expected_type = input_slot.data_type;
+
         let cache = cache.lock()?;
-        let result: Vec<Data> = input_slot
-            .connected_edges
-            .iter()
-            .filter_map(|edge_id| {
-                cache.edges.get(edge_id).and_then(|edge| {
-                    cache
-                        .outputs
-                        .get(&edge.from_output_slot_id)
-                        .and_then(|data| Some(data.share()))
-                })
-            })
-            .collect();
+        let mut result: Vec<Data> = Vec::new();
+
+        for edge_id in cache.edges_for_input(&input_slot.id) {
+            if let Some(edge) = cache.edges.get(edge_id) {
+                if let Some(data) = cache.outputs.get(&edge.from_output_slot_id) {
+                    // Validate type matches
+                    if data.get_type() != expected_type {
+                        return Err(format!(
+                            "Type mismatch: expected {:?}, got {:?}",
+                            expected_type,
+                            data.get_type()
+                        ));
+                    }
+                    result.push(data.share());
+                }
+            }
+        }
 
         Ok(result)
     }
@@ -153,11 +171,21 @@ impl<T: 'static + NodeCore> AsAny for T {
 macro_rules! register_nodes {
     ($($struct_name:ident),*) => {
         $(
+            impl $crate::NodeInit for $struct_name {
+                fn initialize() -> Result<Self, String> {
+                    Ok(Self {
+                        node_data: <Self as $crate::NodeMeta>::DEFAULT_VALUE.to_data(),
+                        inputs: $crate::inputs_from_defs(<Self as $crate::NodeMeta>::INPUTS),
+                        outputs: $crate::outputs_from_defs(<Self as $crate::NodeMeta>::OUTPUTS),
+                    })
+                }
+            }
+
             impl $crate::NodeValueSetter for $struct_name {}
 
             impl $crate::NodeCore for $struct_name {
                 fn node_name(&self) -> &'static str {
-                    self.node_name
+                    <$struct_name as $crate::NodeMeta>::NAME
                 }
 
                 fn node_data(&self) -> Option<$crate::Data> {
@@ -188,8 +216,8 @@ macro_rules! register_nodes {
                 }
 
                 fn register_in(manager: &mut $crate::NodeManager) -> Result<(), String> {
-                    manager.register_factory::<$struct_name>(std::sync::Arc::new(|| {
-                        $struct_name::initialize().map(|node| {
+                    let factory = std::sync::Arc::new(|| {
+                        <$struct_name as $crate::NodeInit>::initialize().map(|node| {
                             std::sync::Arc::new({
                                 #[cfg(target_arch = "wasm32")]
                                 {
@@ -201,10 +229,34 @@ macro_rules! register_nodes {
                                 }
                             }) as $crate::NodeEntity
                         })
-                    }))
+                    });
+
+                    // Register by TypeId for compile-time dispatch
+                    manager.register_factory::<$struct_name>(factory.clone())?;
+
+                    // Register by name for runtime dispatch
+                    manager.register_factory_with_name(
+                        <$struct_name as $crate::NodeMeta>::NAME,
+                        factory,
+                        <$struct_name as $crate::NodeMeta>::DEFAULT_VALUE.to_data(),
+                    );
+
+                    Ok(())
                 }
             }
 
+            // Register NodeTypeInfo for static metadata access
+            inventory::submit! {
+                $crate::NodeTypeInfo {
+                    name: <$struct_name as $crate::NodeMeta>::NAME,
+                    category: <$struct_name as $crate::NodeMeta>::CATEGORY,
+                    inputs: <$struct_name as $crate::NodeMeta>::INPUTS,
+                    outputs: <$struct_name as $crate::NodeMeta>::OUTPUTS,
+                    default_value: <$struct_name as $crate::NodeMeta>::DEFAULT_VALUE,
+                }
+            }
+
+            // Register factory for node creation
             inventory::submit! {
                 $crate::NodeRegistrationEntry {
                     register: $struct_name::register_in,
