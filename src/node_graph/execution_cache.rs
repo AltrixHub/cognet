@@ -16,7 +16,7 @@ impl SharedExecutionCache {
         }
     }
 
-    pub fn lock(&self) -> Result<MutexGuard<ExecutionCache>, String> {
+    pub fn lock(&self) -> Result<MutexGuard<'_, ExecutionCache>, String> {
         Ok(self.inner.lock().map_err(|_| "Failed to lock cache")?)
     }
 
