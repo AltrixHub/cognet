@@ -51,7 +51,7 @@ impl DataType {
 
 pub type DataValue = Arc<dyn Any + Send + Sync>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Data {
     value: DataValue,
     data_type: DataType,

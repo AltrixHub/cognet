@@ -4,7 +4,7 @@ use crate::{Data, Edge, EdgeId, InputSlotId, NodeId, OutputSlotId};
 use std::collections::HashMap;
 
 /// Runtime state for a single node instance.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NodeState {
     /// The node type name (references NodeMeta::NAME).
     pub type_name: &'static str,
@@ -22,21 +22,21 @@ impl NodeState {
 }
 
 /// Runtime state for input slots.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InputSlotState {
     pub id: InputSlotId,
     pub connected_edges: Vec<EdgeId>,
 }
 
 /// Runtime state for output slots.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct OutputSlotState {
     pub id: OutputSlotId,
     pub connected_edges: Vec<EdgeId>,
 }
 
 /// Manages all node states in the graph.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct NodeStates {
     /// Node data by NodeId.
     nodes: HashMap<NodeId, NodeState>,
