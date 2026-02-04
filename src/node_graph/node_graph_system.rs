@@ -222,7 +222,8 @@ impl NodeGraphSystem for NodeGraph {
         // Check max_connections limit BEFORE adding the edge
         if let Some(max) = to_slot.max_connections() {
             let current_count = self
-                .node_states
+                .state_access
+                .storage()
                 .read()
                 .ok()
                 .map(|s| {
@@ -245,19 +246,24 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        // Update NodeStates slot connections and add edge (single source of truth for UI)
-        if let Ok(mut states) = self.node_states.write() {
+        // Update NodeStates slot connections and add edge via state access
+        {
+            let mut guard = self
+                .state_access
+                .storage()
+                .write()
+                .map_err(|e| e.to_string())?;
             if let Some(slot_state) =
-                states.output_slot_mut(&from_node_id, edge.from_output_slot_index)
+                guard.output_slot_mut(&from_node_id, edge.from_output_slot_index)
             {
                 slot_state.connected_edges.push(edge_id);
             }
             if let Some(slot_state) =
-                states.input_slot_mut(&to_node_id, edge.to_input_slot_index)
+                guard.input_slot_mut(&to_node_id, edge.to_input_slot_index)
             {
                 slot_state.connected_edges.push(edge_id);
             }
-            states.add_edge(edge_id, edge.clone());
+            guard.add_edge(edge_id, edge.clone());
         }
 
         tracing::debug!("[cognet] add_edge: collecting dirty nodes...");

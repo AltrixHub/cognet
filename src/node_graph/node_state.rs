@@ -2,7 +2,6 @@
 
 use crate::{Data, Edge, EdgeId, InputSlotId, NodeId, OutputSlotId};
 use std::collections::HashMap;
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Runtime state for a single node instance.
 #[derive(Debug)]
@@ -172,55 +171,5 @@ impl NodeStates {
             .iter()
             .filter(|(_, e)| &e.from_node_id == node_id || &e.to_node_id == node_id)
             .collect()
-    }
-}
-
-// ============================================================================
-// SharedNodeStates - Thread-safe wrapper for external access
-// ============================================================================
-
-/// Convert a PoisonError to a String error message.
-fn poison_error<T>(err: PoisonError<T>) -> String {
-    format!("Lock poisoned: {}", err)
-}
-
-/// Thread-safe wrapper for NodeStates.
-///
-/// This allows UI code to access node states synchronously without
-/// needing to hold the async graph lock.
-#[derive(Debug, Clone)]
-pub struct SharedNodeStates {
-    inner: Arc<RwLock<NodeStates>>,
-}
-
-impl Default for SharedNodeStates {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SharedNodeStates {
-    /// Create a new shared node states.
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(NodeStates::new())),
-        }
-    }
-
-    /// Get read access to the inner NodeStates.
-    pub fn read(&self) -> Result<RwLockReadGuard<'_, NodeStates>, String> {
-        self.inner.read().map_err(poison_error)
-    }
-
-    /// Get write access to the inner NodeStates.
-    pub fn write(&self) -> Result<RwLockWriteGuard<'_, NodeStates>, String> {
-        self.inner.write().map_err(poison_error)
-    }
-
-    /// Clone the Arc (cheap).
-    pub fn share(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
     }
 }

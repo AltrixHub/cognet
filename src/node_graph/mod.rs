@@ -9,12 +9,15 @@ pub use node_graph_api::*;
 pub use node_manager::*;
 pub use node_state::*;
 
-use crate::{ErrorTarget, GraphError, NodeId};
+use crate::{ErrorTarget, GraphError, NodeId, NodeStatesAccess};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub struct NodeGraph {
     node_manager: NodeManager,
-    node_states: SharedNodeStates,
+    /// External state access (for UI integration).
+    /// If None, uses internal state access.
+    state_access: Arc<dyn NodeStatesAccess>,
     cache: SharedExecutionCache,
     dirty_nodes: HashSet<NodeId>,
     /// Current errors in the graph, keyed by target.
@@ -22,12 +25,26 @@ pub struct NodeGraph {
 }
 
 impl NodeGraph {
-    /// Get shared node states (for sync UI access).
+    /// Create a new NodeGraph with external state access.
     ///
-    /// This returns a clone of the Arc, allowing external code
-    /// to access node states without holding the graph lock.
-    pub fn shared_node_states(&self) -> SharedNodeStates {
-        self.node_states.share()
+    /// This is the preferred way to create a NodeGraph when integrating
+    /// with a UI framework like revion. The state access adapter handles
+    /// state updates and can trigger UI rebuilds.
+    pub fn with_state_access(state_access: Arc<dyn NodeStatesAccess>) -> Result<Self, String> {
+        Ok(Self {
+            node_manager: NodeManager::new()?,
+            state_access,
+            cache: Default::default(),
+            dirty_nodes: Default::default(),
+            errors: Default::default(),
+        })
+    }
+
+    /// Get the state access for reading node states.
+    ///
+    /// This provides read-only access to node states through the trait.
+    pub fn state_access(&self) -> &Arc<dyn NodeStatesAccess> {
+        &self.state_access
     }
 
     /// Get shared execution cache (for UI access to output values).

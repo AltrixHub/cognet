@@ -9,8 +9,8 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, GraphError, NodeEntity, NodeGraph,
-    NodeId, NodeImpl, NodeManager, NodeMeta, SharedNodeStates,
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, GraphError, InternalStateAccess,
+    NodeEntity, NodeGraph, NodeId, NodeImpl, NodeManager, NodeMeta,
 };
 
 #[async_trait]
@@ -68,7 +68,7 @@ impl NodeGraphAPI for NodeGraph {
     fn new() -> Result<Self, String> {
         Ok(Self {
             node_manager: NodeManager::new()?,
-            node_states: SharedNodeStates::new(),
+            state_access: Arc::new(InternalStateAccess::new()),
             cache: Default::default(),
             dirty_nodes: Default::default(),
             errors: Default::default(),
@@ -162,17 +162,14 @@ impl NodeGraphAPI for NodeGraph {
     async fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
         let node_id = self.node_manager.create_node::<T>().await?;
 
-        // Register in NodeStates for sync UI access
-        self.node_states
-            .write()
-            .map_err(|e| e.to_string())?
-            .add_node(
-                node_id,
-                T::NAME,
-                T::DEFAULT_VALUE.to_data(),
-                T::INPUTS.len(),
-                T::OUTPUTS.len(),
-            );
+        // Register in NodeStates via state access
+        self.state_access.add_node(
+            node_id,
+            T::NAME,
+            T::DEFAULT_VALUE.to_data(),
+            T::INPUTS.len(),
+            T::OUTPUTS.len(),
+        );
 
         Ok(node_id)
     }
@@ -185,17 +182,14 @@ impl NodeGraphAPI for NodeGraph {
         let type_info = crate::get_node_type_info(name)
             .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
 
-        // Register in NodeStates for sync UI access
-        self.node_states
-            .write()
-            .map_err(|e| e.to_string())?
-            .add_node(
-                node_id,
-                type_info.name,
-                default_data,
-                type_info.inputs.len(),
-                type_info.outputs.len(),
-            );
+        // Register in NodeStates via state access
+        self.state_access.add_node(
+            node_id,
+            type_info.name,
+            default_data,
+            type_info.inputs.len(),
+            type_info.outputs.len(),
+        );
 
         Ok(node_id)
     }
@@ -206,10 +200,8 @@ impl NodeGraphAPI for NodeGraph {
             self.remove_edges_from_cache(&node_id)?;
             self.mark_dirty_nodes(dirty_nodes);
 
-            // Clean up NodeStates
-            if let Ok(mut states) = self.node_states.write() {
-                states.remove_node(&node_id);
-            }
+            // Clean up NodeStates via state access
+            self.state_access.remove_node(node_id);
 
             Ok(())
         } else {
@@ -226,12 +218,8 @@ impl NodeGraphAPI for NodeGraph {
         let mut write_node = node.write().await;
         write_node.set_node_data(data.share())?;
 
-        // Update NodeStates
-        if let Ok(mut states) = self.node_states.write() {
-            if let Some(state) = states.get_mut(node_id) {
-                state.data = Some(data);
-            }
-        }
+        // Update NodeStates via state access
+        self.state_access.update_node_data(*node_id, Some(data));
 
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
@@ -281,19 +269,24 @@ impl NodeGraphAPI for NodeGraph {
         let from_node_id = edge.from_node_id;
         let to_node_id = edge.to_node_id;
 
-        // Update NodeStates slot connections and remove edge (single source of truth for UI)
-        if let Ok(mut states) = self.node_states.write() {
+        // Update NodeStates slot connections and remove edge via state access
+        {
+            let mut guard = self
+                .state_access
+                .storage()
+                .write()
+                .map_err(|e| e.to_string())?;
             if let Some(slot_state) =
-                states.output_slot_mut(&from_node_id, edge.from_output_slot_index)
+                guard.output_slot_mut(&from_node_id, edge.from_output_slot_index)
             {
                 slot_state.connected_edges.retain(|id| *id != edge_id);
             }
             if let Some(slot_state) =
-                states.input_slot_mut(&to_node_id, edge.to_input_slot_index)
+                guard.input_slot_mut(&to_node_id, edge.to_input_slot_index)
             {
                 slot_state.connected_edges.retain(|id| *id != edge_id);
             }
-            states.remove_edge(&edge_id);
+            guard.remove_edge(&edge_id);
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
