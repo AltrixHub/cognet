@@ -13,53 +13,58 @@ use crate::{
     NodeEntity, NodeGraph, NodeId, NodeImpl, NodeManager, NodeMeta,
 };
 
+/// Execution event for progress tracking during graph execution.
+#[derive(Debug, Clone)]
+pub enum ExecutionEvent {
+    /// Node execution started.
+    Started(NodeId),
+    /// Node execution completed successfully.
+    Completed(NodeId),
+    /// Node execution failed with an error.
+    Failed(NodeId, String),
+}
+
 #[async_trait]
 pub trait NodeGraphAPI {
     fn new() -> Result<Self, String>
     where
         Self: Sized;
 
+    /// Execute the graph asynchronously.
     async fn execute(&mut self) -> Result<(), String>;
 
-    async fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String>;
-
-    /// Create a node by name (runtime dispatch).
+    /// Execute the graph with progress callback.
     ///
-    /// This allows creating nodes without knowing the concrete type at compile time.
-    /// The node type must be registered via `register_nodes!` macro.
-    async fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String>;
+    /// The callback is called for each node as it starts executing,
+    /// completes, or fails. This enables real-time UI updates.
+    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<(), String>
+    where
+        F: Fn(ExecutionEvent) + Send + Sync + 'static;
 
-    async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
-
-    async fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String>;
-
-    async fn update_input_slot_default_data(
+    // Sync methods for graph structure operations
+    fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String>;
+    fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String>;
+    fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
+    fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String>;
+    fn update_input_slot_default_data(
         &mut self,
         node_id: &NodeId,
         slot_index: usize,
         data: Data,
     ) -> Result<(), String>;
-
-    async fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
-
-    async fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId>;
-
-    async fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)>;
-
-    async fn connect_nodes(
+    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
+    fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId>;
+    fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)>;
+    fn connect_nodes(
         &mut self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
         to_node_id: &NodeId,
         to_input_slot_index: usize,
     ) -> Result<EdgeId, String>;
-
-    async fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String>;
-
+    fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String>;
     fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
-
-    async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
-
+    fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
     fn node_variants(&self) -> &HashSet<String>;
 }
 
@@ -76,6 +81,13 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     async fn execute(&mut self) -> Result<(), String> {
+        self.execute_with_progress(|_| {}).await
+    }
+
+    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<(), String>
+    where
+        F: Fn(ExecutionEvent) + Send + Sync + 'static,
+    {
         if self.dirty_nodes.is_empty() {
             return Ok(());
         }
@@ -87,23 +99,56 @@ impl NodeGraphAPI for NodeGraph {
 
         let shared_nodes = self.node_manager.nodes();
         let shared_cache = self.cache.share();
+        let on_progress = Arc::new(on_progress);
 
         #[cfg(target_arch = "wasm32")]
         {
             for level_nodes in sorted_node_levels {
                 let futures: Vec<_> = level_nodes
-                    .into_par_iter()
+                    .into_iter()
                     .map(|node_id| {
                         let shared_nodes = shared_nodes.share();
                         let shared_cache = shared_cache.share();
+                        let on_progress = Arc::clone(&on_progress);
                         async move {
-                            let nodes = shared_nodes.lock().await;
-                            let result = if let Some(node) = nodes.get(&node_id) {
-                                let node_read = node.read().await;
-                                node_read.execute(shared_cache.share()).await
-                            } else {
-                                Ok(())
+                            on_progress(ExecutionEvent::Started(node_id));
+
+                            let result = {
+                                let nodes_guard = match shared_nodes.lock() {
+                                    Ok(g) => g,
+                                    Err(_) => return (node_id, Err("Lock poisoned".to_string())),
+                                };
+                                if let Some(node) = nodes_guard.get(&node_id) {
+                                    let node_read = match node.read() {
+                                        Ok(r) => r,
+                                        Err(_) => {
+                                            return (node_id, Err("Node lock poisoned".to_string()))
+                                        }
+                                    };
+                                    // Drop the locks before async execution
+                                    let node_clone = Arc::clone(node);
+                                    drop(node_read);
+                                    drop(nodes_guard);
+                                    // Re-acquire for execution
+                                    let node_read = match node_clone.read() {
+                                        Ok(r) => r,
+                                        Err(_) => {
+                                            return (node_id, Err("Node lock poisoned".to_string()))
+                                        }
+                                    };
+                                    node_read.execute(shared_cache.share()).await
+                                } else {
+                                    Ok(())
+                                }
                             };
+
+                            match &result {
+                                Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
+                                Err(msg) => {
+                                    on_progress(ExecutionEvent::Failed(node_id, msg.clone()))
+                                }
+                            }
+
                             (node_id, result)
                         }
                     })
@@ -126,19 +171,42 @@ impl NodeGraphAPI for NodeGraph {
                     let shared_nodes = shared_nodes.share();
                     let shared_cache = shared_cache.share();
                     let rt_handle = Arc::clone(&rt_handle);
+                    let on_progress = Arc::clone(&on_progress);
                     move || {
                         level_nodes
                             .into_par_iter()
                             .map(|node_id| {
-                                let result = rt_handle.block_on(async {
-                                    let nodes = shared_nodes.lock().await;
-                                    if let Some(node) = nodes.get(&node_id) {
-                                        let node_read = node.read().await;
-                                        node_read.execute(shared_cache.share()).await
+                                on_progress(ExecutionEvent::Started(node_id));
+
+                                let result = {
+                                    let nodes_guard = match shared_nodes.lock() {
+                                        Ok(g) => g,
+                                        Err(_) => return (node_id, Err("Lock poisoned".to_string())),
+                                    };
+                                    if let Some(node) = nodes_guard.get(&node_id) {
+                                        let node_clone = Arc::clone(node);
+                                        drop(nodes_guard);
+                                        rt_handle.block_on(async {
+                                            let node_read = match node_clone.read() {
+                                                Ok(r) => r,
+                                                Err(_) => {
+                                                    return Err("Node lock poisoned".to_string())
+                                                }
+                                            };
+                                            node_read.execute(shared_cache.share()).await
+                                        })
                                     } else {
                                         Ok(())
                                     }
-                                });
+                                };
+
+                                match &result {
+                                    Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
+                                    Err(msg) => {
+                                        on_progress(ExecutionEvent::Failed(node_id, msg.clone()))
+                                    }
+                                }
+
                                 (node_id, result)
                             })
                             .collect()
@@ -159,8 +227,8 @@ impl NodeGraphAPI for NodeGraph {
         Ok(())
     }
 
-    async fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
-        let node_id = self.node_manager.create_node::<T>().await?;
+    fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
+        let node_id = self.node_manager.create_node::<T>()?;
 
         // Register in NodeStates via state access
         self.state_access.add_node(
@@ -174,9 +242,9 @@ impl NodeGraphAPI for NodeGraph {
         Ok(node_id)
     }
 
-    async fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String> {
+    fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String> {
         // Create node and get default data from factory
-        let (node_id, default_data) = self.node_manager.create_node_by_name(name).await?;
+        let (node_id, default_data) = self.node_manager.create_node_by_name(name)?;
 
         // Get type info for slot counts
         let type_info = crate::get_node_type_info(name)
@@ -194,8 +262,8 @@ impl NodeGraphAPI for NodeGraph {
         Ok(node_id)
     }
 
-    async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
-        if self.node_manager.node_remove(&node_id).await.is_some() {
+    fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
+        if self.node_manager.node_remove(&node_id).is_some() {
             let dirty_nodes = self.collect_dirty_nodes(vec![node_id])?;
             self.remove_edges_from_cache(&node_id)?;
             self.mark_dirty_nodes(dirty_nodes);
@@ -209,13 +277,12 @@ impl NodeGraphAPI for NodeGraph {
         }
     }
 
-    async fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
+    fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
         let node = self
             .node_manager
             .get_node_by_id(node_id)
-            .await
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-        let mut write_node = node.write().await;
+        let mut write_node = node.write().map_err(|e| e.to_string())?;
         write_node.set_node_data(data.share())?;
 
         // Update NodeStates via state access
@@ -226,7 +293,7 @@ impl NodeGraphAPI for NodeGraph {
         Ok(())
     }
 
-    async fn update_input_slot_default_data(
+    fn update_input_slot_default_data(
         &mut self,
         node_id: &NodeId,
         slot_index: usize,
@@ -235,16 +302,15 @@ impl NodeGraphAPI for NodeGraph {
         let node = self
             .node_manager
             .get_node_by_id(node_id)
-            .await
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-        let mut write_node = node.write().await;
+        let mut write_node = node.write().map_err(|e| e.to_string())?;
         write_node.set_input_slot_default_data(slot_index, data)?;
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
         Ok(())
     }
 
-    async fn connect_nodes(
+    fn connect_nodes(
         &mut self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
@@ -258,12 +324,12 @@ impl NodeGraphAPI for NodeGraph {
                 to_node_id,
                 to_input_slot_index,
             )
-            .await?;
+            .map_err(|e| e.to_string())?;
 
-        self.add_edge(edge).await
+        self.add_edge(edge)
     }
 
-    async fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
+    fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
         let edge = self.remove_edge_from_cache(&edge_id)?;
 
         let from_node_id = edge.from_node_id;
@@ -304,24 +370,21 @@ impl NodeGraphAPI for NodeGraph {
             .ok_or(format!("Edge not found: id {:?}", edge_id))
     }
 
-    async fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity> {
-        self.node_manager
-            .get_node_by_id(node_id)
-            .await
-            .map(|node| Arc::clone(&node))
+    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity> {
+        self.node_manager.get_node_by_id(node_id)
     }
 
-    async fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
-        self.node_manager.get_node_ids_by_type::<T>().await
+    fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
+        self.node_manager.get_node_ids_by_type::<T>()
     }
 
-    async fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
-        self.node_manager.get_nodes_by_ids(ids).await
+    fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
+        self.node_manager.get_nodes_by_ids(ids)
     }
 
-    async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
-        let node = self.get_node_by_id(node_id).await?;
-        let read_node = node.read().await;
+    fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
+        let node = self.get_node_by_id(node_id)?;
+        let read_node = node.read().ok()?;
         let slot = read_node.outputs().get(output_slot_index)?;
 
         let cache = self.cache.lock().ok()?;

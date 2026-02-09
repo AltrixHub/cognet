@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub(crate) trait NodeGraphSystem {
     fn topological_sort(&self, target_nodes: &HashSet<NodeId>) -> Result<Vec<Vec<NodeId>>, String>;
 
-    async fn create_edge(
+    fn create_edge(
         &self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
@@ -12,7 +12,7 @@ pub(crate) trait NodeGraphSystem {
         to_input_slot_index: usize,
     ) -> Result<Edge, &'static str>;
 
-    async fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
+    fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
 
     fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String>;
 
@@ -87,7 +87,7 @@ impl NodeGraphSystem for NodeGraph {
         Ok(sorted)
     }
 
-    async fn create_edge(
+    fn create_edge(
         &self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
@@ -100,10 +100,9 @@ impl NodeGraphSystem for NodeGraph {
             tracing::debug!("[cognet] create_edge: getting from_node...");
             let node = self
                 .get_node_by_id(from_node_id)
-                .await
                 .ok_or("From node not found")?;
             tracing::debug!("[cognet] create_edge: got from_node, acquiring read lock...");
-            let read_node = node.read().await;
+            let read_node = node.read().map_err(|_| "Failed to acquire read lock")?;
             tracing::debug!("[cognet] create_edge: from_node read lock acquired");
             read_node
                 .outputs()
@@ -117,10 +116,9 @@ impl NodeGraphSystem for NodeGraph {
             tracing::debug!("[cognet] create_edge: getting to_node...");
             let node = self
                 .get_node_by_id(to_node_id)
-                .await
                 .ok_or("To node not found")?;
             tracing::debug!("[cognet] create_edge: got to_node, acquiring read lock...");
-            let read_node = node.read().await;
+            let read_node = node.read().map_err(|_| "Failed to acquire read lock")?;
             tracing::debug!("[cognet] create_edge: to_node read lock acquired");
             read_node
                 .inputs()
@@ -141,7 +139,7 @@ impl NodeGraphSystem for NodeGraph {
         })
     }
 
-    async fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
+    fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
         tracing::debug!("[cognet] add_edge: START");
         let from_node_id = edge.from_node_id;
         let to_node_id = edge.to_node_id;
@@ -154,7 +152,7 @@ impl NodeGraphSystem for NodeGraph {
         self.clear_error(&input_target);
 
         tracing::debug!("[cognet] add_edge: getting from_node...");
-        let from_node = match self.node_manager.get_node_by_id(&from_node_id).await {
+        let from_node = match self.node_manager.get_node_by_id(&from_node_id) {
             Some(node) => node,
             None => {
                 let error = GraphError::node_not_found(from_node_id);
@@ -166,7 +164,7 @@ impl NodeGraphSystem for NodeGraph {
         tracing::debug!("[cognet] add_edge: got from_node");
 
         tracing::debug!("[cognet] add_edge: getting to_node...");
-        let to_node = match self.node_manager.get_node_by_id(&to_node_id).await {
+        let to_node = match self.node_manager.get_node_by_id(&to_node_id) {
             Some(node) => node,
             None => {
                 let error = GraphError::node_not_found(to_node_id);
@@ -178,7 +176,7 @@ impl NodeGraphSystem for NodeGraph {
         tracing::debug!("[cognet] add_edge: got to_node");
 
         tracing::debug!("[cognet] add_edge: acquiring from_node read lock...");
-        let read_from_node = from_node.read().await;
+        let read_from_node = from_node.read().map_err(|e| e.to_string())?;
         tracing::debug!("[cognet] add_edge: from_node read lock acquired");
         let from_slot = match read_from_node.get_output_slot_by_index(edge.from_output_slot_index)
         {
@@ -193,7 +191,7 @@ impl NodeGraphSystem for NodeGraph {
         };
 
         tracing::debug!("[cognet] add_edge: acquiring to_node read lock...");
-        let read_to_node = to_node.read().await;
+        let read_to_node = to_node.read().map_err(|e| e.to_string())?;
         tracing::debug!("[cognet] add_edge: to_node read lock acquired");
         let to_slot = match read_to_node.get_input_slot_by_index(edge.to_input_slot_index) {
             Some(slot) => slot,
@@ -243,6 +241,10 @@ impl NodeGraphSystem for NodeGraph {
                 return Err(msg);
             }
         }
+
+        // Release the read locks before acquiring write lock
+        drop(read_from_node);
+        drop(read_to_node);
 
         let edge_id = EdgeId::new();
 

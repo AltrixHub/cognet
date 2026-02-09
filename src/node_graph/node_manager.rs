@@ -1,8 +1,4 @@
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::sync::{Mutex, MutexGuard, RwLock};
-
-#[cfg(target_arch = "wasm32")]
-use async_lock::{Mutex, MutexGuard, RwLock};
+use std::sync::{Mutex, MutexGuard, RwLock};
 
 use crate::{Data, NodeCore, NodeId, NodeImpl, NodeValueSetter};
 use std::{
@@ -37,8 +33,10 @@ impl SharedNodes {
         }
     }
 
-    pub async fn lock(&self) -> MutexGuard<'_, HashMap<NodeId, NodeEntity>> {
-        self.inner.lock().await
+    /// Lock the nodes map for access.
+    /// Returns an error if the lock is poisoned.
+    pub fn lock(&self) -> Result<MutexGuard<'_, HashMap<NodeId, NodeEntity>>, String> {
+        self.inner.lock().map_err(|e| e.to_string())
     }
 
     pub fn share(&self) -> Self {
@@ -78,21 +76,27 @@ impl NodeManager {
         self.nodes.share()
     }
 
-    pub async fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
-        let nodes = self.nodes.lock().await;
+    pub fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
+        let nodes = self.nodes.lock().ok()?;
         nodes.get(id).map(|node| Arc::clone(node))
     }
 
-    pub async fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
-        let nodes = self.nodes.lock().await;
+    pub fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
+        let nodes = match self.nodes.lock() {
+            Ok(n) => n,
+            Err(_) => return Vec::new(),
+        };
 
         ids.into_iter()
             .filter_map(|id| nodes.get(&id).map(|node| (id, Arc::clone(node))))
             .collect()
     }
 
-    pub async fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
-        let nodes = self.nodes.lock().await;
+    pub fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
+        let nodes = match self.nodes.lock() {
+            Ok(n) => n,
+            Err(_) => return Vec::new(),
+        };
 
         let mut result: Vec<NodeId> = Vec::new();
 
@@ -105,18 +109,21 @@ impl NodeManager {
         result
     }
 
-    pub async fn contains_key(&self, id: &NodeId) -> bool {
-        let nodes = self.nodes.lock().await;
+    pub fn contains_key(&self, id: &NodeId) -> bool {
+        let nodes = match self.nodes.lock() {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
         nodes.contains_key(id)
     }
 
-    pub async fn node_insert(&self, node_id: NodeId, node: NodeEntity) -> Option<NodeEntity> {
-        let mut nodes = self.nodes.lock().await;
+    pub fn node_insert(&self, node_id: NodeId, node: NodeEntity) -> Option<NodeEntity> {
+        let mut nodes = self.nodes.lock().ok()?;
         nodes.insert(node_id, node)
     }
 
-    pub async fn node_remove(&self, node_id: &NodeId) -> Option<NodeEntity> {
-        let mut nodes = self.nodes.lock().await;
+    pub fn node_remove(&self, node_id: &NodeId) -> Option<NodeEntity> {
+        let mut nodes = self.nodes.lock().ok()?;
         nodes.remove(node_id)
     }
 
@@ -162,11 +169,11 @@ impl NodeManager {
     }
 
     /// Create a node by type (compile-time dispatch).
-    pub async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
+    pub fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
             let node = factory()?;
             let node_id = NodeId::new();
-            self.node_insert(node_id, node).await;
+            self.node_insert(node_id, node);
             Ok(node_id)
         } else {
             Err(format!("{:?} is not registered", TypeId::of::<T>()))
@@ -176,7 +183,7 @@ impl NodeManager {
     /// Create a node by name (runtime dispatch).
     ///
     /// Returns the node ID and default data if successful.
-    pub async fn create_node_by_name(
+    pub fn create_node_by_name(
         &self,
         name: &str,
     ) -> Result<(NodeId, Option<Data>), String> {
@@ -188,7 +195,7 @@ impl NodeManager {
         let node = (factory_meta.factory)()?;
         let default_data = factory_meta.default_data.as_ref().map(|d| d.share());
         let node_id = NodeId::new();
-        self.node_insert(node_id, node).await;
+        self.node_insert(node_id, node);
 
         Ok((node_id, default_data))
     }
