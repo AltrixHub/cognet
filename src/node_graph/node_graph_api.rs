@@ -24,6 +24,41 @@ pub enum ExecutionEvent {
     Failed(NodeId, String),
 }
 
+/// Output from a single node execution.
+#[derive(Debug, Clone)]
+pub struct NodeOutput {
+    /// The node that produced this output.
+    pub node_id: NodeId,
+    /// Output slot index.
+    pub slot_index: usize,
+    /// The output data (Arc-shared with ExecutionCache for zero-copy).
+    pub data: Data,
+}
+
+/// Changes produced by a graph execution.
+///
+/// Contains all outputs from nodes that were (re)computed, plus any nodes
+/// that were removed since the last execution.
+#[derive(Debug, Clone, Default)]
+pub struct GraphChanges {
+    /// Outputs from nodes computed in this execution (new + updated).
+    pub outputs: Vec<NodeOutput>,
+    /// Nodes removed since the last execute() call.
+    pub removed_nodes: Vec<NodeId>,
+}
+
+impl GraphChanges {
+    /// Create empty changes.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Check if there are no changes.
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty() && self.removed_nodes.is_empty()
+    }
+}
+
 #[async_trait]
 pub trait NodeGraphAPI {
     fn new() -> Result<Self, String>
@@ -31,13 +66,19 @@ pub trait NodeGraphAPI {
         Self: Sized;
 
     /// Execute the graph asynchronously.
-    async fn execute(&mut self) -> Result<(), String>;
+    ///
+    /// Returns `GraphChanges` containing outputs from computed nodes
+    /// and IDs of nodes removed since the last execution.
+    async fn execute(&mut self) -> Result<GraphChanges, String>;
 
     /// Execute the graph with progress callback.
     ///
     /// The callback is called for each node as it starts executing,
     /// completes, or fails. This enables real-time UI updates.
-    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<(), String>
+    ///
+    /// Returns `GraphChanges` containing outputs from computed nodes
+    /// and IDs of nodes removed since the last execution.
+    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<GraphChanges, String>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static;
 
@@ -77,25 +118,43 @@ impl NodeGraphAPI for NodeGraph {
             cache: Default::default(),
             dirty_nodes: Default::default(),
             errors: Default::default(),
+            removed_since_last_execute: Vec::new(),
         })
     }
 
-    async fn execute(&mut self) -> Result<(), String> {
+    async fn execute(&mut self) -> Result<GraphChanges, String> {
         self.execute_with_progress(|_| {}).await
     }
 
-    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<(), String>
+    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<GraphChanges, String>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static,
     {
+        // Drain removed nodes accumulated since last execute
+        let removed = std::mem::take(&mut self.removed_since_last_execute);
+
+        if self.dirty_nodes.is_empty() && removed.is_empty() {
+            return Ok(GraphChanges::empty());
+        }
+
+        // If only removals (no dirty nodes), return just the removed list
         if self.dirty_nodes.is_empty() {
-            return Ok(());
+            return Ok(GraphChanges {
+                outputs: Vec::new(),
+                removed_nodes: removed,
+            });
         }
 
         // Clear previous execution errors before running
         self.clear_execution_errors();
 
         let sorted_node_levels = self.topological_sort(&self.dirty_nodes)?;
+
+        // Collect all node IDs that will be executed (for output collection)
+        let executed_node_ids: Vec<NodeId> = sorted_node_levels
+            .iter()
+            .flat_map(|level| level.iter().copied())
+            .collect();
 
         let shared_nodes = self.node_manager.nodes();
         let shared_cache = self.cache.share();
@@ -223,8 +282,31 @@ impl NodeGraphAPI for NodeGraph {
             }
         }
 
+        // Collect outputs from executed nodes (Arc-shared for zero-copy)
+        let mut outputs = Vec::new();
+        for node_id in &executed_node_ids {
+            if let Some(node) = self.node_manager.get_node_by_id(node_id) {
+                if let Ok(read_node) = node.read() {
+                    for (idx, slot) in read_node.outputs().iter().enumerate() {
+                        if let Ok(cache) = shared_cache.lock() {
+                            if let Some(data) = cache.outputs.get(&slot.id) {
+                                outputs.push(NodeOutput {
+                                    node_id: *node_id,
+                                    slot_index: idx,
+                                    data: data.share(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.dirty_nodes.clear();
-        Ok(())
+        Ok(GraphChanges {
+            outputs,
+            removed_nodes: removed,
+        })
     }
 
     fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
@@ -270,6 +352,9 @@ impl NodeGraphAPI for NodeGraph {
 
             // Clean up NodeStates via state access
             self.state_access.remove_node(node_id);
+
+            // Track removal for GraphChanges in next execute()
+            self.removed_since_last_execute.push(node_id);
 
             Ok(())
         } else {

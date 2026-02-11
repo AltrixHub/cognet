@@ -22,6 +22,8 @@ pub struct NodeGraph {
     dirty_nodes: HashSet<NodeId>,
     /// Current errors in the graph, keyed by target.
     errors: HashMap<ErrorTarget, GraphError>,
+    /// Nodes removed since last execute(). Drained by execute() into GraphChanges.removed_nodes.
+    removed_since_last_execute: Vec<NodeId>,
 }
 
 impl NodeGraph {
@@ -37,6 +39,7 @@ impl NodeGraph {
             cache: Default::default(),
             dirty_nodes: Default::default(),
             errors: Default::default(),
+            removed_since_last_execute: Vec::new(),
         })
     }
 

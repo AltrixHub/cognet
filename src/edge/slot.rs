@@ -20,6 +20,9 @@ pub enum DataType {
     #[default]
     Number,
     String,
+    /// Mesh data type for geometry outputs.
+    /// Stores arbitrary mesh data as `Arc<dyn Any>` via `Data::from_mesh()`.
+    Mesh,
 }
 
 impl DataType {
@@ -27,6 +30,8 @@ impl DataType {
         match self {
             DataType::Number => TypeId::of::<f64>(),
             DataType::String => TypeId::of::<String>(),
+            // Mesh holds arbitrary types; type_id is not used for Mesh (see Data::value())
+            DataType::Mesh => TypeId::of::<()>(),
         }
     }
 
@@ -34,6 +39,7 @@ impl DataType {
         match self {
             DataType::Number => type_name::<f64>(),
             DataType::String => type_name::<String>(),
+            DataType::Mesh => "Mesh",
         }
     }
 
@@ -45,6 +51,8 @@ impl DataType {
         match self {
             DataType::Number => value.downcast_ref::<f64>().is_some(),
             DataType::String => value.downcast_ref::<String>().is_some(),
+            // Mesh accepts any type
+            DataType::Mesh => true,
         }
     }
 }
@@ -62,22 +70,23 @@ impl Serialize for Data {
     where
         S: serde::Serializer,
     {
-        let type_name = self.data_type.type_name();
-        match type_name {
-            "f64" => {
+        match self.data_type {
+            DataType::Number => {
                 let value = self
                     .value
                     .downcast_ref::<f64>()
                     .ok_or_else(|| serde::ser::Error::custom("Failed to downcast value to f64"))?;
                 serializer.serialize_f64(*value)
             }
-            "alloc::string::String" => {
+            DataType::String => {
                 let value = self.value.downcast_ref::<String>().ok_or_else(|| {
                     serde::ser::Error::custom("Failed to downcast value to String")
                 })?;
                 serializer.serialize_str(value)
             }
-            _ => Err(serde::ser::Error::custom("Unsupported data type")),
+            DataType::Mesh => Err(serde::ser::Error::custom(
+                "Mesh data type is not serializable",
+            )),
         }
     }
 }
@@ -137,6 +146,18 @@ impl Data {
         })
     }
 
+    /// Create a Mesh data value from any type.
+    ///
+    /// Mesh data holds arbitrary types as `Arc<dyn Any>`, allowing custom
+    /// geometry types to flow through the graph without cognet needing
+    /// to know about them.
+    pub fn from_mesh<T: Any + Send + Sync + 'static>(value: T) -> Self {
+        Data {
+            value: Arc::new(value),
+            data_type: DataType::Mesh,
+        }
+    }
+
     pub fn from_any(value: Arc<dyn Any + Send + Sync>) -> Result<Self, String> {
         let type_id = (*value).type_id();
         let data_type = match type_id {
@@ -159,7 +180,15 @@ impl Data {
     }
 
     pub fn value<T: 'static>(&self) -> Result<&T, String> {
-        if TypeId::of::<T>() == self.data_type.type_id() {
+        if self.data_type == DataType::Mesh {
+            // Mesh holds arbitrary types; bypass TypeId check and downcast directly
+            self.value.downcast_ref::<T>().ok_or_else(|| {
+                format!(
+                    "Mesh data downcast failed: requested {}",
+                    type_name::<T>()
+                )
+            })
+        } else if TypeId::of::<T>() == self.data_type.type_id() {
             self.value.downcast_ref::<T>().ok_or_else(|| {
                 format!(
                     "Data type mismatch: Expected {}, but got {}",
