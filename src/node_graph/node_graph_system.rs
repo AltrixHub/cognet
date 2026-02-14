@@ -34,17 +34,20 @@ impl NodeGraphSystem for NodeGraph {
         }
 
         let cache = self.cache.lock()?;
-        for edge in cache.edges.values() {
-            if target_nodes.contains(&edge.from_node_id) && target_nodes.contains(&edge.to_node_id)
-            {
-                in_degree
-                    .entry(&edge.to_node_id)
-                    .and_modify(|count| *count += 1)
-                    .or_insert(1);
-                adj_list
-                    .entry(&edge.from_node_id)
-                    .or_default()
-                    .push(edge.to_node_id);
+        for node_id in target_nodes {
+            for edge_id in cache.outgoing_edges_for_node(node_id) {
+                if let Some(edge) = cache.edges.get(edge_id) {
+                    if target_nodes.contains(&edge.to_node_id) {
+                        in_degree
+                            .entry(&edge.to_node_id)
+                            .and_modify(|count| *count += 1)
+                            .or_insert(1);
+                        adj_list
+                            .entry(&edge.from_node_id)
+                            .or_default()
+                            .push(edge.to_node_id);
+                    }
+                }
             }
         }
 
@@ -288,9 +291,11 @@ impl NodeGraphSystem for NodeGraph {
 
         while let Some(node_id) = queue.pop_front() {
             if affected.insert(node_id) {
-                for edge in cache.edges.values() {
-                    if edge.from_node_id == node_id && !affected.contains(&edge.to_node_id) {
-                        queue.push_back(edge.to_node_id);
+                for edge_id in cache.outgoing_edges_for_node(&node_id) {
+                    if let Some(edge) = cache.edges.get(edge_id) {
+                        if !affected.contains(&edge.to_node_id) {
+                            queue.push_back(edge.to_node_id);
+                        }
                     }
                 }
             }
@@ -301,9 +306,7 @@ impl NodeGraphSystem for NodeGraph {
 
     fn remove_edges_from_cache(&self, node_id: &NodeId) -> Result<(), String> {
         let mut cache = self.cache.lock()?;
-        cache
-            .edges
-            .retain(|_, edge| edge.from_node_id != *node_id && edge.to_node_id != *node_id);
+        cache.remove_edges_for_node(node_id);
         Ok(())
     }
 

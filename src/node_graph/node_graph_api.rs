@@ -288,7 +288,7 @@ impl NodeGraphAPI for NodeGraph {
             if let Some(node) = self.node_manager.get_node_by_id(node_id) {
                 if let Ok(read_node) = node.read() {
                     for (idx, slot) in read_node.outputs().iter().enumerate() {
-                        if let Ok(cache) = shared_cache.lock() {
+                        if let Ok(cache) = shared_cache.read() {
                             if let Some(data) = cache.outputs.get(&slot.id) {
                                 outputs.push(NodeOutput {
                                     node_id: *node_id,
@@ -472,7 +472,7 @@ impl NodeGraphAPI for NodeGraph {
         let read_node = node.read().ok()?;
         let slot = read_node.outputs().get(output_slot_index)?;
 
-        let cache = self.cache.lock().ok()?;
+        let cache = self.cache.read().ok()?;
         cache.outputs.get(&slot.id).map(|data| data.share())
     }
 

@@ -54,7 +54,7 @@ pub trait NodeCore: Debug {
 
         let expected_type = input_slot.data_type;
 
-        let cache = cache.lock()?;
+        let cache = cache.read()?;
         let mut result: Vec<Data> = Vec::new();
 
         for edge_id in cache.edges_for_input(&input_slot.id) {
