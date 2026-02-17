@@ -15,6 +15,43 @@ pub enum SlotId {
     Output(OutputSlotId),
 }
 
+/// A 3D vector value for passing spatial data through the graph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Vector3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Vector3 {
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    pub fn zero() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        }
+    }
+}
+
+/// An RGBA color value for passing color data through the graph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorValue {
+    pub r: f64,
+    pub g: f64,
+    pub b: f64,
+    pub a: f64,
+}
+
+impl ColorValue {
+    pub fn new(r: f64, g: f64, b: f64, a: f64) -> Self {
+        Self { r, g, b, a }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum DataType {
     #[default]
@@ -23,6 +60,10 @@ pub enum DataType {
     /// Mesh data type for geometry outputs.
     /// Stores arbitrary mesh data as `Arc<dyn Any>` via `Data::from_mesh()`.
     Mesh,
+    /// 3D vector (x, y, z).
+    Vector3,
+    /// RGBA color value.
+    Color,
 }
 
 impl DataType {
@@ -32,6 +73,8 @@ impl DataType {
             DataType::String => TypeId::of::<String>(),
             // Mesh holds arbitrary types; type_id is not used for Mesh (see Data::value())
             DataType::Mesh => TypeId::of::<()>(),
+            DataType::Vector3 => TypeId::of::<Vector3>(),
+            DataType::Color => TypeId::of::<ColorValue>(),
         }
     }
 
@@ -40,6 +83,8 @@ impl DataType {
             DataType::Number => type_name::<f64>(),
             DataType::String => type_name::<String>(),
             DataType::Mesh => "Mesh",
+            DataType::Vector3 => "Vector3",
+            DataType::Color => "Color",
         }
     }
 
@@ -53,6 +98,8 @@ impl DataType {
             DataType::String => value.downcast_ref::<String>().is_some(),
             // Mesh accepts any type
             DataType::Mesh => true,
+            DataType::Vector3 => value.downcast_ref::<Vector3>().is_some(),
+            DataType::Color => value.downcast_ref::<ColorValue>().is_some(),
         }
     }
 }
@@ -86,6 +133,12 @@ impl Serialize for Data {
             }
             DataType::Mesh => Err(serde::ser::Error::custom(
                 "Mesh data type is not serializable",
+            )),
+            DataType::Vector3 => Err(serde::ser::Error::custom(
+                "Vector3 data type is not serializable",
+            )),
+            DataType::Color => Err(serde::ser::Error::custom(
+                "Color data type is not serializable",
             )),
         }
     }
@@ -137,6 +190,8 @@ impl Data {
         let data_type = match type_id {
             t if t == TypeId::of::<f64>() => DataType::Number,
             t if t == TypeId::of::<String>() => DataType::String,
+            t if t == TypeId::of::<Vector3>() => DataType::Vector3,
+            t if t == TypeId::of::<ColorValue>() => DataType::Color,
             _ => return Err(format!("Invalid DataType: {}", type_name::<T>())),
         };
 
@@ -163,6 +218,8 @@ impl Data {
         let data_type = match type_id {
             t if t == TypeId::of::<f64>() => DataType::Number,
             t if t == TypeId::of::<String>() => DataType::String,
+            t if t == TypeId::of::<Vector3>() => DataType::Vector3,
+            t if t == TypeId::of::<ColorValue>() => DataType::Color,
             _ => return Err("Unsupported data type".to_string()),
         };
 
