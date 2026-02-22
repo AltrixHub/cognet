@@ -56,6 +56,8 @@ pub enum DefaultValue {
     Vector3 { x: f64, y: f64, z: f64 },
     /// An RGBA color default value.
     Color { r: f64, g: f64, b: f64, a: f64 },
+    /// A boolean default value.
+    Bool(bool),
 }
 
 impl DefaultValue {
@@ -67,6 +69,7 @@ impl DefaultValue {
             DefaultValue::String(s) => Data::new(s.to_string()).ok(),
             DefaultValue::Vector3 { x, y, z } => Data::new(Vector3::new(x, y, z)).ok(),
             DefaultValue::Color { r, g, b, a } => Data::new(ColorValue::new(r, g, b, a)).ok(),
+            DefaultValue::Bool(b) => Data::new(b).ok(),
         }
     }
 }

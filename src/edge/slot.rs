@@ -52,6 +52,19 @@ impl ColorValue {
     }
 }
 
+/// A collection of 3D vertices with an open/closed flag.
+#[derive(Debug, Clone)]
+pub struct Vertices {
+    pub points: Vec<Vector3>,
+    pub closed: bool,
+}
+
+impl Vertices {
+    pub fn new(points: Vec<Vector3>, closed: bool) -> Self {
+        Self { points, closed }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum DataType {
     #[default]
@@ -64,6 +77,10 @@ pub enum DataType {
     Vector3,
     /// RGBA color value.
     Color,
+    /// A collection of vertices with an open/closed flag.
+    Vertices,
+    /// A boolean value.
+    Bool,
 }
 
 impl DataType {
@@ -75,6 +92,8 @@ impl DataType {
             DataType::Mesh => TypeId::of::<()>(),
             DataType::Vector3 => TypeId::of::<Vector3>(),
             DataType::Color => TypeId::of::<ColorValue>(),
+            DataType::Vertices => TypeId::of::<Vertices>(),
+            DataType::Bool => TypeId::of::<bool>(),
         }
     }
 
@@ -85,6 +104,8 @@ impl DataType {
             DataType::Mesh => "Mesh",
             DataType::Vector3 => "Vector3",
             DataType::Color => "Color",
+            DataType::Vertices => "Vertices",
+            DataType::Bool => "Bool",
         }
     }
 
@@ -100,6 +121,8 @@ impl DataType {
             DataType::Mesh => true,
             DataType::Vector3 => value.downcast_ref::<Vector3>().is_some(),
             DataType::Color => value.downcast_ref::<ColorValue>().is_some(),
+            DataType::Vertices => value.downcast_ref::<Vertices>().is_some(),
+            DataType::Bool => value.downcast_ref::<bool>().is_some(),
         }
     }
 }
@@ -140,6 +163,16 @@ impl Serialize for Data {
             DataType::Color => Err(serde::ser::Error::custom(
                 "Color data type is not serializable",
             )),
+            DataType::Vertices => Err(serde::ser::Error::custom(
+                "Vertices data type is not serializable",
+            )),
+            DataType::Bool => {
+                let value = self
+                    .value
+                    .downcast_ref::<bool>()
+                    .ok_or_else(|| serde::ser::Error::custom("Failed to downcast value to bool"))?;
+                serializer.serialize_bool(*value)
+            }
         }
     }
 }
@@ -177,6 +210,16 @@ impl<'de> Deserialize<'de> for Data {
                     data_type: DataType::String,
                 })
             }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Data {
+                    value: Arc::new(value),
+                    data_type: DataType::Bool,
+                })
+            }
         }
 
         deserializer.deserialize_any(DataVisitor)
@@ -192,6 +235,8 @@ impl Data {
             t if t == TypeId::of::<String>() => DataType::String,
             t if t == TypeId::of::<Vector3>() => DataType::Vector3,
             t if t == TypeId::of::<ColorValue>() => DataType::Color,
+            t if t == TypeId::of::<Vertices>() => DataType::Vertices,
+            t if t == TypeId::of::<bool>() => DataType::Bool,
             _ => return Err(format!("Invalid DataType: {}", type_name::<T>())),
         };
 
@@ -220,6 +265,8 @@ impl Data {
             t if t == TypeId::of::<String>() => DataType::String,
             t if t == TypeId::of::<Vector3>() => DataType::Vector3,
             t if t == TypeId::of::<ColorValue>() => DataType::Color,
+            t if t == TypeId::of::<Vertices>() => DataType::Vertices,
+            t if t == TypeId::of::<bool>() => DataType::Bool,
             _ => return Err("Unsupported data type".to_string()),
         };
 
