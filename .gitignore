@@ -1,2 +1,5 @@
 target
 .DS_Store
+.ai/instructions.md
+.ai/outputs/git.md
+.ai/outputs/*
