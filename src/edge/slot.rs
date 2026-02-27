@@ -81,9 +81,45 @@ pub enum DataType {
     Vertices,
     /// A boolean value.
     Bool,
+    /// BRep solid geometry.
+    /// Stores arbitrary BRep data as `Arc<dyn Any>` via `Data::from_brep()`.
+    BRep,
+    /// Application-defined domain type.
+    /// Connection validation uses name equality — only ports with the same
+    /// domain name can be connected.
+    Domain(&'static str),
 }
 
 impl DataType {
+    /// Human-readable label for this data type.
+    pub fn label(&self) -> &str {
+        match self {
+            DataType::Number => "Number",
+            DataType::String => "String",
+            DataType::Mesh => "Mesh",
+            DataType::Vector3 => "Vector3",
+            DataType::Color => "Color",
+            DataType::Vertices => "Vertices",
+            DataType::Bool => "Bool",
+            DataType::BRep => "BRep",
+            DataType::Domain(name) => name,
+        }
+    }
+
+    /// All standard (non-Domain) data types for UI dropdowns.
+    pub fn standard_types() -> &'static [DataType] {
+        &[
+            DataType::Number,
+            DataType::String,
+            DataType::Bool,
+            DataType::Vector3,
+            DataType::Color,
+            DataType::Mesh,
+            DataType::Vertices,
+            DataType::BRep,
+        ]
+    }
+
     fn type_id(&self) -> TypeId {
         match self {
             DataType::Number => TypeId::of::<f64>(),
@@ -94,6 +130,8 @@ impl DataType {
             DataType::Color => TypeId::of::<ColorValue>(),
             DataType::Vertices => TypeId::of::<Vertices>(),
             DataType::Bool => TypeId::of::<bool>(),
+            DataType::BRep => TypeId::of::<()>(),
+            DataType::Domain(_) => TypeId::of::<()>(),
         }
     }
 
@@ -106,6 +144,8 @@ impl DataType {
             DataType::Color => "Color",
             DataType::Vertices => "Vertices",
             DataType::Bool => "Bool",
+            DataType::BRep => "BRep",
+            DataType::Domain(name) => name,
         }
     }
 
@@ -117,8 +157,8 @@ impl DataType {
         match self {
             DataType::Number => value.downcast_ref::<f64>().is_some(),
             DataType::String => value.downcast_ref::<String>().is_some(),
-            // Mesh accepts any type
-            DataType::Mesh => true,
+            // Mesh, BRep, Domain accept any type (dynamic downcast)
+            DataType::Mesh | DataType::BRep | DataType::Domain(_) => true,
             DataType::Vector3 => value.downcast_ref::<Vector3>().is_some(),
             DataType::Color => value.downcast_ref::<ColorValue>().is_some(),
             DataType::Vertices => value.downcast_ref::<Vertices>().is_some(),
@@ -173,6 +213,13 @@ impl Serialize for Data {
                     .ok_or_else(|| serde::ser::Error::custom("Failed to downcast value to bool"))?;
                 serializer.serialize_bool(*value)
             }
+            DataType::BRep => Err(serde::ser::Error::custom(
+                "BRep data type is not serializable",
+            )),
+            DataType::Domain(name) => Err(serde::ser::Error::custom(format!(
+                "Domain type '{}' is not serializable",
+                name
+            ))),
         }
     }
 }
@@ -258,6 +305,27 @@ impl Data {
         }
     }
 
+    /// Create a BRep data value from any type.
+    ///
+    /// BRep data holds arbitrary BRep geometry types as `Arc<dyn Any>`.
+    pub fn from_brep<T: Any + Send + Sync + 'static>(value: T) -> Self {
+        Data {
+            value: Arc::new(value),
+            data_type: DataType::BRep,
+        }
+    }
+
+    /// Create a domain-typed data value.
+    ///
+    /// Domain types carry an application-defined name for type-safe connections.
+    /// Only ports with the same domain name can be connected.
+    pub fn from_domain<T: Any + Send + Sync + 'static>(value: T, name: &'static str) -> Self {
+        Data {
+            value: Arc::new(value),
+            data_type: DataType::Domain(name),
+        }
+    }
+
     pub fn from_any(value: Arc<dyn Any + Send + Sync>) -> Result<Self, String> {
         let type_id = (*value).type_id();
         let data_type = match type_id {
@@ -284,28 +352,31 @@ impl Data {
     }
 
     pub fn value<T: 'static>(&self) -> Result<&T, String> {
-        if self.data_type == DataType::Mesh {
-            // Mesh holds arbitrary types; bypass TypeId check and downcast directly
-            self.value.downcast_ref::<T>().ok_or_else(|| {
-                format!(
-                    "Mesh data downcast failed: requested {}",
-                    type_name::<T>()
-                )
-            })
-        } else if TypeId::of::<T>() == self.data_type.type_id() {
-            self.value.downcast_ref::<T>().ok_or_else(|| {
-                format!(
-                    "Data type mismatch: Expected {}, but got {}",
-                    self.data_type.type_name(),
-                    type_name::<T>()
-                )
-            })
-        } else {
-            Err(format!(
+        match self.data_type {
+            // Mesh, BRep, Domain hold arbitrary types; bypass TypeId check and downcast directly
+            DataType::Mesh | DataType::BRep | DataType::Domain(_) => {
+                self.value.downcast_ref::<T>().ok_or_else(|| {
+                    format!(
+                        "{} data downcast failed: requested {}",
+                        self.data_type.type_name(),
+                        type_name::<T>()
+                    )
+                })
+            }
+            _ if TypeId::of::<T>() == self.data_type.type_id() => {
+                self.value.downcast_ref::<T>().ok_or_else(|| {
+                    format!(
+                        "Data type mismatch: Expected {}, but got {}",
+                        self.data_type.type_name(),
+                        type_name::<T>()
+                    )
+                })
+            }
+            _ => Err(format!(
                 "Data type mismatch: Expected {}, but got {}",
                 self.data_type.type_name(),
                 type_name::<T>()
-            ))
+            )),
         }
     }
 

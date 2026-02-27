@@ -3,11 +3,13 @@ pub mod node_graph_api;
 pub mod node_graph_system;
 pub mod node_manager;
 pub mod node_state;
+pub mod subgraph_ops;
 
 pub use execution_cache::*;
 pub use node_graph_api::*;
 pub use node_manager::*;
 pub use node_state::*;
+pub use subgraph_ops::*;
 
 use crate::{ErrorTarget, GraphError, NodeId, NodeStatesAccess};
 use std::collections::{HashMap, HashSet};
@@ -88,6 +90,15 @@ impl NodeGraph {
     /// Clear all execution errors (before running execute()).
     pub fn clear_execution_errors(&mut self) {
         self.errors.retain(|_, e| !e.is_execution_error());
+    }
+
+    /// Mark all nodes in the graph as dirty, forcing re-execution.
+    ///
+    /// Used by SubGraphNode to ensure all internal nodes execute
+    /// after external inputs are injected into the input proxy.
+    pub fn mark_all_nodes_dirty(&mut self) {
+        let all_ids: Vec<NodeId> = self.node_manager.all_node_ids();
+        self.dirty_nodes.extend(all_ids);
     }
 }
 

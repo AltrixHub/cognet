@@ -10,7 +10,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, GraphError, InternalStateAccess,
-    NodeEntity, NodeGraph, NodeId, NodeImpl, NodeManager, NodeMeta,
+    NodeEntity, NodeGraph, NodeId, NodeImpl, NodeManager, NodeMeta, SubGraphNode,
 };
 
 /// Execution event for progress tracking during graph execution.
@@ -178,17 +178,30 @@ impl NodeGraphAPI for NodeGraph {
                                     Err(_) => return (node_id, Err("Lock poisoned".to_string())),
                                 };
                                 if let Some(node) = nodes_guard.get(&node_id) {
-                                    let node_read = match node.read() {
-                                        Ok(r) => r,
-                                        Err(_) => {
-                                            return (node_id, Err("Node lock poisoned".to_string()))
-                                        }
-                                    };
-                                    // Drop the locks before async execution
                                     let node_clone = Arc::clone(node);
-                                    drop(node_read);
                                     drop(nodes_guard);
-                                    // Re-acquire for execution
+                                    // Try SubGraphNode with write lock (needs &mut for internal graph execution)
+                                    {
+                                        let mut node_write = match node_clone.write() {
+                                            Ok(w) => w,
+                                            Err(_) => {
+                                                return (
+                                                    node_id,
+                                                    Err("Node lock poisoned".to_string()),
+                                                )
+                                            }
+                                        };
+                                        if let Some(sg) = node_write
+                                            .as_any_mut()
+                                            .downcast_mut::<SubGraphNode>()
+                                        {
+                                            return (
+                                                node_id,
+                                                sg.execute_internal(shared_cache.share()).await,
+                                            );
+                                        }
+                                    }
+                                    // Regular node with read lock
                                     let node_read = match node_clone.read() {
                                         Ok(r) => r,
                                         Err(_) => {
@@ -244,16 +257,60 @@ impl NodeGraphAPI for NodeGraph {
                                     };
                                     if let Some(node) = nodes_guard.get(&node_id) {
                                         let node_clone = Arc::clone(node);
+                                        let cache_clone = shared_cache.share();
+                                        let rt_clone = Arc::clone(&rt_handle);
                                         drop(nodes_guard);
-                                        rt_handle.block_on(async {
-                                            let node_read = match node_clone.read() {
-                                                Ok(r) => r,
-                                                Err(_) => {
-                                                    return Err("Node lock poisoned".to_string())
-                                                }
-                                            };
-                                            node_read.execute(shared_cache.share()).await
-                                        })
+                                        // Catch panics so a single node failure
+                                        // doesn't abort the entire execution level.
+                                        match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| {
+                                                rt_clone.block_on(async {
+                                                    // Try SubGraphNode with write lock
+                                                    // (needs &mut for internal graph execution)
+                                                    {
+                                                        let mut node_write =
+                                                            match node_clone.write() {
+                                                                Ok(w) => w,
+                                                                Err(poisoned) => {
+                                                                    poisoned.into_inner()
+                                                                }
+                                                            };
+                                                        if let Some(sg) = node_write
+                                                            .as_any_mut()
+                                                            .downcast_mut::<SubGraphNode>()
+                                                        {
+                                                            return sg
+                                                                .execute_internal(cache_clone)
+                                                                .await;
+                                                        }
+                                                    }
+                                                    // Regular node with read lock.
+                                                    // Recover from poisoned locks (caused by
+                                                    // a previous panic in this node).
+                                                    let node_read = match node_clone.read() {
+                                                        Ok(r) => r,
+                                                        Err(poisoned) => poisoned.into_inner(),
+                                                    };
+                                                    node_read.execute(cache_clone).await
+                                                })
+                                            }),
+                                        ) {
+                                            Ok(result) => result,
+                                            Err(panic_payload) => {
+                                                let msg = if let Some(s) =
+                                                    panic_payload.downcast_ref::<&str>()
+                                                {
+                                                    format!("Node panicked: {}", s)
+                                                } else if let Some(s) =
+                                                    panic_payload.downcast_ref::<String>()
+                                                {
+                                                    format!("Node panicked: {}", s)
+                                                } else {
+                                                    "Node panicked".to_string()
+                                                };
+                                                Err(msg)
+                                            }
+                                        }
                                     } else {
                                         Ok(())
                                     }

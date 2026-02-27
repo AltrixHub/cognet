@@ -1,11 +1,13 @@
 pub mod operators;
 pub mod outputs;
 pub mod primitives;
+pub mod subgraph;
 pub mod type_info;
 
 pub use operators::*;
 pub use outputs::*;
 pub use primitives::*;
+pub use subgraph::*;
 pub use type_info::*;
 
 use crate::{impl_entity_id, AsAny, Data, InputSlot, NodeManager, OutputSlot, SharedExecutionCache};

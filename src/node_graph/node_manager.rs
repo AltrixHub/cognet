@@ -34,9 +34,12 @@ impl SharedNodes {
     }
 
     /// Lock the nodes map for access.
-    /// Returns an error if the lock is poisoned.
+    /// Recovers from poisoned locks (caused by panics caught via catch_unwind).
     pub fn lock(&self) -> Result<MutexGuard<'_, HashMap<NodeId, NodeEntity>>, String> {
-        self.inner.lock().map_err(|e| e.to_string())
+        match self.inner.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => Ok(poisoned.into_inner()),
+        }
     }
 
     pub fn share(&self) -> Self {
@@ -74,6 +77,14 @@ impl NodeManager {
 
     pub fn nodes(&self) -> SharedNodes {
         self.nodes.share()
+    }
+
+    pub fn all_node_ids(&self) -> Vec<NodeId> {
+        self.nodes
+            .lock()
+            .ok()
+            .map(|nodes| nodes.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     pub fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
