@@ -3,16 +3,15 @@ use crate::{
     NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
 };
 
-/// Adds two numbers (A + B)
 #[derive(Debug)]
-pub struct AddNode {
+pub struct MultiplyNode {
     pub node_data: Option<Data>,
     pub inputs: Vec<InputSlot>,
     pub outputs: Vec<OutputSlot>,
 }
 
-impl NodeMeta for AddNode {
-    const NAME: &'static str = "Add";
+impl NodeMeta for MultiplyNode {
+    const NAME: &'static str = "Multiply";
     const CATEGORY: NodeCategory = NodeCategory::Math;
     const INPUTS: &'static [SlotDef] = &[
         SlotDef {
@@ -27,14 +26,14 @@ impl NodeMeta for AddNode {
         },
     ];
     const OUTPUTS: &'static [SlotDef] = &[SlotDef {
-        label: "Sum",
+        label: "Product",
         data_type: DataType::Number,
         max_connections: None,
     }];
 }
 
 #[async_trait::async_trait]
-impl NodeImpl for AddNode {
+impl NodeImpl for MultiplyNode {
     async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
         let a_values = self.input_value(cache.share(), 0)?;
         let b_values = self.input_value(cache.share(), 1)?;
@@ -42,18 +41,18 @@ impl NodeImpl for AddNode {
         let mut a: f64 = 0.0;
         for data in a_values {
             a = *data.value()?;
-            break;
+            break; // Take first value only
         }
 
         let mut b: f64 = 0.0;
         for data in b_values {
             b = *data.value()?;
-            break;
+            break; // Take first value only
         }
 
-        self.set_output_data(cache, 0, Data::new(a + b)?)?;
+        self.set_output_data(cache, 0, Data::new(a * b)?)?;
         Ok(())
     }
 }
 
-register_nodes!(AddNode);
+register_nodes!(MultiplyNode);

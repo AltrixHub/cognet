@@ -9,9 +9,55 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, NodeEntity, NodeGraph, NodeId,
-    NodeImpl, NodeManager,
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, GraphError, InternalStateAccess,
+    NodeEntity, NodeGraph, NodeId, NodeImpl, NodeManager, NodeMeta, SubGraphNode,
 };
+
+/// Execution event for progress tracking during graph execution.
+#[derive(Debug, Clone)]
+pub enum ExecutionEvent {
+    /// Node execution started.
+    Started(NodeId),
+    /// Node execution completed successfully.
+    Completed(NodeId),
+    /// Node execution failed with an error.
+    Failed(NodeId, String),
+}
+
+/// Output from a single node execution.
+#[derive(Debug, Clone)]
+pub struct NodeOutput {
+    /// The node that produced this output.
+    pub node_id: NodeId,
+    /// Output slot index.
+    pub slot_index: usize,
+    /// The output data (Arc-shared with ExecutionCache for zero-copy).
+    pub data: Data,
+}
+
+/// Changes produced by a graph execution.
+///
+/// Contains all outputs from nodes that were (re)computed, plus any nodes
+/// that were removed since the last execution.
+#[derive(Debug, Clone, Default)]
+pub struct GraphChanges {
+    /// Outputs from nodes computed in this execution (new + updated).
+    pub outputs: Vec<NodeOutput>,
+    /// Nodes removed since the last execute() call.
+    pub removed_nodes: Vec<NodeId>,
+}
+
+impl GraphChanges {
+    /// Create empty changes.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Check if there are no changes.
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty() && self.removed_nodes.is_empty()
+    }
+}
 
 #[async_trait]
 pub trait NodeGraphAPI {
@@ -19,41 +65,47 @@ pub trait NodeGraphAPI {
     where
         Self: Sized;
 
-    async fn execute(&mut self) -> Result<(), String>;
+    /// Execute the graph asynchronously.
+    ///
+    /// Returns `GraphChanges` containing outputs from computed nodes
+    /// and IDs of nodes removed since the last execution.
+    async fn execute(&mut self) -> Result<GraphChanges, String>;
 
-    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String>;
+    /// Execute the graph with progress callback.
+    ///
+    /// The callback is called for each node as it starts executing,
+    /// completes, or fails. This enables real-time UI updates.
+    ///
+    /// Returns `GraphChanges` containing outputs from computed nodes
+    /// and IDs of nodes removed since the last execution.
+    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<GraphChanges, String>
+    where
+        F: Fn(ExecutionEvent) + Send + Sync + 'static;
 
-    async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
-
-    async fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String>;
-
-    async fn update_input_slot_default_data(
+    // Sync methods for graph structure operations
+    fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String>;
+    fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String>;
+    fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
+    fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String>;
+    fn update_input_slot_default_data(
         &mut self,
         node_id: &NodeId,
         slot_index: usize,
         data: Data,
     ) -> Result<(), String>;
-
-    async fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
-
-    async fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId>;
-
-    async fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)>;
-
-    async fn connect_nodes(
+    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
+    fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId>;
+    fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)>;
+    fn connect_nodes(
         &mut self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
         to_node_id: &NodeId,
         to_input_slot_index: usize,
     ) -> Result<EdgeId, String>;
-
-    async fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String>;
-
+    fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String>;
     fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
-
-    async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
-
+    fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
     fn node_variants(&self) -> &HashSet<String>;
 }
 
@@ -62,44 +114,123 @@ impl NodeGraphAPI for NodeGraph {
     fn new() -> Result<Self, String> {
         Ok(Self {
             node_manager: NodeManager::new()?,
+            state_access: Arc::new(InternalStateAccess::new()),
             cache: Default::default(),
             dirty_nodes: Default::default(),
+            errors: Default::default(),
+            removed_since_last_execute: Vec::new(),
         })
     }
 
-    async fn execute(&mut self) -> Result<(), String> {
-        if self.dirty_nodes.is_empty() {
-            return Ok(());
+    async fn execute(&mut self) -> Result<GraphChanges, String> {
+        self.execute_with_progress(|_| {}).await
+    }
+
+    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<GraphChanges, String>
+    where
+        F: Fn(ExecutionEvent) + Send + Sync + 'static,
+    {
+        // Drain removed nodes accumulated since last execute
+        let removed = std::mem::take(&mut self.removed_since_last_execute);
+
+        if self.dirty_nodes.is_empty() && removed.is_empty() {
+            return Ok(GraphChanges::empty());
         }
+
+        // If only removals (no dirty nodes), return just the removed list
+        if self.dirty_nodes.is_empty() {
+            return Ok(GraphChanges {
+                outputs: Vec::new(),
+                removed_nodes: removed,
+            });
+        }
+
+        // Clear previous execution errors before running
+        self.clear_execution_errors();
 
         let sorted_node_levels = self.topological_sort(&self.dirty_nodes)?;
 
+        // Collect all node IDs that will be executed (for output collection)
+        let executed_node_ids: Vec<NodeId> = sorted_node_levels
+            .iter()
+            .flat_map(|level| level.iter().copied())
+            .collect();
+
         let shared_nodes = self.node_manager.nodes();
         let shared_cache = self.cache.share();
+        let on_progress = Arc::new(on_progress);
 
         #[cfg(target_arch = "wasm32")]
         {
             for level_nodes in sorted_node_levels {
                 let futures: Vec<_> = level_nodes
-                    .into_par_iter()
+                    .into_iter()
                     .map(|node_id| {
                         let shared_nodes = shared_nodes.share();
                         let shared_cache = shared_cache.share();
+                        let on_progress = Arc::clone(&on_progress);
                         async move {
-                            let nodes = shared_nodes.lock().await;
-                            if let Some(node) = nodes.get(&node_id) {
-                                let node_read = node.read().await;
-                                node_read.execute(shared_cache.share()).await
-                            } else {
-                                Ok(())
+                            on_progress(ExecutionEvent::Started(node_id));
+
+                            let result = {
+                                let nodes_guard = match shared_nodes.lock() {
+                                    Ok(g) => g,
+                                    Err(_) => return (node_id, Err("Lock poisoned".to_string())),
+                                };
+                                if let Some(node) = nodes_guard.get(&node_id) {
+                                    let node_clone = Arc::clone(node);
+                                    drop(nodes_guard);
+                                    // Try SubGraphNode with write lock (needs &mut for internal graph execution)
+                                    {
+                                        let mut node_write = match node_clone.write() {
+                                            Ok(w) => w,
+                                            Err(_) => {
+                                                return (
+                                                    node_id,
+                                                    Err("Node lock poisoned".to_string()),
+                                                )
+                                            }
+                                        };
+                                        if let Some(sg) = node_write
+                                            .as_any_mut()
+                                            .downcast_mut::<SubGraphNode>()
+                                        {
+                                            return (
+                                                node_id,
+                                                sg.execute_internal(shared_cache.share()).await,
+                                            );
+                                        }
+                                    }
+                                    // Regular node with read lock
+                                    let node_read = match node_clone.read() {
+                                        Ok(r) => r,
+                                        Err(_) => {
+                                            return (node_id, Err("Node lock poisoned".to_string()))
+                                        }
+                                    };
+                                    node_read.execute(shared_cache.share()).await
+                                } else {
+                                    Ok(())
+                                }
+                            };
+
+                            match &result {
+                                Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
+                                Err(msg) => {
+                                    on_progress(ExecutionEvent::Failed(node_id, msg.clone()))
+                                }
                             }
+
+                            (node_id, result)
                         }
                     })
                     .collect();
 
                 let results = join_all(futures).await;
-                for res in results {
-                    res?;
+                for (node_id, res) in results {
+                    if let Err(msg) = res {
+                        self.add_error(GraphError::execution(node_id, msg));
+                    }
                 }
             }
         }
@@ -108,23 +239,91 @@ impl NodeGraphAPI for NodeGraph {
         {
             let rt_handle = Arc::new(Handle::current());
             for level_nodes in sorted_node_levels {
-                let results: Vec<Result<(), String>> = task::spawn_blocking({
+                let results: Vec<(NodeId, Result<(), String>)> = task::spawn_blocking({
                     let shared_nodes = shared_nodes.share();
                     let shared_cache = shared_cache.share();
                     let rt_handle = Arc::clone(&rt_handle);
+                    let on_progress = Arc::clone(&on_progress);
                     move || {
                         level_nodes
                             .into_par_iter()
                             .map(|node_id| {
-                                rt_handle.block_on(async {
-                                    let nodes = shared_nodes.lock().await;
-                                    if let Some(node) = nodes.get(&node_id) {
-                                        let node_read = node.read().await;
-                                        node_read.execute(shared_cache.share()).await
+                                on_progress(ExecutionEvent::Started(node_id));
+
+                                let result = {
+                                    let nodes_guard = match shared_nodes.lock() {
+                                        Ok(g) => g,
+                                        Err(_) => return (node_id, Err("Lock poisoned".to_string())),
+                                    };
+                                    if let Some(node) = nodes_guard.get(&node_id) {
+                                        let node_clone = Arc::clone(node);
+                                        let cache_clone = shared_cache.share();
+                                        let rt_clone = Arc::clone(&rt_handle);
+                                        drop(nodes_guard);
+                                        // Catch panics so a single node failure
+                                        // doesn't abort the entire execution level.
+                                        match std::panic::catch_unwind(
+                                            std::panic::AssertUnwindSafe(|| {
+                                                rt_clone.block_on(async {
+                                                    // Try SubGraphNode with write lock
+                                                    // (needs &mut for internal graph execution)
+                                                    {
+                                                        let mut node_write =
+                                                            match node_clone.write() {
+                                                                Ok(w) => w,
+                                                                Err(poisoned) => {
+                                                                    poisoned.into_inner()
+                                                                }
+                                                            };
+                                                        if let Some(sg) = node_write
+                                                            .as_any_mut()
+                                                            .downcast_mut::<SubGraphNode>()
+                                                        {
+                                                            return sg
+                                                                .execute_internal(cache_clone)
+                                                                .await;
+                                                        }
+                                                    }
+                                                    // Regular node with read lock.
+                                                    // Recover from poisoned locks (caused by
+                                                    // a previous panic in this node).
+                                                    let node_read = match node_clone.read() {
+                                                        Ok(r) => r,
+                                                        Err(poisoned) => poisoned.into_inner(),
+                                                    };
+                                                    node_read.execute(cache_clone).await
+                                                })
+                                            }),
+                                        ) {
+                                            Ok(result) => result,
+                                            Err(panic_payload) => {
+                                                let msg = if let Some(s) =
+                                                    panic_payload.downcast_ref::<&str>()
+                                                {
+                                                    format!("Node panicked: {}", s)
+                                                } else if let Some(s) =
+                                                    panic_payload.downcast_ref::<String>()
+                                                {
+                                                    format!("Node panicked: {}", s)
+                                                } else {
+                                                    "Node panicked".to_string()
+                                                };
+                                                Err(msg)
+                                            }
+                                        }
                                     } else {
                                         Ok(())
                                     }
-                                })
+                                };
+
+                                match &result {
+                                    Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
+                                    Err(msg) => {
+                                        on_progress(ExecutionEvent::Failed(node_id, msg.clone()))
+                                    }
+                                }
+
+                                (node_id, result)
                             })
                             .collect()
                     }
@@ -132,45 +331,111 @@ impl NodeGraphAPI for NodeGraph {
                 .await
                 .map_err(|e| e.to_string())?;
 
-                for res in results {
-                    res?;
+                for (node_id, res) in results {
+                    if let Err(msg) = res {
+                        self.add_error(GraphError::execution(node_id, msg));
+                    }
+                }
+            }
+        }
+
+        // Collect outputs from executed nodes (Arc-shared for zero-copy)
+        let mut outputs = Vec::new();
+        for node_id in &executed_node_ids {
+            if let Some(node) = self.node_manager.get_node_by_id(node_id) {
+                if let Ok(read_node) = node.read() {
+                    for (idx, slot) in read_node.outputs().iter().enumerate() {
+                        if let Ok(cache) = shared_cache.read() {
+                            if let Some(data) = cache.outputs.get(&slot.id) {
+                                outputs.push(NodeOutput {
+                                    node_id: *node_id,
+                                    slot_index: idx,
+                                    data: data.share(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
 
         self.dirty_nodes.clear();
-        Ok(())
+        Ok(GraphChanges {
+            outputs,
+            removed_nodes: removed,
+        })
     }
 
-    async fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
-        self.node_manager.create_node::<T>().await
+    fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
+        let node_id = self.node_manager.create_node::<T>()?;
+
+        // Register in NodeStates via state access
+        self.state_access.add_node(
+            node_id,
+            T::NAME,
+            T::DEFAULT_VALUE.to_data(),
+            T::INPUTS.len(),
+            T::OUTPUTS.len(),
+        );
+
+        Ok(node_id)
     }
 
-    async fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
-        if self.node_manager.node_remove(&node_id).await.is_some() {
+    fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String> {
+        // Create node and get default data from factory
+        let (node_id, default_data) = self.node_manager.create_node_by_name(name)?;
+
+        // Get type info for slot counts
+        let type_info = crate::get_node_type_info(name)
+            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
+
+        // Register in NodeStates via state access
+        self.state_access.add_node(
+            node_id,
+            type_info.name,
+            default_data,
+            type_info.inputs.len(),
+            type_info.outputs.len(),
+        );
+
+        Ok(node_id)
+    }
+
+    fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
+        if self.node_manager.node_remove(&node_id).is_some() {
             let dirty_nodes = self.collect_dirty_nodes(vec![node_id])?;
             self.remove_edges_from_cache(&node_id)?;
             self.mark_dirty_nodes(dirty_nodes);
+
+            // Clean up NodeStates via state access
+            self.state_access.remove_node(node_id);
+
+            // Track removal for GraphChanges in next execute()
+            self.removed_since_last_execute.push(node_id);
+
             Ok(())
         } else {
             Err("Node not found.".to_string())
         }
     }
 
-    async fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
+    fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
         let node = self
             .node_manager
             .get_node_by_id(node_id)
-            .await
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-        let mut write_node = node.write().await;
-        write_node.set_node_data(data)?;
+        let mut write_node = node.write().map_err(|e| e.to_string())?;
+        write_node.set_node_data(data.share())?;
+
+        // Update NodeStates via state access
+        self.state_access.update_node_data(*node_id, Some(data));
+
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
         Ok(())
     }
 
-    async fn update_input_slot_default_data(
+    fn update_input_slot_default_data(
         &mut self,
         node_id: &NodeId,
         slot_index: usize,
@@ -179,16 +444,15 @@ impl NodeGraphAPI for NodeGraph {
         let node = self
             .node_manager
             .get_node_by_id(node_id)
-            .await
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-        let mut write_node = node.write().await;
+        let mut write_node = node.write().map_err(|e| e.to_string())?;
         write_node.set_input_slot_default_data(slot_index, data)?;
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
         Ok(())
     }
 
-    async fn connect_nodes(
+    fn connect_nodes(
         &mut self,
         from_node_id: &NodeId,
         from_output_slot_index: usize,
@@ -202,30 +466,35 @@ impl NodeGraphAPI for NodeGraph {
                 to_node_id,
                 to_input_slot_index,
             )
-            .await?;
+            .map_err(|e| e.to_string())?;
 
-        self.add_edge(edge).await
+        self.add_edge(edge)
     }
 
-    async fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
+    fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
         let edge = self.remove_edge_from_cache(&edge_id)?;
 
         let from_node_id = edge.from_node_id;
         let to_node_id = edge.to_node_id;
 
-        if let Some(node) = self.node_manager.get_node_by_id(&from_node_id).await {
-            let mut node_write = node.write().await;
-            if let Some(slot) = node_write.get_output_slot_by_index_mut(edge.from_output_slot_index)
+        // Update NodeStates slot connections and remove edge via state access
+        {
+            let mut guard = self
+                .state_access
+                .storage()
+                .write()
+                .map_err(|e| e.to_string())?;
+            if let Some(slot_state) =
+                guard.output_slot_mut(&from_node_id, edge.from_output_slot_index)
             {
-                slot.connected_edges.retain(|id| *id != edge_id);
+                slot_state.connected_edges.retain(|id| *id != edge_id);
             }
-        }
-
-        if let Some(node) = self.node_manager.get_node_by_id(&to_node_id).await {
-            let mut node_write = node.write().await;
-            if let Some(slot) = node_write.get_input_slot_by_index_mut(edge.to_input_slot_index) {
-                slot.connected_edges.retain(|id| *id != edge_id);
+            if let Some(slot_state) =
+                guard.input_slot_mut(&to_node_id, edge.to_input_slot_index)
+            {
+                slot_state.connected_edges.retain(|id| *id != edge_id);
             }
+            guard.remove_edge(&edge_id);
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
@@ -243,27 +512,24 @@ impl NodeGraphAPI for NodeGraph {
             .ok_or(format!("Edge not found: id {:?}", edge_id))
     }
 
-    async fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity> {
-        self.node_manager
-            .get_node_by_id(node_id)
-            .await
-            .map(|node| Arc::clone(&node))
+    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity> {
+        self.node_manager.get_node_by_id(node_id)
     }
 
-    async fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
-        self.node_manager.get_node_ids_by_type::<T>().await
+    fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
+        self.node_manager.get_node_ids_by_type::<T>()
     }
 
-    async fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
-        self.node_manager.get_nodes_by_ids(ids).await
+    fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
+        self.node_manager.get_nodes_by_ids(ids)
     }
 
-    async fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
-        let node = self.get_node_by_id(node_id).await?;
-        let read_node = node.read().await;
+    fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
+        let node = self.get_node_by_id(node_id)?;
+        let read_node = node.read().ok()?;
         let slot = read_node.outputs().get(output_slot_index)?;
 
-        let cache = self.cache.lock().ok()?;
+        let cache = self.cache.read().ok()?;
         cache.outputs.get(&slot.id).map(|data| data.share())
     }
 

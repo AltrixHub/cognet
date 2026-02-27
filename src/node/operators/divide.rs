@@ -1,18 +1,22 @@
+//! Divide operator node.
+//!
+//! Divides A by B. Returns 0.0 when B is zero.
+
 use crate::{
     register_nodes, Data, DataType, InputSlot, NodeCategory, NodeCore, NodeImpl, NodeMeta,
     NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
 };
 
-/// Adds two numbers (A + B)
+/// Divides A by B (A / B)
 #[derive(Debug)]
-pub struct AddNode {
+pub struct DivideNode {
     pub node_data: Option<Data>,
     pub inputs: Vec<InputSlot>,
     pub outputs: Vec<OutputSlot>,
 }
 
-impl NodeMeta for AddNode {
-    const NAME: &'static str = "Add";
+impl NodeMeta for DivideNode {
+    const NAME: &'static str = "Divide";
     const CATEGORY: NodeCategory = NodeCategory::Math;
     const INPUTS: &'static [SlotDef] = &[
         SlotDef {
@@ -27,14 +31,14 @@ impl NodeMeta for AddNode {
         },
     ];
     const OUTPUTS: &'static [SlotDef] = &[SlotDef {
-        label: "Sum",
+        label: "Quotient",
         data_type: DataType::Number,
         max_connections: None,
     }];
 }
 
 #[async_trait::async_trait]
-impl NodeImpl for AddNode {
+impl NodeImpl for DivideNode {
     async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
         let a_values = self.input_value(cache.share(), 0)?;
         let b_values = self.input_value(cache.share(), 1)?;
@@ -51,9 +55,10 @@ impl NodeImpl for AddNode {
             break;
         }
 
-        self.set_output_data(cache, 0, Data::new(a + b)?)?;
+        let result = if b == 0.0 { 0.0 } else { a / b };
+        self.set_output_data(cache, 0, Data::new(result)?)?;
         Ok(())
     }
 }
 
-register_nodes!(AddNode);
+register_nodes!(DivideNode);

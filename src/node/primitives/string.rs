@@ -4,26 +4,26 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct NumberNode {
+pub struct StringNode {
     pub node_data: Option<Data>,
     pub inputs: Vec<InputSlot>,
     pub outputs: Vec<OutputSlot>,
 }
 
-impl NodeMeta for NumberNode {
-    const NAME: &'static str = "Number";
+impl NodeMeta for StringNode {
+    const NAME: &'static str = "String";
     const CATEGORY: NodeCategory = NodeCategory::Primitive;
     const INPUTS: &'static [SlotDef] = &[];
     const OUTPUTS: &'static [SlotDef] = &[SlotDef {
         label: "Value",
-        data_type: DataType::Number,
+        data_type: DataType::String,
         max_connections: None,
     }];
-    const DEFAULT_VALUE: DefaultValue = DefaultValue::Number(10.0);
+    const DEFAULT_VALUE: DefaultValue = DefaultValue::String("Hello");
 }
 
 #[async_trait::async_trait]
-impl NodeImpl for NumberNode {
+impl NodeImpl for StringNode {
     async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
         let node_data = self.node_data().ok_or("Failed to get node data")?;
         self.set_output_data(cache, 0, node_data)?;
@@ -31,4 +31,4 @@ impl NodeImpl for NumberNode {
     }
 }
 
-register_nodes!(NumberNode);
+register_nodes!(StringNode);
