@@ -1,23 +1,26 @@
 # Git PR Description
 
-Generate a PR description based on the current branch's linked issue and commits.
+Generate a PR description based on commits (and optionally a linked issue).
+
+## Usage
+
+- `/git-pr` — Generate from commits only (default, no issue lookup)
+- `/git-pr 61` — Generate from commits + issue #61
 
 ## Instructions
 
-### 1. Get Current Branch and Issue
-
-Extract the issue number from the current branch name.
+### 1. Get Current Branch
 
 ```bash
-# Get current branch name
 git branch --show-current
 ```
 
-Branch naming pattern: `{issue-number}-{description}` (e.g., `12-feat-geometry-nurbs-curve`)
+### 2. Determine Issue Number (Optional)
 
-### 2. Fetch Issue Details
+- If an issue number was passed as `$ARGUMENTS`, use it.
+- Otherwise, skip issue lookup entirely. Do NOT extract or guess an issue number from the branch name.
 
-Use `gh issue view` to get the issue content:
+If an issue number is available, fetch details:
 
 ```bash
 gh issue view {issue-number} --json title,body,labels
@@ -25,21 +28,21 @@ gh issue view {issue-number} --json title,body,labels
 
 ### 3. Get Commit History
 
-Get all commits on this branch that are not in the base branch (main):
+Get all commits on this branch that are not in the base branch (develop):
 
 ```bash
-git log main..HEAD --oneline
-git log main..HEAD --pretty=format:"%s%n%b"
+git log develop..HEAD --oneline
+git log develop..HEAD --pretty=format:"%s%n%b"
 ```
 
 ### 4. Analyze and Generate PR Description
 
-Based on the issue and commits, generate a PR description following this template:
+Based on commits (and issue if provided), generate a PR description following this template:
 
 ```markdown
 # Description
 
-Closes #{issue-number}
+{If issue number is available: "Closes #{issue-number}", otherwise omit this line}
 
 ## PR Type
 
@@ -93,11 +96,11 @@ Format:
 # PR Output
 
 **Generated:** {timestamp}
-**Issue:** #{issue-number}
+{If issue number is available: "**Issue:** #{issue-number}", otherwise omit}
 
 ## Title
 
-{issue title - typically in format "type(scope): description"}
+{Derive title from commit messages; if issue is available, use issue title}
 
 ## Description
 
@@ -109,18 +112,18 @@ After writing the file, display a brief summary to the user:
 ```text
 Wrote PR description to .ai/outputs/git.md
 
-- Issue: #{issue-number} {title}
+{If issue: "- Issue: #{issue-number} {title}"}
 - Commits: {number of commits}
 - Type: {detected PR type}
 ```
 
 ## Notes
 
-- If branch name doesn't contain an issue number, ask the user for it
+- **Do NOT ask for an issue number** unless the user explicitly passes one
 - Determine PR type from:
   - Issue labels (enhancement = Feature, bug = Bugfix)
   - Branch name prefix (feat = Feature, fix = Bugfix, refactor = Refactoring)
   - Commit messages
 - Keep the description concise but informative
 - Focus on the "what" and "why", not the "how" (code details are in the diff)
-- **IMPORTANT**: Use only ASCII characters in the output. Avoid Unicode symbols (arrows, special characters) as they may get corrupted. Use ASCII alternatives like `->`, `|`, `v` instead of `->`, `|`, `v`, etc.
+- **IMPORTANT**: Use only ASCII characters in the output. Avoid Unicode symbols (arrows, special characters) as they may get corrupted. Use ASCII alternatives like `->`, `|`, `v` instead of `→`, `↓`, etc.
