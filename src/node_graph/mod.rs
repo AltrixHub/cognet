@@ -1,10 +1,15 @@
+pub mod convenience;
+pub mod edge_info;
 pub mod execution_cache;
 pub mod node_graph_api;
 pub mod node_graph_system;
 pub mod node_manager;
 pub mod node_state;
+pub mod path_navigation;
+pub mod subgraph_helpers;
 pub mod subgraph_ops;
 
+pub use edge_info::*;
 pub use execution_cache::*;
 pub use node_graph_api::*;
 pub use node_manager::*;
