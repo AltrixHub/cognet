@@ -16,46 +16,45 @@ pub use node_manager::*;
 pub use node_state::*;
 pub use subgraph_ops::*;
 
-use crate::{ErrorTarget, GraphError, InternalStateAccess, NodeId, NodeStatesAccess};
+use crate::{ErrorTarget, GraphError, NodeId};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
-pub struct NodeGraph {
-    node_manager: NodeManager,
-    /// External state access (for UI integration).
-    /// If None, uses internal state access.
-    state_access: Arc<dyn NodeStatesAccess>,
-    cache: SharedExecutionCache,
+/// Mutable bookkeeping state used during execution and graph mutation.
+///
+/// Wrapped in `Mutex` for interior mutability so that `execute()` can
+/// take `&self` instead of `&mut self`, eliminating the need for the
+/// app layer to hold a write lock on `NodeGraph` during execution.
+#[derive(Default)]
+struct Bookkeeping {
     dirty_nodes: HashSet<NodeId>,
-    /// Current errors in the graph, keyed by target.
     errors: HashMap<ErrorTarget, GraphError>,
-    /// Nodes removed since last execute(). Drained by execute() into GraphChanges.removed_nodes.
     removed_since_last_execute: Vec<NodeId>,
 }
 
-impl NodeGraph {
-    /// Create a new NodeGraph with internal state management.
-    pub fn new() -> Result<Self, String> {
-        Self::with_state_access(Arc::new(InternalStateAccess::new()))
-    }
+pub struct NodeGraph {
+    node_manager: NodeManager,
+    /// Node states (type_name, data, slots) — shared with app via Arc.
+    node_states: Arc<RwLock<NodeStates>>,
+    cache: SharedExecutionCache,
+    /// Interior-mutable bookkeeping (dirty_nodes, errors, removed list).
+    bookkeeping: Mutex<Bookkeeping>,
+}
 
-    /// Create a new NodeGraph with external state access.
-    pub fn with_state_access(state_access: Arc<dyn NodeStatesAccess>) -> Result<Self, String> {
+impl NodeGraph {
+    /// Create a new NodeGraph.
+    pub fn new() -> Result<Self, String> {
         Ok(Self {
             node_manager: NodeManager::new()?,
-            state_access,
+            node_states: Arc::new(RwLock::new(NodeStates::new())),
             cache: Default::default(),
-            dirty_nodes: Default::default(),
-            errors: Default::default(),
-            removed_since_last_execute: Vec::new(),
+            bookkeeping: Mutex::new(Bookkeeping::default()),
         })
     }
 
-    /// Get the state access for reading node states.
-    ///
-    /// This provides read-only access to node states through the trait.
-    pub fn state_access(&self) -> &Arc<dyn NodeStatesAccess> {
-        &self.state_access
+    /// Get shared reference to the NodeStates storage.
+    pub fn node_states(&self) -> &Arc<RwLock<NodeStates>> {
+        &self.node_states
     }
 
     /// Get shared execution cache (for UI access to output values).
@@ -63,48 +62,81 @@ impl NodeGraph {
         self.cache.share()
     }
 
-    /// Get all current errors.
-    pub fn errors(&self) -> &HashMap<ErrorTarget, GraphError> {
-        &self.errors
+    /// Get all current errors (snapshot).
+    pub fn errors(&self) -> HashMap<ErrorTarget, GraphError> {
+        self.bookkeeping
+            .lock()
+            .map(|b| b.errors.clone())
+            .unwrap_or_default()
     }
 
     /// Check if there are any errors.
     pub fn has_errors(&self) -> bool {
-        !self.errors.is_empty()
+        self.bookkeeping
+            .lock()
+            .map(|b| !b.errors.is_empty())
+            .unwrap_or(false)
     }
 
     /// Get error for a specific target.
-    pub fn error_for(&self, target: &ErrorTarget) -> Option<&GraphError> {
-        self.errors.get(target)
+    pub fn error_for(&self, target: &ErrorTarget) -> Option<GraphError> {
+        self.bookkeeping
+            .lock()
+            .ok()
+            .and_then(|b| b.errors.get(target).cloned())
     }
 
     /// Add an error.
-    pub fn add_error(&mut self, error: GraphError) {
-        self.errors.insert(error.target.clone(), error);
+    pub fn add_error(&self, error: GraphError) {
+        if let Ok(mut b) = self.bookkeeping.lock() {
+            b.errors.insert(error.target.clone(), error);
+        }
     }
 
     /// Clear error for a specific target.
-    pub fn clear_error(&mut self, target: &ErrorTarget) {
-        self.errors.remove(target);
+    pub fn clear_error(&self, target: &ErrorTarget) {
+        if let Ok(mut b) = self.bookkeeping.lock() {
+            b.errors.remove(target);
+        }
     }
 
     /// Clear all errors.
-    pub fn clear_all_errors(&mut self) {
-        self.errors.clear();
+    pub fn clear_all_errors(&self) {
+        if let Ok(mut b) = self.bookkeeping.lock() {
+            b.errors.clear();
+        }
     }
 
     /// Clear all execution errors (before running execute()).
-    pub fn clear_execution_errors(&mut self) {
-        self.errors.retain(|_, e| !e.is_execution_error());
+    pub fn clear_execution_errors(&self) {
+        if let Ok(mut b) = self.bookkeeping.lock() {
+            b.errors.retain(|_, e| !e.is_execution_error());
+        }
     }
 
     /// Mark all nodes in the graph as dirty, forcing re-execution.
     ///
     /// Used by SubGraphNode to ensure all internal nodes execute
     /// after external inputs are injected into the input proxy.
-    pub fn mark_all_nodes_dirty(&mut self) {
+    pub fn mark_all_nodes_dirty(&self) {
         let all_ids: Vec<NodeId> = self.node_manager.all_node_ids();
-        self.dirty_nodes.extend(all_ids);
+        if let Ok(mut b) = self.bookkeeping.lock() {
+            b.dirty_nodes.extend(all_ids);
+        }
+    }
+
+    /// Mark specific nodes as dirty.
+    pub(crate) fn mark_dirty(&self, nodes: impl IntoIterator<Item = NodeId>) {
+        if let Ok(mut b) = self.bookkeeping.lock() {
+            b.dirty_nodes.extend(nodes);
+        }
+    }
+
+    /// Record a node removal (will be reported in next execute()).
+    pub(crate) fn record_removal(&self, node_id: NodeId) {
+        if let Ok(mut b) = self.bookkeeping.lock() {
+            b.removed_since_last_execute.push(node_id);
+        }
     }
 }
 

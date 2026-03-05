@@ -339,10 +339,10 @@ impl SubGraphNode {
     ///
     /// Performs the full execution cycle:
     /// 1. Inject external inputs into the internal input proxy
-    /// 2. Execute the internal graph (requires `&mut self`)
+    /// 2. Execute the internal graph
     /// 3. Collect outputs from the internal output proxy
     pub async fn execute_internal(
-        &mut self,
+        &self,
         parent_cache: SharedExecutionCache,
     ) -> Result<(), String> {
         self.inject_inputs(parent_cache.share())?;

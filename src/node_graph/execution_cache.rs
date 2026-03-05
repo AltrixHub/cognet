@@ -35,6 +35,7 @@ impl SharedExecutionCache {
             inner: Arc::clone(&self.inner),
         }
     }
+
 }
 
 #[derive(Default, Debug)]

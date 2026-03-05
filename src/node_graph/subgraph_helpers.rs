@@ -68,8 +68,7 @@ impl NodeGraph {
         let entity = self.get_node_by_id(node_id)?;
         let guard = entity.read().ok()?;
         let sg = guard.as_any().downcast_ref::<SubGraphNode>()?;
-        let storage = sg.internal_graph().state_access().storage();
-        let ns = storage.read().ok()?;
+        let ns = sg.internal_graph().node_states().read().ok()?;
         Some(ns.node_ids().copied().collect())
     }
 
@@ -79,10 +78,11 @@ impl NodeGraph {
             let entity = self.get_node_by_id(node_id)?;
             let guard = entity.read().ok()?;
             let sg = guard.as_any().downcast_ref::<SubGraphNode>()?;
-            let storage = sg.internal_graph().state_access().storage();
-            let ns = storage.read().ok()?;
+            let cache = sg.internal_graph().shared_cache();
+            let cache_read = cache.read().ok()?;
             Some(
-                ns.edges()
+                cache_read
+                    .edges
                     .iter()
                     .map(|(id, edge)| EdgeInfo {
                         id: *id,

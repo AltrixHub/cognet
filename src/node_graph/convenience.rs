@@ -10,21 +10,21 @@ use super::EdgeInfo;
 impl NodeGraph {
     /// Get all node IDs in the graph.
     pub fn node_ids(&self) -> Vec<NodeId> {
-        self.state_access
-            .storage()
+        self.node_states
             .read()
             .map(|guard| guard.node_ids().copied().collect())
             .unwrap_or_default()
     }
 
     /// Get all edges as `EdgeInfo` structs.
+    ///
+    /// Reads from ExecutionCache (sole owner of edge data).
     pub fn edges_info(&self) -> Vec<EdgeInfo> {
-        self.state_access
-            .storage()
+        self.cache
             .read()
             .map(|guard| {
                 guard
-                    .edges()
+                    .edges
                     .iter()
                     .map(|(id, edge)| EdgeInfo {
                         id: *id,
@@ -40,8 +40,8 @@ impl NodeGraph {
 
     /// Get a specific edge by ID as `EdgeInfo`.
     pub fn edge_info(&self, edge_id: &EdgeId) -> Option<EdgeInfo> {
-        self.state_access.storage().read().ok().and_then(|guard| {
-            guard.edges().get(edge_id).map(|edge| EdgeInfo {
+        self.cache.read().ok().and_then(|guard| {
+            guard.edges.get(edge_id).map(|edge| EdgeInfo {
                 id: *edge_id,
                 from_node: edge.from_node_id,
                 from_output: edge.from_output_slot_index,

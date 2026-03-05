@@ -16,7 +16,7 @@ pub(crate) trait NodeGraphSystem {
 
     fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String>;
 
-    fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>);
+    fn mark_dirty_nodes(&self, nodes: Vec<NodeId>);
 
     fn remove_edges_from_cache(&self, node_id: &NodeId) -> Result<(), String>;
 
@@ -223,8 +223,7 @@ impl NodeGraphSystem for NodeGraph {
         // Check max_connections limit BEFORE adding the edge
         if let Some(max) = to_slot.max_connections() {
             let current_count = self
-                .state_access
-                .storage()
+                .node_states
                 .read()
                 .ok()
                 .map(|s| {
@@ -251,11 +250,10 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        // Update NodeStates slot connections and add edge via state access
+        // Update NodeStates slot connections and edge storage
         {
             let mut guard = self
-                .state_access
-                .storage()
+                .node_states
                 .write()
                 .map_err(|e| e.to_string())?;
             if let Some(slot_state) =
@@ -317,7 +315,7 @@ impl NodeGraphSystem for NodeGraph {
             .ok_or(format!("Edge does not exist: id: {:?}", edge_id))
     }
 
-    fn mark_dirty_nodes(&mut self, nodes: Vec<NodeId>) {
-        self.dirty_nodes.extend(nodes.into_iter());
+    fn mark_dirty_nodes(&self, nodes: Vec<NodeId>) {
+        self.mark_dirty(nodes);
     }
 }

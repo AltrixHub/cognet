@@ -9,8 +9,8 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, GraphError, InternalStateAccess,
-    NodeEntity, NodeGraph, NodeId, NodeImpl, NodeManager, NodeMeta, SubGraphNode,
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, GraphError, NodeEntity, NodeGraph,
+    NodeId, NodeImpl, NodeMeta, SubGraphNode,
 };
 
 /// Execution event for progress tracking during graph execution.
@@ -69,7 +69,7 @@ pub trait NodeGraphAPI {
     ///
     /// Returns `GraphChanges` containing outputs from computed nodes
     /// and IDs of nodes removed since the last execution.
-    async fn execute(&mut self) -> Result<GraphChanges, String>;
+    async fn execute(&self) -> Result<GraphChanges, String>;
 
     /// Execute the graph with progress callback.
     ///
@@ -78,7 +78,7 @@ pub trait NodeGraphAPI {
     ///
     /// Returns `GraphChanges` containing outputs from computed nodes
     /// and IDs of nodes removed since the last execution.
-    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<GraphChanges, String>
+    async fn execute_with_progress<F>(&self, on_progress: F) -> Result<GraphChanges, String>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static;
 
@@ -112,33 +112,41 @@ pub trait NodeGraphAPI {
 #[async_trait]
 impl NodeGraphAPI for NodeGraph {
     fn new() -> Result<Self, String> {
-        Ok(Self {
-            node_manager: NodeManager::new()?,
-            state_access: Arc::new(InternalStateAccess::new()),
-            cache: Default::default(),
-            dirty_nodes: Default::default(),
-            errors: Default::default(),
-            removed_since_last_execute: Vec::new(),
-        })
+        NodeGraph::new()
     }
 
-    async fn execute(&mut self) -> Result<GraphChanges, String> {
+    async fn execute(&self) -> Result<GraphChanges, String> {
         self.execute_with_progress(|_| {}).await
     }
 
-    async fn execute_with_progress<F>(&mut self, on_progress: F) -> Result<GraphChanges, String>
+    async fn execute_with_progress<F>(&self, on_progress: F) -> Result<GraphChanges, String>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static,
     {
-        // Drain removed nodes accumulated since last execute
-        let removed = std::mem::take(&mut self.removed_since_last_execute);
+        // Drain bookkeeping state atomically
+        let (dirty_nodes, removed) = {
+            let mut b = self
+                .bookkeeping
+                .lock()
+                .map_err(|e| e.to_string())?;
+            let dirty = std::mem::take(&mut b.dirty_nodes);
+            let removed = std::mem::take(&mut b.removed_since_last_execute);
+            (dirty, removed)
+        };
 
-        if self.dirty_nodes.is_empty() && removed.is_empty() {
+        tracing::debug!(
+            target: "graph",
+            "[cognet] execute: dirty={} removed={}",
+            dirty_nodes.len(),
+            removed.len(),
+        );
+
+        if dirty_nodes.is_empty() && removed.is_empty() {
             return Ok(GraphChanges::empty());
         }
 
         // If only removals (no dirty nodes), return just the removed list
-        if self.dirty_nodes.is_empty() {
+        if dirty_nodes.is_empty() {
             return Ok(GraphChanges {
                 outputs: Vec::new(),
                 removed_nodes: removed,
@@ -148,7 +156,7 @@ impl NodeGraphAPI for NodeGraph {
         // Clear previous execution errors before running
         self.clear_execution_errors();
 
-        let sorted_node_levels = self.topological_sort(&self.dirty_nodes)?;
+        let sorted_node_levels = self.topological_sort(&dirty_nodes)?;
 
         // Collect all node IDs that will be executed (for output collection)
         let executed_node_ids: Vec<NodeId> = sorted_node_levels
@@ -180,35 +188,20 @@ impl NodeGraphAPI for NodeGraph {
                                 if let Some(node) = nodes_guard.get(&node_id) {
                                     let node_clone = Arc::clone(node);
                                     drop(nodes_guard);
-                                    // Try SubGraphNode with write lock (needs &mut for internal graph execution)
-                                    {
-                                        let mut node_write = match node_clone.write() {
-                                            Ok(w) => w,
-                                            Err(_) => {
-                                                return (
-                                                    node_id,
-                                                    Err("Node lock poisoned".to_string()),
-                                                )
-                                            }
-                                        };
-                                        if let Some(sg) = node_write
-                                            .as_any_mut()
-                                            .downcast_mut::<SubGraphNode>()
-                                        {
-                                            return (
-                                                node_id,
-                                                sg.execute_internal(shared_cache.share()).await,
-                                            );
-                                        }
-                                    }
-                                    // Regular node with read lock
                                     let node_read = match node_clone.read() {
                                         Ok(r) => r,
                                         Err(_) => {
                                             return (node_id, Err("Node lock poisoned".to_string()))
                                         }
                                     };
-                                    node_read.execute(shared_cache.share()).await
+                                    if let Some(sg) = node_read
+                                        .as_any()
+                                        .downcast_ref::<SubGraphNode>()
+                                    {
+                                        sg.execute_internal(shared_cache.share()).await
+                                    } else {
+                                        node_read.execute(shared_cache.share()).await
+                                    }
                                 } else {
                                     Ok(())
                                 }
@@ -265,33 +258,20 @@ impl NodeGraphAPI for NodeGraph {
                                         match std::panic::catch_unwind(
                                             std::panic::AssertUnwindSafe(|| {
                                                 rt_clone.block_on(async {
-                                                    // Try SubGraphNode with write lock
-                                                    // (needs &mut for internal graph execution)
-                                                    {
-                                                        let mut node_write =
-                                                            match node_clone.write() {
-                                                                Ok(w) => w,
-                                                                Err(poisoned) => {
-                                                                    poisoned.into_inner()
-                                                                }
-                                                            };
-                                                        if let Some(sg) = node_write
-                                                            .as_any_mut()
-                                                            .downcast_mut::<SubGraphNode>()
-                                                        {
-                                                            return sg
-                                                                .execute_internal(cache_clone)
-                                                                .await;
-                                                        }
-                                                    }
-                                                    // Regular node with read lock.
-                                                    // Recover from poisoned locks (caused by
-                                                    // a previous panic in this node).
+                                                    // Read lock only — execute() and
+                                                    // execute_internal() take &self.
                                                     let node_read = match node_clone.read() {
                                                         Ok(r) => r,
                                                         Err(poisoned) => poisoned.into_inner(),
                                                     };
-                                                    node_read.execute(cache_clone).await
+                                                    if let Some(sg) = node_read
+                                                        .as_any()
+                                                        .downcast_ref::<SubGraphNode>()
+                                                    {
+                                                        sg.execute_internal(cache_clone).await
+                                                    } else {
+                                                        node_read.execute(cache_clone).await
+                                                    }
                                                 })
                                             }),
                                         ) {
@@ -359,7 +339,6 @@ impl NodeGraphAPI for NodeGraph {
             }
         }
 
-        self.dirty_nodes.clear();
         Ok(GraphChanges {
             outputs,
             removed_nodes: removed,
@@ -369,14 +348,17 @@ impl NodeGraphAPI for NodeGraph {
     fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
         let node_id = self.node_manager.create_node::<T>()?;
 
-        // Register in NodeStates via state access
-        self.state_access.add_node(
-            node_id,
-            T::NAME,
-            T::DEFAULT_VALUE.to_data(),
-            T::INPUTS.len(),
-            T::OUTPUTS.len(),
-        );
+        // Register in NodeStates
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            guard.add_node(
+                node_id,
+                T::NAME,
+                T::DEFAULT_VALUE.to_data(),
+                T::INPUTS.len(),
+                T::OUTPUTS.len(),
+            );
+        }
 
         Ok(node_id)
     }
@@ -389,14 +371,17 @@ impl NodeGraphAPI for NodeGraph {
         let type_info = crate::get_node_type_info(name)
             .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
 
-        // Register in NodeStates via state access
-        self.state_access.add_node(
-            node_id,
-            type_info.name,
-            default_data,
-            type_info.inputs.len(),
-            type_info.outputs.len(),
-        );
+        // Register in NodeStates
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            guard.add_node(
+                node_id,
+                type_info.name,
+                default_data,
+                type_info.inputs.len(),
+                type_info.outputs.len(),
+            );
+        }
 
         Ok(node_id)
     }
@@ -407,11 +392,14 @@ impl NodeGraphAPI for NodeGraph {
             self.remove_edges_from_cache(&node_id)?;
             self.mark_dirty_nodes(dirty_nodes);
 
-            // Clean up NodeStates via state access
-            self.state_access.remove_node(node_id);
+            // Clean up NodeStates
+            {
+                let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+                guard.remove_node(&node_id);
+            }
 
             // Track removal for GraphChanges in next execute()
-            self.removed_since_last_execute.push(node_id);
+            self.record_removal(node_id);
 
             Ok(())
         } else {
@@ -427,8 +415,13 @@ impl NodeGraphAPI for NodeGraph {
         let mut write_node = node.write().map_err(|e| e.to_string())?;
         write_node.set_node_data(data.share())?;
 
-        // Update NodeStates via state access
-        self.state_access.update_node_data(*node_id, Some(data));
+        // Update NodeStates
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            if let Some(node_state) = guard.get_mut(node_id) {
+                node_state.data = Some(data);
+            }
+        }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
@@ -477,13 +470,9 @@ impl NodeGraphAPI for NodeGraph {
         let from_node_id = edge.from_node_id;
         let to_node_id = edge.to_node_id;
 
-        // Update NodeStates slot connections and remove edge via state access
+        // Update NodeStates slot connections
         {
-            let mut guard = self
-                .state_access
-                .storage()
-                .write()
-                .map_err(|e| e.to_string())?;
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             if let Some(slot_state) =
                 guard.output_slot_mut(&from_node_id, edge.from_output_slot_index)
             {
@@ -494,7 +483,6 @@ impl NodeGraphAPI for NodeGraph {
             {
                 slot_state.connected_edges.retain(|id| *id != edge_id);
             }
-            guard.remove_edge(&edge_id);
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
