@@ -16,7 +16,7 @@ pub use node_manager::*;
 pub use node_state::*;
 pub use subgraph_ops::*;
 
-use crate::{ErrorTarget, GraphError, NodeId, NodeStatesAccess};
+use crate::{ErrorTarget, GraphError, InternalStateAccess, NodeId, NodeStatesAccess};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -34,11 +34,12 @@ pub struct NodeGraph {
 }
 
 impl NodeGraph {
+    /// Create a new NodeGraph with internal state management.
+    pub fn new() -> Result<Self, String> {
+        Self::with_state_access(Arc::new(InternalStateAccess::new()))
+    }
+
     /// Create a new NodeGraph with external state access.
-    ///
-    /// This is the preferred way to create a NodeGraph when integrating
-    /// with a UI framework like revion. The state access adapter handles
-    /// state updates and can trigger UI rebuilds.
     pub fn with_state_access(state_access: Arc<dyn NodeStatesAccess>) -> Result<Self, String> {
         Ok(Self {
             node_manager: NodeManager::new()?,
