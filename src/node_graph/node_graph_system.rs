@@ -200,7 +200,8 @@ impl NodeGraphSystem for NodeGraph {
 
             // Check max_connections limit BEFORE adding the edge
             if let Some(max) = to_slot.max_connections {
-                if to_slot.connected_edges.len() >= max {
+                let current = ns.edges_for_input(&to_slot.id).len();
+                if current >= max {
                     let error = GraphError::connection_limit_exceeded(
                         to_node_id,
                         edge.to_input_slot_index,
@@ -215,7 +216,7 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        // Update NodeStates (edge storage + slot connected_edges + indexes)
+        // Update NodeStates (edge storage + indexes)
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             guard.add_edge(edge_id, edge.clone());

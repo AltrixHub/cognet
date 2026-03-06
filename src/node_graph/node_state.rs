@@ -30,7 +30,6 @@ pub struct InputSlotState {
     pub data_type: DataType,
     pub max_connections: Option<usize>,
     pub default_value: Option<DataValue>,
-    pub connected_edges: Vec<EdgeId>,
 }
 
 /// Runtime state for output slots.
@@ -39,7 +38,6 @@ pub struct OutputSlotState {
     pub id: OutputSlotId,
     pub label: &'static str,
     pub data_type: DataType,
-    pub connected_edges: Vec<EdgeId>,
 }
 
 /// Shared handle to `NodeStates` for cross-thread access.
@@ -89,7 +87,6 @@ impl NodeStates {
                     data_type: def.data_type,
                     max_connections: def.max_connections,
                     default_value: None,
-                    connected_edges: Vec::new(),
                 },
             );
         }
@@ -102,7 +99,6 @@ impl NodeStates {
                     id: OutputSlotId::new(),
                     label: def.label,
                     data_type: def.data_type,
-                    connected_edges: Vec::new(),
                 },
             );
         }
@@ -125,7 +121,6 @@ impl NodeStates {
                 data_type,
                 max_connections,
                 default_value: None,
-                connected_edges: Vec::new(),
             },
         );
         index
@@ -145,7 +140,6 @@ impl NodeStates {
                 id: OutputSlotId::new(),
                 label,
                 data_type,
-                connected_edges: Vec::new(),
             },
         );
         index
@@ -259,22 +253,8 @@ impl NodeStates {
         self.nodes.iter()
     }
 
-    /// Add an edge and update all indexes (including slot connected_edges).
+    /// Add an edge and update lookup indexes.
     pub fn add_edge(&mut self, edge_id: EdgeId, edge: Edge) {
-        // Update slot connected_edges
-        if let Some(slot) = self
-            .output_slots
-            .get_mut(&(edge.from_node_id, edge.from_output_slot_index))
-        {
-            slot.connected_edges.push(edge_id);
-        }
-        if let Some(slot) = self
-            .input_slots
-            .get_mut(&(edge.to_node_id, edge.to_input_slot_index))
-        {
-            slot.connected_edges.push(edge_id);
-        }
-        // Update lookup indexes
         self.input_connections
             .entry(edge.to_input_slot_id)
             .or_default()
@@ -286,23 +266,9 @@ impl NodeStates {
         self.edges.insert(edge_id, edge);
     }
 
-    /// Remove an edge and update all indexes (including slot connected_edges).
+    /// Remove an edge and update lookup indexes.
     pub fn remove_edge(&mut self, edge_id: &EdgeId) -> Option<Edge> {
         if let Some(edge) = self.edges.remove(edge_id) {
-            // Update slot connected_edges
-            if let Some(slot) = self
-                .output_slots
-                .get_mut(&(edge.from_node_id, edge.from_output_slot_index))
-            {
-                slot.connected_edges.retain(|id| id != edge_id);
-            }
-            if let Some(slot) = self
-                .input_slots
-                .get_mut(&(edge.to_node_id, edge.to_input_slot_index))
-            {
-                slot.connected_edges.retain(|id| id != edge_id);
-            }
-            // Update lookup indexes
             if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
                 connections.retain(|id| id != edge_id);
             }
@@ -354,11 +320,4 @@ impl NodeStates {
             .unwrap_or(&[])
     }
 
-    /// Get edges connected to a node (both directions).
-    pub fn edges_for_node(&self, node_id: &NodeId) -> Vec<(&EdgeId, &Edge)> {
-        self.edges
-            .iter()
-            .filter(|(_, e)| &e.from_node_id == node_id || &e.to_node_id == node_id)
-            .collect()
-    }
 }

@@ -555,8 +555,7 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
-        // remove_edge_from_cache now removes from NodeStates
-        // (including slot connected_edges and all indexes)
+        // remove_edge_from_cache removes from NodeStates (including all indexes)
         let edge = self.remove_edge_from_cache(&edge_id)?;
 
         let dirty_nodes =

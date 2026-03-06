@@ -47,15 +47,13 @@ pub struct SubGraphNode {
     /// Number of proxy outputs each external input maps to.
     /// Normally 1 (1:1 mapping). For multi-input ports like Baseline, this is N.
     input_proxy_counts: Vec<usize>,
-    /// Number of output slots (tracked locally since SubGraphNode doesn't know its parent NodeId).
-    output_count: usize,
 }
 
 impl std::fmt::Debug for SubGraphNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubGraphNode")
             .field("inputs", &self.input_proxy_counts.len())
-            .field("outputs", &self.output_count)
+            .field("outputs", &self.output_count())
             .field("input_proxy_id", &self.input_proxy_id)
             .field("output_proxy_id", &self.output_proxy_id)
             .field("label", &self.label)
@@ -77,7 +75,6 @@ impl SubGraphNode {
             output_proxy_id,
             label: label.into(),
             input_proxy_counts: Vec::new(),
-            output_count: 0,
         })
     }
 
@@ -109,6 +106,15 @@ impl SubGraphNode {
     /// Set the display label.
     pub fn set_label(&mut self, label: impl Into<String>) {
         self.label = label.into();
+    }
+
+    /// Number of output slots, derived from the internal OutputProxy's input slot count.
+    pub fn output_count(&self) -> usize {
+        self.internal_graph
+            .node_states()
+            .read()
+            .map(|ns| ns.input_slot_count(&self.output_proxy_id))
+            .unwrap_or(0)
     }
 
     /// Add an input slot to this subgraph node and a corresponding
@@ -189,10 +195,11 @@ impl SubGraphNode {
     ///
     /// Returns an error if the index is out of range.
     pub fn remove_output(&mut self, index: usize) -> Result<(), String> {
-        if index >= self.output_count {
+        let count = self.output_count();
+        if index >= count {
             return Err(format!(
                 "Output index {} out of range (have {})",
-                index, self.output_count
+                index, count
             ));
         }
 
@@ -203,9 +210,6 @@ impl SubGraphNode {
             .write()
             .map_err(|e| e.to_string())?;
         ns.remove_input_slot(&self.output_proxy_id, index);
-        drop(ns);
-
-        self.output_count -= 1;
 
         Ok(())
     }
@@ -213,8 +217,6 @@ impl SubGraphNode {
     /// Add an output slot to this subgraph node and a corresponding
     /// input slot on the internal SubGraphOutputNode (via NodeStates).
     pub fn add_output(&mut self, label: &'static str, data_type: DataType) -> Result<(), String> {
-        self.output_count += 1;
-
         // Add corresponding input on the output proxy via NodeStates
         let mut ns = self
             .internal_graph
@@ -365,7 +367,7 @@ impl SubGraphNode {
             // Find edges connected to the output proxy's input slot at this index
             if let Some(slot_state) = internal_ns.input_slot(&self.output_proxy_id, idx) {
                 let cache_read = internal_cache.read()?;
-                for edge_id in &slot_state.connected_edges {
+                for edge_id in internal_ns.edges_for_input(&slot_state.id) {
                     if let Some(edge) = internal_ns.get_edge(edge_id) {
                         if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
                             let data = data.share();
