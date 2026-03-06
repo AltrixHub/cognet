@@ -4,17 +4,12 @@
 //! Returns 0.0 when any divisor is zero.
 
 use crate::{
-    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
-    OutputSlot, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, NodeCategory, NodeImpl, NodeMeta, SlotDef,
 };
 
 /// Divides the first number by all subsequent numbers
 #[derive(Debug)]
-pub struct DivideListNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct DivideListNode;
 
 impl NodeMeta for DivideListNode {
     const NAME: &'static str = "DivideList";
@@ -34,7 +29,7 @@ impl NodeMeta for DivideListNode {
 #[async_trait::async_trait]
 impl NodeImpl for DivideListNode {
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
-        let data_list = ctx.input_values.get(0).cloned().unwrap_or_default();
+        let data_list = ctx.input_values.first().cloned().unwrap_or_default();
         let mut result: Option<f64> = None;
         for data in &data_list {
             let value: f64 = *data.value()?;

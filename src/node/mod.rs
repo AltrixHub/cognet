@@ -12,7 +12,7 @@ pub use primitives::*;
 pub use subgraph::*;
 pub use type_info::*;
 
-use crate::{impl_entity_id, AsAny, Data, InputSlot, NodeManager, OutputSlot};
+use crate::{impl_entity_id, AsAny, NodeManager};
 use std::{any::Any, fmt::Debug};
 
 impl_entity_id!(NodeId);
@@ -46,58 +46,11 @@ impl dyn NodeImpl {
 }
 
 pub trait NodeCore: Debug {
-    fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot> {
-        self.inputs().get(input_slot_index)
-    }
-
-    fn get_output_slot_by_index(&self, output_slot_index: usize) -> Option<&OutputSlot> {
-        self.outputs().get(output_slot_index)
-    }
-
-    fn get_input_slot_by_index_mut(&mut self, input_slot_index: usize) -> Option<&mut InputSlot> {
-        self.inputs_mut().get_mut(input_slot_index)
-    }
-
-    fn get_output_slot_by_index_mut(
-        &mut self,
-        output_slot_index: usize,
-    ) -> Option<&mut OutputSlot> {
-        self.outputs_mut().get_mut(output_slot_index)
-    }
-
     fn node_name(&self) -> &'static str;
-
-    fn node_data(&self) -> Option<Data>;
-
-    fn node_data_mut(&mut self) -> &mut Option<Data>;
-
-    fn inputs(&self) -> &Vec<InputSlot>;
-
-    fn inputs_mut(&mut self) -> &mut Vec<InputSlot>;
-
-    fn outputs(&self) -> &Vec<OutputSlot>;
-
-    fn outputs_mut(&mut self) -> &mut Vec<OutputSlot>;
 
     fn register_in(manager: &mut NodeManager) -> Result<(), String>
     where
         Self: Sized;
-}
-
-pub trait NodeValueSetter: NodeCore {
-    fn set_input_slot_default_data(&mut self, slot_index: usize, data: Data) -> Result<(), String> {
-        let input_slot = self
-            .inputs_mut()
-            .get_mut(slot_index)
-            .ok_or(format!("Invalid slot index: {}", slot_index))?;
-        input_slot.set_default_value(data)?;
-        Ok(())
-    }
-
-    fn set_node_data(&mut self, data: Data) -> Result<(), String> {
-        *self.node_data_mut() = Some(data);
-        Ok(())
-    }
 }
 
 impl<T: 'static + NodeCore> AsAny for T {
@@ -116,46 +69,13 @@ macro_rules! register_nodes {
         $(
             impl $crate::NodeInit for $struct_name {
                 fn initialize() -> Result<Self, String> {
-                    Ok(Self {
-                        node_data: <Self as $crate::NodeMeta>::DEFAULT_VALUE.to_data(),
-                        inputs: $crate::inputs_from_defs(<Self as $crate::NodeMeta>::INPUTS),
-                        outputs: $crate::outputs_from_defs(<Self as $crate::NodeMeta>::OUTPUTS),
-                    })
+                    Ok(Self)
                 }
             }
-
-            impl $crate::NodeValueSetter for $struct_name {}
 
             impl $crate::NodeCore for $struct_name {
                 fn node_name(&self) -> &'static str {
                     <$struct_name as $crate::NodeMeta>::NAME
-                }
-
-                fn node_data(&self) -> Option<$crate::Data> {
-                    match &self.node_data {
-                        Some(data) => Some(data.share()),
-                        None => None
-                    }
-                }
-
-                fn node_data_mut(&mut self) -> &mut Option<$crate::Data> {
-                    &mut self.node_data
-                }
-
-                fn inputs(&self) -> &Vec<$crate::InputSlot> {
-                    &self.inputs
-                }
-
-                fn inputs_mut(&mut self) -> &mut Vec<$crate::InputSlot> {
-                    &mut self.inputs
-                }
-
-                fn outputs(&self) -> &Vec<$crate::OutputSlot> {
-                    &self.outputs
-                }
-
-                fn outputs_mut(&mut self) -> &mut Vec<$crate::OutputSlot> {
-                    &mut self.outputs
                 }
 
                 fn register_in(manager: &mut $crate::NodeManager) -> Result<(), String> {

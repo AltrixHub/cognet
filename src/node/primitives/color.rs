@@ -4,17 +4,13 @@
 //! which is passed through to the output.
 
 use crate::{
-    register_nodes, Data, DataType, DefaultValue, ExecutionContext, InputSlot, NodeCategory,
-    NodeImpl, NodeMeta, OutputSlot, SlotDef,
+    register_nodes, DataType, DefaultValue, ExecutionContext, NodeCategory, NodeImpl, NodeMeta,
+    SlotDef,
 };
 
 /// A Color value node that outputs an RGBA color.
 #[derive(Debug)]
-pub struct ColorNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct ColorNode;
 
 impl NodeMeta for ColorNode {
     const NAME: &'static str = "Color";

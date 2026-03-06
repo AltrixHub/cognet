@@ -263,6 +263,7 @@ impl NodeGraphAPI for NodeGraph {
                                         .downcast_ref::<SubGraphNode>()
                                     {
                                         sg.execute_internal(
+                                            &node_id,
                                             shared_cache.share(),
                                             shared_node_states.clone(),
                                         )
@@ -334,9 +335,11 @@ impl NodeGraphAPI for NodeGraph {
                                         // doesn't abort the entire execution level.
                                         match std::panic::catch_unwind(
                                             std::panic::AssertUnwindSafe(|| {
+                                                #[allow(clippy::await_holding_lock)]
                                                 rt_clone.block_on(async {
-                                                    // Read lock only — execute() and
-                                                    // execute_internal() take &self.
+                                                    // Read lock held across await — intentional.
+                                                    // execute() takes &self, so the read guard
+                                                    // must live for the duration of the call.
                                                     let node_read = match node_clone.read() {
                                                         Ok(r) => r,
                                                         Err(poisoned) => poisoned.into_inner(),
@@ -346,6 +349,7 @@ impl NodeGraphAPI for NodeGraph {
                                                         .downcast_ref::<SubGraphNode>()
                                                     {
                                                         sg.execute_internal(
+                                                            &node_id,
                                                             cache_clone,
                                                             ns_clone,
                                                         )
@@ -499,20 +503,12 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
-        // Write to NodeStates (source of truth)
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             let node_state = guard
                 .get_mut(node_id)
                 .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-            node_state.data = Some(data.share());
-        }
-
-        // Also update NodeEntity (backward compatibility for SubGraphNode)
-        if let Some(node) = self.node_manager.get_node_by_id(node_id) {
-            if let Ok(mut write_node) = node.write() {
-                let _ = write_node.set_node_data(data);
-            }
+            node_state.data = Some(data);
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
@@ -526,20 +522,12 @@ impl NodeGraphAPI for NodeGraph {
         slot_index: usize,
         data: Data,
     ) -> Result<(), String> {
-        // Write to NodeStates (source of truth)
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             let slot = guard
                 .input_slot_mut(node_id, slot_index)
                 .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
-            slot.default_value = Some(data.share().into_value());
-        }
-
-        // Also update NodeEntity (backward compatibility for SubGraphNode)
-        if let Some(node) = self.node_manager.get_node_by_id(node_id) {
-            if let Ok(mut write_node) = node.write() {
-                let _ = write_node.set_input_slot_default_data(slot_index, data);
-            }
+            slot.default_value = Some(data.into_value());
         }
 
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;

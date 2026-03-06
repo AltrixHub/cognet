@@ -1,14 +1,9 @@
 use crate::{
-    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
-    OutputSlot, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, NodeCategory, NodeImpl, NodeMeta, SlotDef,
 };
 
 #[derive(Debug)]
-pub struct MultiplyNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct MultiplyNode;
 
 impl NodeMeta for MultiplyNode {
     const NAME: &'static str = "Multiply";
@@ -35,7 +30,7 @@ impl NodeMeta for MultiplyNode {
 #[async_trait::async_trait]
 impl NodeImpl for MultiplyNode {
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
-        let a: f64 = ctx.input_values.get(0)
+        let a: f64 = ctx.input_values.first()
             .and_then(|v| v.first())
             .and_then(|d| d.value::<f64>().ok().copied())
             .unwrap_or(0.0);

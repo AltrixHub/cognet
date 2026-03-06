@@ -1,14 +1,10 @@
 use crate::{
-    register_nodes, Data, DataType, DefaultValue, ExecutionContext, InputSlot, NodeCategory,
-    NodeImpl, NodeMeta, OutputSlot, SlotDef,
+    register_nodes, DataType, DefaultValue, ExecutionContext, NodeCategory, NodeImpl, NodeMeta,
+    SlotDef,
 };
 
 #[derive(Debug)]
-pub struct NumberNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct NumberNode;
 
 impl NodeMeta for NumberNode {
     const NAME: &'static str = "Number";

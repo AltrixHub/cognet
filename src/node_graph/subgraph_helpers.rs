@@ -3,7 +3,7 @@
 //! These methods provide direct access to SubGraphNode operations
 //! without requiring callers to perform entity lookup + downcast manually.
 
-use crate::{Data, DataType, InputSlot, NodeGraph, NodeGraphAPI, NodeId, OutputSlot, SubGraphNode};
+use crate::{Data, DataType, NodeGraph, NodeGraphAPI, NodeId, SubGraphNode};
 
 use super::EdgeInfo;
 
@@ -137,12 +137,7 @@ impl NodeGraph {
             .as_any_mut()
             .downcast_mut::<SubGraphNode>()
             .ok_or("Node is not a SubGraphNode")?;
-        let slot = InputSlot {
-            label,
-            data_type,
-            ..Default::default()
-        };
-        sg.add_input(slot)?;
+        sg.add_input(label, data_type)?;
         drop(guard);
         // Sync parent NodeStates
         if let Ok(mut ns) = self.node_states.write() {
@@ -189,12 +184,7 @@ impl NodeGraph {
             .as_any_mut()
             .downcast_mut::<SubGraphNode>()
             .ok_or("Node is not a SubGraphNode")?;
-        let slot = OutputSlot {
-            label,
-            data_type,
-            ..Default::default()
-        };
-        sg.add_output(slot)?;
+        sg.add_output(label, data_type)?;
         drop(guard);
         // Sync parent NodeStates
         if let Ok(mut ns) = self.node_states.write() {
@@ -226,23 +216,20 @@ impl NodeGraph {
         Ok(())
     }
 
-    /// Set the default value for a SubGraphNode input port.
-    pub fn set_subgraph_input_default(
+    /// Add a multi-input port to a SubGraphNode.
+    ///
+    /// Creates one external input port that maps to multiple proxy outputs inside
+    /// the internal graph. Used for ports like "Baseline" where N edges connect to
+    /// one input slot and each edge value is distributed to a separate proxy output.
+    pub fn add_subgraph_multi_input(
         &self,
         node_id: &NodeId,
-        input_index: usize,
-        data: Data,
+        label: &'static str,
+        data_type: DataType,
+        proxy_count: usize,
+        proxy_data_type: DataType,
+        proxy_label: &'static str,
     ) -> Result<(), String> {
-        // Write to NodeStates (source of truth)
-        {
-            let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-            let slot = ns
-                .input_slot_mut(node_id, input_index)
-                .ok_or_else(|| format!("Input slot {} not found for node {:?}", input_index, node_id))?;
-            slot.default_value = Some(data.share().into_value());
-        }
-
-        // Also update NodeEntity (backward compatibility)
         let entity = self
             .get_node_by_id(node_id)
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
@@ -251,7 +238,33 @@ impl NodeGraph {
             .as_any_mut()
             .downcast_mut::<SubGraphNode>()
             .ok_or("Node is not a SubGraphNode")?;
-        sg.set_input_default(input_index, data)
+        sg.add_multi_input(proxy_count, proxy_data_type, proxy_label)?;
+        drop(guard);
+        // Sync parent NodeStates
+        if let Ok(mut ns) = self.node_states.write() {
+            ns.add_input_slot(node_id, label, data_type, None);
+        }
+        Ok(())
+    }
+
+    /// Set the default value for a SubGraphNode input port.
+    pub fn set_subgraph_input_default(
+        &self,
+        node_id: &NodeId,
+        input_index: usize,
+        data: Data,
+    ) -> Result<(), String> {
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+        let slot = ns
+            .input_slot_mut(node_id, input_index)
+            .ok_or_else(|| {
+                format!(
+                    "Input slot {} not found for node {:?}",
+                    input_index, node_id
+                )
+            })?;
+        slot.default_value = Some(data.into_value());
+        Ok(())
     }
 }
 
@@ -316,12 +329,12 @@ mod tests {
             .add_subgraph_output(&sg, "Out1", crate::DataType::Number)
             .expect("add output");
 
-        // Verify via entity
-        let entity = graph.get_node_by_id(&sg).unwrap();
-        let guard = entity.read().unwrap();
-        assert_eq!(guard.inputs().len(), 1);
-        assert_eq!(guard.outputs().len(), 1);
-        drop(guard);
+        // Verify via NodeStates
+        {
+            let ns = graph.node_states().read().unwrap();
+            assert_eq!(ns.input_slot_count(&sg), 1);
+            assert_eq!(ns.output_slot_count(&sg), 1);
+        }
 
         // Remove
         graph.remove_subgraph_input(&sg, 0).expect("remove input");
@@ -329,9 +342,11 @@ mod tests {
             .remove_subgraph_output(&sg, 0)
             .expect("remove output");
 
-        let guard = entity.read().unwrap();
-        assert!(guard.inputs().is_empty());
-        assert!(guard.outputs().is_empty());
+        {
+            let ns = graph.node_states().read().unwrap();
+            assert_eq!(ns.input_slot_count(&sg), 0);
+            assert_eq!(ns.output_slot_count(&sg), 0);
+        }
     }
 
     #[tokio::test]

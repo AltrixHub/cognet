@@ -1,14 +1,9 @@
 use crate::{
-    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
-    OutputSlot, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, NodeCategory, NodeImpl, NodeMeta, SlotDef,
 };
 
 #[derive(Debug)]
-pub struct SubtractNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct SubtractNode;
 
 impl NodeMeta for SubtractNode {
     const NAME: &'static str = "Subtract";
@@ -35,7 +30,7 @@ impl NodeMeta for SubtractNode {
 #[async_trait::async_trait]
 impl NodeImpl for SubtractNode {
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
-        let a: f64 = ctx.input_values.get(0)
+        let a: f64 = ctx.input_values.first()
             .and_then(|v| v.first())
             .and_then(|d| d.value::<f64>().ok().copied())
             .unwrap_or(0.0);

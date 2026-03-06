@@ -3,11 +3,7 @@
 //! Placed inside a subgraph to receive data from the parent graph's
 //! SubGraphNode input slots. Each output corresponds to one external input.
 
-#[allow(unused_imports)]
-use crate::{
-    Data, DefaultValue, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta, OutputSlot,
-    SlotDef,
-};
+use crate::{DefaultValue, ExecutionContext, NodeCategory, NodeImpl, NodeMeta, SlotDef};
 
 /// Proxy node inside a subgraph that bridges external inputs.
 ///
@@ -15,11 +11,7 @@ use crate::{
 /// outputs before the internal graph executes. Each output slot corresponds
 /// to one input slot on the parent SubGraphNode.
 #[derive(Debug)]
-pub struct SubGraphInputNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct SubGraphInputNode;
 
 impl NodeMeta for SubGraphInputNode {
     const NAME: &'static str = "SubGraphInput";

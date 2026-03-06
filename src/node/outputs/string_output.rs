@@ -1,14 +1,9 @@
 use crate::{
-    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
-    OutputSlot, SlotDef,
+    register_nodes, DataType, ExecutionContext, NodeCategory, NodeImpl, NodeMeta, SlotDef,
 };
 
 #[derive(Debug)]
-pub struct StringOutput {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct StringOutput;
 
 impl NodeMeta for StringOutput {
     const NAME: &'static str = "String Output";

@@ -1,15 +1,10 @@
 use crate::{
-    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
-    OutputSlot, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, NodeCategory, NodeImpl, NodeMeta, SlotDef,
 };
 
 /// Adds two numbers (A + B)
 #[derive(Debug)]
-pub struct AddNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct AddNode;
 
 impl NodeMeta for AddNode {
     const NAME: &'static str = "Add";
@@ -36,7 +31,7 @@ impl NodeMeta for AddNode {
 #[async_trait::async_trait]
 impl NodeImpl for AddNode {
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
-        let a: f64 = ctx.input_values.get(0)
+        let a: f64 = ctx.input_values.first()
             .and_then(|v| v.first())
             .and_then(|d| d.value::<f64>().ok().copied())
             .unwrap_or(0.0);

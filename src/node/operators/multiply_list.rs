@@ -1,15 +1,10 @@
 use crate::{
-    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
-    OutputSlot, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, NodeCategory, NodeImpl, NodeMeta, SlotDef,
 };
 
 /// Multiplies all input numbers together
 #[derive(Debug)]
-pub struct MultiplyListNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct MultiplyListNode;
 
 impl NodeMeta for MultiplyListNode {
     const NAME: &'static str = "MultiplyList";
@@ -29,7 +24,7 @@ impl NodeMeta for MultiplyListNode {
 #[async_trait::async_trait]
 impl NodeImpl for MultiplyListNode {
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
-        let data_list = ctx.input_values.get(0).cloned().unwrap_or_default();
+        let data_list = ctx.input_values.first().cloned().unwrap_or_default();
         let mut result = 1.0_f64;
         for data in &data_list {
             result *= data.value::<f64>()?;

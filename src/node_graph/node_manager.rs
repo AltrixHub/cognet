@@ -1,14 +1,14 @@
 use std::sync::{Mutex, MutexGuard, RwLock};
 
-use crate::{Data, NodeCore, NodeId, NodeImpl, NodeValueSetter};
+use crate::{Data, NodeCore, NodeId, NodeImpl};
 use std::{
     any::{type_name, Any, TypeId},
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
-pub trait Node: NodeImpl + NodeValueSetter + NodeCore {}
-impl<T: NodeImpl + NodeValueSetter + NodeCore> Node for T {}
+pub trait Node: NodeImpl + NodeCore {}
+impl<T: NodeImpl + NodeCore> Node for T {}
 
 pub type NodeEntity = Arc<RwLock<dyn Node>>;
 type NodeFactory = Arc<dyn Fn() -> Result<NodeEntity, String> + Send + Sync>;
@@ -89,7 +89,7 @@ impl NodeManager {
 
     pub fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
         let nodes = self.nodes.lock().ok()?;
-        nodes.get(id).map(|node| Arc::clone(node))
+        nodes.get(id).cloned()
     }
 
     pub fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {

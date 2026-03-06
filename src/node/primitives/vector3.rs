@@ -4,17 +4,13 @@
 //! which is passed through to the output.
 
 use crate::{
-    register_nodes, Data, DataType, DefaultValue, ExecutionContext, InputSlot, NodeCategory,
-    NodeImpl, NodeMeta, OutputSlot, SlotDef,
+    register_nodes, DataType, DefaultValue, ExecutionContext, NodeCategory, NodeImpl, NodeMeta,
+    SlotDef,
 };
 
 /// A Vector3 value node that outputs a 3D vector (x, y, z).
 #[derive(Debug)]
-pub struct Vector3Node {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct Vector3Node;
 
 impl NodeMeta for Vector3Node {
     const NAME: &'static str = "Vector3";

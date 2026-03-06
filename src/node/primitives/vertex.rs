@@ -5,17 +5,13 @@
 //! Vector3Node — Vertex represents a point/position in space.
 
 use crate::{
-    register_nodes, Data, DataType, DefaultValue, ExecutionContext, InputSlot, NodeCategory,
-    NodeImpl, NodeMeta, OutputSlot, SlotDef,
+    register_nodes, DataType, DefaultValue, ExecutionContext, NodeCategory, NodeImpl, NodeMeta,
+    SlotDef,
 };
 
 /// A Vertex value node that outputs a 3D position (x, y, z).
 #[derive(Debug)]
-pub struct VertexNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct VertexNode;
 
 impl NodeMeta for VertexNode {
     const NAME: &'static str = "Vertex";
