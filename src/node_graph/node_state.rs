@@ -1,6 +1,6 @@
 //! Runtime state for node instances.
 
-use crate::{Data, Edge, EdgeId, InputSlotId, NodeId, OutputSlotId};
+use crate::{Data, DataType, DataValue, Edge, EdgeId, InputSlotId, NodeId, OutputSlotId, SlotDef};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -26,6 +26,10 @@ impl NodeState {
 #[derive(Debug, Default, Clone)]
 pub struct InputSlotState {
     pub id: InputSlotId,
+    pub label: &'static str,
+    pub data_type: DataType,
+    pub max_connections: Option<usize>,
+    pub default_value: Option<DataValue>,
     pub connected_edges: Vec<EdgeId>,
 }
 
@@ -33,6 +37,8 @@ pub struct InputSlotState {
 #[derive(Debug, Default, Clone)]
 pub struct OutputSlotState {
     pub id: OutputSlotId,
+    pub label: &'static str,
+    pub data_type: DataType,
     pub connected_edges: Vec<EdgeId>,
 }
 
@@ -61,39 +67,136 @@ impl NodeStates {
         Self::default()
     }
 
-    /// Add a new node.
+    /// Add a new node with slot metadata from `SlotDef` arrays.
     pub fn add_node(
         &mut self,
         node_id: NodeId,
         type_name: &'static str,
         default_data: Option<Data>,
-        input_count: usize,
-        output_count: usize,
+        input_defs: &[SlotDef],
+        output_defs: &[SlotDef],
     ) {
         self.nodes
             .insert(node_id, NodeState::new(type_name, default_data));
 
-        // Initialize input slot states
-        for i in 0..input_count {
+        // Initialize input slot states with metadata
+        for (i, def) in input_defs.iter().enumerate() {
             self.input_slots.insert(
                 (node_id, i),
                 InputSlotState {
                     id: InputSlotId::new(),
+                    label: def.label,
+                    data_type: def.data_type,
+                    max_connections: def.max_connections,
+                    default_value: None,
                     connected_edges: Vec::new(),
                 },
             );
         }
 
-        // Initialize output slot states
-        for i in 0..output_count {
+        // Initialize output slot states with metadata
+        for (i, def) in output_defs.iter().enumerate() {
             self.output_slots.insert(
                 (node_id, i),
                 OutputSlotState {
                     id: OutputSlotId::new(),
+                    label: def.label,
+                    data_type: def.data_type,
                     connected_edges: Vec::new(),
                 },
             );
         }
+    }
+
+    /// Add a dynamic input slot (for SubGraphNode).
+    pub fn add_input_slot(
+        &mut self,
+        node_id: &NodeId,
+        label: &'static str,
+        data_type: DataType,
+        max_connections: Option<usize>,
+    ) -> usize {
+        let index = self.input_slot_count(node_id);
+        self.input_slots.insert(
+            (*node_id, index),
+            InputSlotState {
+                id: InputSlotId::new(),
+                label,
+                data_type,
+                max_connections,
+                default_value: None,
+                connected_edges: Vec::new(),
+            },
+        );
+        index
+    }
+
+    /// Add a dynamic output slot (for SubGraphNode).
+    pub fn add_output_slot(
+        &mut self,
+        node_id: &NodeId,
+        label: &'static str,
+        data_type: DataType,
+    ) -> usize {
+        let index = self.output_slot_count(node_id);
+        self.output_slots.insert(
+            (*node_id, index),
+            OutputSlotState {
+                id: OutputSlotId::new(),
+                label,
+                data_type,
+                connected_edges: Vec::new(),
+            },
+        );
+        index
+    }
+
+    /// Remove a dynamic input slot by index and shift higher-indexed slots down.
+    pub fn remove_input_slot(&mut self, node_id: &NodeId, index: usize) {
+        let count = self.input_slot_count(node_id);
+        if index >= count {
+            return;
+        }
+        // Remove the slot at index
+        self.input_slots.remove(&(*node_id, index));
+        // Shift slots above index down by 1
+        for i in (index + 1)..count {
+            if let Some(slot) = self.input_slots.remove(&(*node_id, i)) {
+                self.input_slots.insert((*node_id, i - 1), slot);
+            }
+        }
+    }
+
+    /// Remove a dynamic output slot by index and shift higher-indexed slots down.
+    pub fn remove_output_slot(&mut self, node_id: &NodeId, index: usize) {
+        let count = self.output_slot_count(node_id);
+        if index >= count {
+            return;
+        }
+        // Remove the slot at index
+        self.output_slots.remove(&(*node_id, index));
+        // Shift slots above index down by 1
+        for i in (index + 1)..count {
+            if let Some(slot) = self.output_slots.remove(&(*node_id, i)) {
+                self.output_slots.insert((*node_id, i - 1), slot);
+            }
+        }
+    }
+
+    /// Count input slots for a node.
+    pub fn input_slot_count(&self, node_id: &NodeId) -> usize {
+        self.input_slots
+            .keys()
+            .filter(|(id, _)| id == node_id)
+            .count()
+    }
+
+    /// Count output slots for a node.
+    pub fn output_slot_count(&self, node_id: &NodeId) -> usize {
+        self.output_slots
+            .keys()
+            .filter(|(id, _)| id == node_id)
+            .count()
     }
 
     /// Remove a node, its slot states, and all connected edges.

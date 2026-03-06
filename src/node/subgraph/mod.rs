@@ -135,6 +135,12 @@ impl SubGraphNode {
             ..Default::default()
         };
         write_proxy.outputs_mut().push(output_slot);
+        drop(write_proxy);
+
+        // Sync internal graph's NodeStates for the proxy node
+        if let Ok(mut ns) = self.internal_graph.node_states().write() {
+            ns.add_output_slot(&self.input_proxy_id, label, data_type);
+        }
         Ok(())
     }
 
@@ -165,6 +171,14 @@ impl SubGraphNode {
                 data_type: proxy_data_type,
                 ..Default::default()
             });
+        }
+        drop(write_proxy);
+
+        // Sync internal graph's NodeStates for the proxy node
+        if let Ok(mut ns) = self.internal_graph.node_states().write() {
+            for _ in 0..proxy_count {
+                ns.add_output_slot(&self.input_proxy_id, proxy_label, proxy_data_type);
+            }
         }
         Ok(())
     }
@@ -199,6 +213,13 @@ impl SubGraphNode {
         }
         drop(write_proxy);
 
+        // Sync internal graph's NodeStates
+        if let Ok(mut ns) = self.internal_graph.node_states().write() {
+            for _ in 0..proxy_count {
+                ns.remove_output_slot(&self.input_proxy_id, proxy_start);
+            }
+        }
+
         // Remove from self
         self.inputs.remove(index);
         self.input_proxy_counts.remove(index);
@@ -230,6 +251,11 @@ impl SubGraphNode {
         }
         drop(write_proxy);
 
+        // Sync internal graph's NodeStates
+        if let Ok(mut ns) = self.internal_graph.node_states().write() {
+            ns.remove_input_slot(&self.output_proxy_id, index);
+        }
+
         // Remove from self
         self.outputs.remove(index);
 
@@ -255,6 +281,12 @@ impl SubGraphNode {
             ..Default::default()
         };
         write_proxy.inputs_mut().push(input_slot);
+        drop(write_proxy);
+
+        // Sync internal graph's NodeStates for the proxy node
+        if let Ok(mut ns) = self.internal_graph.node_states().write() {
+            ns.add_input_slot(&self.output_proxy_id, label, data_type, None);
+        }
         Ok(())
     }
 

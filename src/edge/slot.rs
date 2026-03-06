@@ -351,6 +351,11 @@ impl Data {
         }
     }
 
+    /// Consume this Data and return the inner `DataValue` (`Arc<dyn Any + Send + Sync>`).
+    pub fn into_value(self) -> DataValue {
+        self.value
+    }
+
     pub fn value<T: 'static>(&self) -> Result<&T, String> {
         match self.data_type {
             // Mesh, BRep, Domain hold arbitrary types; bypass TypeId check and downcast directly

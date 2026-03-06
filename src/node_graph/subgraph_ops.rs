@@ -120,12 +120,12 @@ impl NodeGraph {
             let data_type = self.get_edge_data_type(&first.edge)?;
             // Use source node's output slot label (e.g. Vertex→"Position", Number→"Value")
             let source_label = self
-                .get_node_by_id(&first.edge.from_node_id)
-                .and_then(|e| {
-                    e.read().ok().and_then(|g| {
-                        g.get_output_slot_by_index(first.edge.from_output_slot_index)
-                            .map(|s| s.label)
-                    })
+                .node_states
+                .read()
+                .ok()
+                .and_then(|ns| {
+                    ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
+                        .map(|s| s.label)
                 })
                 .unwrap_or("");
             let input_slot = InputSlot {
@@ -145,12 +145,12 @@ impl NodeGraph {
             let first = &group[0];
             let data_type = self.get_edge_data_type(&first.edge)?;
             let source_label = self
-                .get_node_by_id(&first.edge.from_node_id)
-                .and_then(|e| {
-                    e.read().ok().and_then(|g| {
-                        g.get_output_slot_by_index(first.edge.from_output_slot_index)
-                            .map(|s| s.label)
-                    })
+                .node_states
+                .read()
+                .ok()
+                .and_then(|ns| {
+                    ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
+                        .map(|s| s.label)
                 })
                 .unwrap_or("");
             let output_slot = OutputSlot {
@@ -191,10 +191,11 @@ impl NodeGraph {
         }
 
         let mut terminal_outputs: Vec<TerminalOutput> = Vec::new();
-        for &node_id in node_ids {
-            if let Some(node_entity) = self.get_node_by_id(&node_id) {
-                if let Ok(read_node) = node_entity.read() {
-                    for (slot_idx, slot) in read_node.outputs().iter().enumerate() {
+        if let Ok(ns) = self.node_states.read() {
+            for &node_id in node_ids {
+                let output_count = ns.output_slot_count(&node_id);
+                for slot_idx in 0..output_count {
+                    if let Some(slot) = ns.output_slot(&node_id, slot_idx) {
                         if !consumed_slots.contains(&(node_id, slot_idx))
                             && !slot.label.starts_with('_')
                         {
@@ -310,6 +311,17 @@ impl NodeGraph {
                 &output_proxy_id,
                 *proxy_input_idx,
             )?;
+        }
+
+        // Sync parent NodeStates with SubGraphNode's dynamic slots
+        {
+            let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+            for slot in &subgraph.inputs {
+                ns.add_input_slot(&subgraph_id, slot.label, slot.data_type, slot.max_connections);
+            }
+            for slot in &subgraph.outputs {
+                ns.add_output_slot(&subgraph_id, slot.label, slot.data_type);
+            }
         }
 
         // Release the write lock before modifying the parent graph
@@ -585,12 +597,9 @@ impl NodeGraph {
 
     /// Get the DataType for an edge by examining its source output slot.
     fn get_edge_data_type(&self, edge: &Edge) -> Result<DataType, String> {
-        let node = self
-            .get_node_by_id(&edge.from_node_id)
-            .ok_or("Edge source node not found")?;
-        let read_node = node.read().map_err(|e| e.to_string())?;
-        let slot = read_node
-            .get_output_slot_by_index(edge.from_output_slot_index)
+        let ns = self.node_states.read().map_err(|e| e.to_string())?;
+        let slot = ns
+            .output_slot(&edge.from_node_id, edge.from_output_slot_index)
             .ok_or("Edge source output slot not found")?;
         Ok(slot.data_type)
     }

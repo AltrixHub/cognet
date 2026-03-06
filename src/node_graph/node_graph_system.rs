@@ -1,4 +1,4 @@
-use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodeGraphAPI, NodeId};
+use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
@@ -99,37 +99,22 @@ impl NodeGraphSystem for NodeGraph {
     ) -> Result<Edge, &'static str> {
         tracing::debug!("[cognet] create_edge: START");
 
-        let from_output_slot_id = {
-            tracing::debug!("[cognet] create_edge: getting from_node...");
-            let node = self
-                .get_node_by_id(from_node_id)
-                .ok_or("From node not found")?;
-            tracing::debug!("[cognet] create_edge: got from_node, acquiring read lock...");
-            let read_node = node.read().map_err(|_| "Failed to acquire read lock")?;
-            tracing::debug!("[cognet] create_edge: from_node read lock acquired");
-            read_node
-                .outputs()
-                .get(from_output_slot_index)
-                .ok_or("Invalid output slot index")?
-                .id
-                .clone()
-        };
+        let ns = self
+            .node_states
+            .read()
+            .map_err(|_| "Failed to read node states")?;
 
-        let to_input_slot_id = {
-            tracing::debug!("[cognet] create_edge: getting to_node...");
-            let node = self
-                .get_node_by_id(to_node_id)
-                .ok_or("To node not found")?;
-            tracing::debug!("[cognet] create_edge: got to_node, acquiring read lock...");
-            let read_node = node.read().map_err(|_| "Failed to acquire read lock")?;
-            tracing::debug!("[cognet] create_edge: to_node read lock acquired");
-            read_node
-                .inputs()
-                .get(to_input_slot_index)
-                .ok_or("Invalid input slot index")?
-                .id
-                .clone()
-        };
+        let from_output_slot_id = ns
+            .output_slot(from_node_id, from_output_slot_index)
+            .ok_or("Invalid output slot index")?
+            .id;
+
+        let to_input_slot_id = ns
+            .input_slot(to_node_id, to_input_slot_index)
+            .ok_or("Invalid input slot index")?
+            .id;
+
+        drop(ns);
 
         tracing::debug!("[cognet] create_edge: DONE");
         Ok(Edge {
@@ -154,108 +139,85 @@ impl NodeGraphSystem for NodeGraph {
         };
         self.clear_error(&input_target);
 
-        tracing::debug!("[cognet] add_edge: getting from_node...");
-        let from_node = match self.node_manager.get_node_by_id(&from_node_id) {
-            Some(node) => node,
-            None => {
+        // Validate slots and check constraints using NodeStates
+        {
+            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+
+            // Validate from node exists
+            if ns.get(&from_node_id).is_none() {
                 let error = GraphError::node_not_found(from_node_id);
                 let msg = error.message();
                 self.add_error(error);
                 return Err(msg);
             }
-        };
-        tracing::debug!("[cognet] add_edge: got from_node");
 
-        tracing::debug!("[cognet] add_edge: getting to_node...");
-        let to_node = match self.node_manager.get_node_by_id(&to_node_id) {
-            Some(node) => node,
-            None => {
+            // Validate to node exists
+            if ns.get(&to_node_id).is_none() {
                 let error = GraphError::node_not_found(to_node_id);
                 let msg = error.message();
                 self.add_error(error);
                 return Err(msg);
             }
-        };
-        tracing::debug!("[cognet] add_edge: got to_node");
 
-        tracing::debug!("[cognet] add_edge: acquiring from_node read lock...");
-        let read_from_node = from_node.read().map_err(|e| e.to_string())?;
-        tracing::debug!("[cognet] add_edge: from_node read lock acquired");
-        let from_slot = match read_from_node.get_output_slot_by_index(edge.from_output_slot_index)
-        {
-            Some(slot) => slot,
-            None => {
-                let error =
-                    GraphError::output_slot_not_found(from_node_id, edge.from_output_slot_index);
-                let msg = error.message();
-                self.add_error(error);
-                return Err(msg);
-            }
-        };
+            // Validate output slot
+            let from_slot = match ns.output_slot(&from_node_id, edge.from_output_slot_index) {
+                Some(slot) => slot,
+                None => {
+                    let error = GraphError::output_slot_not_found(
+                        from_node_id,
+                        edge.from_output_slot_index,
+                    );
+                    let msg = error.message();
+                    self.add_error(error);
+                    return Err(msg);
+                }
+            };
 
-        tracing::debug!("[cognet] add_edge: acquiring to_node read lock...");
-        let read_to_node = to_node.read().map_err(|e| e.to_string())?;
-        tracing::debug!("[cognet] add_edge: to_node read lock acquired");
-        let to_slot = match read_to_node.get_input_slot_by_index(edge.to_input_slot_index) {
-            Some(slot) => slot,
-            None => {
-                let error =
-                    GraphError::input_slot_not_found(to_node_id, edge.to_input_slot_index);
-                let msg = error.message();
-                self.add_error(error);
-                return Err(msg);
-            }
-        };
+            // Validate input slot
+            let to_slot = match ns.input_slot(&to_node_id, edge.to_input_slot_index) {
+                Some(slot) => slot,
+                None => {
+                    let error =
+                        GraphError::input_slot_not_found(to_node_id, edge.to_input_slot_index);
+                    let msg = error.message();
+                    self.add_error(error);
+                    return Err(msg);
+                }
+            };
 
-        // Check type compatibility
-        if from_slot.data_type != to_slot.data_type {
-            let error = GraphError::type_mismatch(
-                to_node_id,
-                edge.to_input_slot_index,
-                from_slot.data_type,
-                to_slot.data_type,
-            );
-            let msg = error.message();
-            self.add_error(error);
-            return Err(msg);
-        }
-
-        // Check max_connections limit BEFORE adding the edge
-        if let Some(max) = to_slot.max_connections() {
-            let current_count = self
-                .node_states
-                .read()
-                .ok()
-                .map(|s| {
-                    s.input_slot(&to_node_id, edge.to_input_slot_index)
-                        .map(|slot| slot.connected_edges.len())
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-            if current_count >= *max {
-                let error = GraphError::connection_limit_exceeded(
+            // Check type compatibility
+            if from_slot.data_type != to_slot.data_type {
+                let error = GraphError::type_mismatch(
                     to_node_id,
                     edge.to_input_slot_index,
-                    *max,
+                    from_slot.data_type,
+                    to_slot.data_type,
                 );
                 let msg = error.message();
                 self.add_error(error);
                 return Err(msg);
             }
-        }
 
-        // Release the read locks before acquiring write lock
-        drop(read_from_node);
-        drop(read_to_node);
+            // Check max_connections limit BEFORE adding the edge
+            if let Some(max) = to_slot.max_connections {
+                if to_slot.connected_edges.len() >= max {
+                    let error = GraphError::connection_limit_exceeded(
+                        to_node_id,
+                        edge.to_input_slot_index,
+                        max,
+                    );
+                    let msg = error.message();
+                    self.add_error(error);
+                    return Err(msg);
+                }
+            }
+        }
 
         let edge_id = EdgeId::new();
 
         // Update NodeStates (edge storage + slot connected_edges + indexes)
         {
-            let mut guard = self
-                .node_states
-                .write()
-                .map_err(|e| e.to_string())?;
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             guard.add_edge(edge_id, edge.clone());
         }
 

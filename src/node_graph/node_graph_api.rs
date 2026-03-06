@@ -9,7 +9,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, ExecutionContext, GraphError, Node,
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, ExecutionContext, GraphError,
     NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta, OutputWriter, SharedExecutionCache,
     SharedNodeStates, SubGraphNode,
 };
@@ -66,20 +66,20 @@ impl GraphChanges {
 /// using NodeStates for edge topology and ExecutionCache for output values.
 /// Captures node_data and creates an OutputWriter for the node's output slots.
 fn build_execution_context(
-    node_read: &dyn Node,
+    node_id: &NodeId,
     node_states: &SharedNodeStates,
     cache: &SharedExecutionCache,
 ) -> Result<ExecutionContext, String> {
-    // Resolve input values: edges from NodeStates, output data from cache
-    let input_values = {
-        let ns = node_states.read().map_err(|e| e.to_string())?;
-        let cache_read = cache.read()?;
-        node_read
-            .inputs()
-            .iter()
-            .map(|input_slot| {
-                let mut values = Vec::new();
-                for edge_id in ns.edges_for_input(&input_slot.id) {
+    let ns = node_states.read().map_err(|e| e.to_string())?;
+    let cache_read = cache.read()?;
+
+    // Resolve input values from NodeStates slot metadata
+    let input_count = ns.input_slot_count(node_id);
+    let input_values = (0..input_count)
+        .map(|idx| {
+            let mut values = Vec::new();
+            if let Some(slot_state) = ns.input_slot(node_id, idx) {
+                for edge_id in ns.edges_for_input(&slot_state.id) {
                     if let Some(edge) = ns.get_edge(edge_id) {
                         if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
                             values.push(data.share());
@@ -88,25 +88,29 @@ fn build_execution_context(
                 }
                 // Default value fallback when no edges are connected
                 if values.is_empty() {
-                    if let Some(default_ref) = input_slot.default_value.as_ref() {
+                    if let Some(default_ref) = slot_state.default_value.as_ref() {
                         if let Ok(data) = Data::from_any(Arc::clone(default_ref)) {
                             values.push(data);
                         }
                     }
                 }
-                values
-            })
-            .collect()
-    };
+            }
+            values
+        })
+        .collect();
 
-    // Capture node data
-    let node_data = node_read.node_data();
+    // Capture node data from NodeStates
+    let node_data = ns
+        .get(node_id)
+        .and_then(|state| state.data.as_ref().map(|d| d.share()));
 
-    // Build output writer from output slot metadata
-    let slots = node_read
-        .outputs()
-        .iter()
-        .map(|s| (s.id, s.data_type))
+    // Build output writer from NodeStates output slot metadata
+    let output_count = ns.output_slot_count(node_id);
+    let slots = (0..output_count)
+        .filter_map(|idx| {
+            ns.output_slot(node_id, idx)
+                .map(|s| (s.id, s.data_type))
+        })
         .collect();
     let output_writer = OutputWriter::new(cache.share(), slots);
 
@@ -265,7 +269,7 @@ impl NodeGraphAPI for NodeGraph {
                                         .await
                                     } else {
                                         match build_execution_context(
-                                            &*node_read,
+                                            &node_id,
                                             &shared_node_states,
                                             &shared_cache,
                                         ) {
@@ -348,7 +352,7 @@ impl NodeGraphAPI for NodeGraph {
                                                         .await
                                                     } else {
                                                         match build_execution_context(
-                                                            &*node_read,
+                                                            &node_id,
                                                             &ns_clone,
                                                             &cache_clone,
                                                         ) {
@@ -407,11 +411,12 @@ impl NodeGraphAPI for NodeGraph {
 
         // Collect outputs from executed nodes (Arc-shared for zero-copy)
         let mut outputs = Vec::new();
-        for node_id in &executed_node_ids {
-            if let Some(node) = self.node_manager.get_node_by_id(node_id) {
-                if let Ok(read_node) = node.read() {
-                    for (idx, slot) in read_node.outputs().iter().enumerate() {
-                        if let Ok(cache) = shared_cache.read() {
+        if let Ok(ns) = shared_node_states.read() {
+            if let Ok(cache) = shared_cache.read() {
+                for node_id in &executed_node_ids {
+                    let output_count = ns.output_slot_count(node_id);
+                    for idx in 0..output_count {
+                        if let Some(slot) = ns.output_slot(node_id, idx) {
                             if let Some(data) = cache.outputs.get(&slot.id) {
                                 outputs.push(NodeOutput {
                                     node_id: *node_id,
@@ -441,8 +446,8 @@ impl NodeGraphAPI for NodeGraph {
                 node_id,
                 T::NAME,
                 T::DEFAULT_VALUE.to_data(),
-                T::INPUTS.len(),
-                T::OUTPUTS.len(),
+                T::INPUTS,
+                T::OUTPUTS,
             );
         }
 
@@ -464,8 +469,8 @@ impl NodeGraphAPI for NodeGraph {
                 node_id,
                 type_info.name,
                 default_data,
-                type_info.inputs.len(),
-                type_info.outputs.len(),
+                type_info.inputs,
+                type_info.outputs,
             );
         }
 
@@ -494,18 +499,19 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
-        let node = self
-            .node_manager
-            .get_node_by_id(node_id)
-            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-        let mut write_node = node.write().map_err(|e| e.to_string())?;
-        write_node.set_node_data(data.share())?;
-
-        // Update NodeStates
+        // Write to NodeStates (source of truth)
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            if let Some(node_state) = guard.get_mut(node_id) {
-                node_state.data = Some(data);
+            let node_state = guard
+                .get_mut(node_id)
+                .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
+            node_state.data = Some(data.share());
+        }
+
+        // Also update NodeEntity (backward compatibility for SubGraphNode)
+        if let Some(node) = self.node_manager.get_node_by_id(node_id) {
+            if let Ok(mut write_node) = node.write() {
+                let _ = write_node.set_node_data(data);
             }
         }
 
@@ -520,12 +526,22 @@ impl NodeGraphAPI for NodeGraph {
         slot_index: usize,
         data: Data,
     ) -> Result<(), String> {
-        let node = self
-            .node_manager
-            .get_node_by_id(node_id)
-            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-        let mut write_node = node.write().map_err(|e| e.to_string())?;
-        write_node.set_input_slot_default_data(slot_index, data)?;
+        // Write to NodeStates (source of truth)
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            let slot = guard
+                .input_slot_mut(node_id, slot_index)
+                .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
+            slot.default_value = Some(data.share().into_value());
+        }
+
+        // Also update NodeEntity (backward compatibility for SubGraphNode)
+        if let Some(node) = self.node_manager.get_node_by_id(node_id) {
+            if let Ok(mut write_node) = node.write() {
+                let _ = write_node.set_input_slot_default_data(slot_index, data);
+            }
+        }
+
         let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
         Ok(())
@@ -582,12 +598,13 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
-        let node = self.get_node_by_id(node_id)?;
-        let read_node = node.read().ok()?;
-        let slot = read_node.outputs().get(output_slot_index)?;
+        let ns = self.node_states.read().ok()?;
+        let slot = ns.output_slot(node_id, output_slot_index)?;
+        let slot_id = slot.id;
+        drop(ns);
 
         let cache = self.cache.read().ok()?;
-        cache.outputs.get(&slot.id).map(|data| data.share())
+        cache.outputs.get(&slot_id).map(|data| data.share())
     }
 
     fn node_variants(&self) -> &HashSet<String> {

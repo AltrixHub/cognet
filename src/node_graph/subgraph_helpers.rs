@@ -142,7 +142,13 @@ impl NodeGraph {
             data_type,
             ..Default::default()
         };
-        sg.add_input(slot)
+        sg.add_input(slot)?;
+        drop(guard);
+        // Sync parent NodeStates
+        if let Ok(mut ns) = self.node_states.write() {
+            ns.add_input_slot(node_id, label, data_type, None);
+        }
+        Ok(())
     }
 
     /// Remove an input port from a SubGraphNode by index.
@@ -159,7 +165,13 @@ impl NodeGraph {
             .as_any_mut()
             .downcast_mut::<SubGraphNode>()
             .ok_or("Node is not a SubGraphNode")?;
-        sg.remove_input(index)
+        sg.remove_input(index)?;
+        drop(guard);
+        // Sync parent NodeStates
+        if let Ok(mut ns) = self.node_states.write() {
+            ns.remove_input_slot(node_id, index);
+        }
+        Ok(())
     }
 
     /// Add an output port to a SubGraphNode.
@@ -182,7 +194,13 @@ impl NodeGraph {
             data_type,
             ..Default::default()
         };
-        sg.add_output(slot)
+        sg.add_output(slot)?;
+        drop(guard);
+        // Sync parent NodeStates
+        if let Ok(mut ns) = self.node_states.write() {
+            ns.add_output_slot(node_id, label, data_type);
+        }
+        Ok(())
     }
 
     /// Remove an output port from a SubGraphNode by index.
@@ -199,7 +217,13 @@ impl NodeGraph {
             .as_any_mut()
             .downcast_mut::<SubGraphNode>()
             .ok_or("Node is not a SubGraphNode")?;
-        sg.remove_output(index)
+        sg.remove_output(index)?;
+        drop(guard);
+        // Sync parent NodeStates
+        if let Ok(mut ns) = self.node_states.write() {
+            ns.remove_output_slot(node_id, index);
+        }
+        Ok(())
     }
 
     /// Set the default value for a SubGraphNode input port.
@@ -209,6 +233,16 @@ impl NodeGraph {
         input_index: usize,
         data: Data,
     ) -> Result<(), String> {
+        // Write to NodeStates (source of truth)
+        {
+            let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+            let slot = ns
+                .input_slot_mut(node_id, input_index)
+                .ok_or_else(|| format!("Input slot {} not found for node {:?}", input_index, node_id))?;
+            slot.default_value = Some(data.share().into_value());
+        }
+
+        // Also update NodeEntity (backward compatibility)
         let entity = self
             .get_node_by_id(node_id)
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
