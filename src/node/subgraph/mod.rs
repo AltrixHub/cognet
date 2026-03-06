@@ -13,8 +13,9 @@ pub use output_proxy::SubGraphOutputNode;
 use std::sync::Arc;
 
 use crate::{
-    Data, DataType, InputSlot, NodeCategory, NodeCore, NodeGraph, NodeGraphAPI, NodeId, NodeImpl,
-    NodeManager, NodeMeta, NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
+    Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeCore, NodeGraph, NodeGraphAPI,
+    NodeId, NodeImpl, NodeManager, NodeMeta, NodeValueSetter, OutputSlot, SharedExecutionCache,
+    SlotDef,
 };
 
 /// A node that contains a nested NodeGraph.
@@ -400,22 +401,10 @@ impl NodeMeta for SubGraphNode {
 
 #[async_trait::async_trait]
 impl NodeImpl for SubGraphNode {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        // 1. Inject external inputs into internal input proxy outputs
-        self.inject_inputs(cache.share())?;
-
-        // 2. Execute the internal graph
-        // Note: We need mutable access for execute(), but we only have &self.
-        // The internal graph's dirty nodes are all nodes since we inject fresh inputs.
-        // We use the shared cache directly instead.
-        //
-        // For now, mark all internal nodes as dirty by creating a temporary mutable graph.
-        // This is a limitation - in practice, the UI layer will call execute() on
-        // the parent graph which owns SubGraphNode mutably.
-
-        // 3. Collect outputs from internal output proxy
-        self.collect_outputs(cache)?;
-
+    async fn execute(&self, _ctx: ExecutionContext) -> Result<(), String> {
+        // SubGraphNode execution is handled by execute_internal() which is called
+        // directly by the execution engine with the parent cache.
+        // This NodeImpl::execute() is not called for SubGraphNode.
         Ok(())
     }
 }

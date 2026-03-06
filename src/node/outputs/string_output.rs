@@ -1,6 +1,6 @@
 use crate::{
-    register_nodes, Data, DataType, InputSlot, NodeCategory, NodeCore, NodeImpl, NodeMeta,
-    OutputSlot, SharedExecutionCache, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
+    OutputSlot, SlotDef,
 };
 
 #[derive(Debug)]
@@ -23,9 +23,8 @@ impl NodeMeta for StringOutput {
 
 #[async_trait::async_trait]
 impl NodeImpl for StringOutput {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
+    async fn execute(&self, _ctx: ExecutionContext) -> Result<(), String> {
         // Output node just reads its input - the value is read from cache for UI display
-        let _values = self.input_value(cache, 0)?;
         Ok(())
     }
 }

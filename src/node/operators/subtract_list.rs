@@ -1,6 +1,6 @@
 use crate::{
-    register_nodes, Data, DataType, InputSlot, NodeCategory, NodeCore, NodeImpl, NodeMeta,
-    NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
+    OutputSlot, SlotDef,
 };
 
 /// Subtracts all subsequent numbers from the first number
@@ -28,17 +28,17 @@ impl NodeMeta for SubtractListNode {
 
 #[async_trait::async_trait]
 impl NodeImpl for SubtractListNode {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        let data_list = self.input_value(cache.share(), 0)?;
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+        let data_list = ctx.input_values.get(0).cloned().unwrap_or_default();
         let mut result: Option<f64> = None;
-        for data in data_list {
+        for data in &data_list {
             let value: f64 = *data.value()?;
             match result {
                 None => result = Some(value),
                 Some(r) => result = Some(r - value),
             }
         }
-        self.set_output_data(cache, 0, Data::new(result.unwrap_or(0.0))?)?;
+        ctx.output_writer.set(0, Data::new(result.unwrap_or(0.0))?)?;
         Ok(())
     }
 }

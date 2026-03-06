@@ -4,8 +4,8 @@
 //! which is passed through to the output.
 
 use crate::{
-    register_nodes, Data, DataType, DefaultValue, InputSlot, NodeCategory, NodeCore, NodeImpl,
-    NodeMeta, NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
+    register_nodes, Data, DataType, DefaultValue, ExecutionContext, InputSlot, NodeCategory,
+    NodeImpl, NodeMeta, OutputSlot, SlotDef,
 };
 
 /// A Color value node that outputs an RGBA color.
@@ -35,9 +35,9 @@ impl NodeMeta for ColorNode {
 
 #[async_trait::async_trait]
 impl NodeImpl for ColorNode {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        let node_data = self.node_data().ok_or("Failed to get node data")?;
-        self.set_output_data(cache, 0, node_data)?;
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+        let node_data = ctx.node_data.ok_or("Failed to get node data")?;
+        ctx.output_writer.set(0, node_data)?;
         Ok(())
     }
 }

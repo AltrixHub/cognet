@@ -1,16 +1,18 @@
+pub mod execution_context;
 pub mod operators;
 pub mod outputs;
 pub mod primitives;
 pub mod subgraph;
 pub mod type_info;
 
+pub use execution_context::*;
 pub use operators::*;
 pub use outputs::*;
 pub use primitives::*;
 pub use subgraph::*;
 pub use type_info::*;
 
-use crate::{impl_entity_id, AsAny, Data, InputSlot, NodeManager, OutputSlot, SharedExecutionCache};
+use crate::{impl_entity_id, AsAny, Data, InputSlot, NodeManager, OutputSlot};
 use std::{any::Any, fmt::Debug};
 
 impl_entity_id!(NodeId);
@@ -30,7 +32,7 @@ pub trait NodeInit: NodeMeta + Sized {
 /// Only requires `execute()` - initialization is handled by `NodeInit`.
 #[async_trait::async_trait]
 pub trait NodeImpl: Debug + Send + Sync + AsAny {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String>;
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String>;
 }
 
 impl dyn NodeImpl {
@@ -44,40 +46,6 @@ impl dyn NodeImpl {
 }
 
 pub trait NodeCore: Debug {
-    fn input_value(
-        &self,
-        cache: SharedExecutionCache,
-        slot_index: usize,
-    ) -> Result<Vec<Data>, String> {
-        let input_slot = self
-            .inputs()
-            .get(slot_index)
-            .ok_or("Invalid slot index".to_string())?;
-
-        let expected_type = input_slot.data_type;
-
-        let cache = cache.read()?;
-        let mut result: Vec<Data> = Vec::new();
-
-        for edge_id in cache.edges_for_input(&input_slot.id) {
-            if let Some(edge) = cache.edges.get(edge_id) {
-                if let Some(data) = cache.outputs.get(&edge.from_output_slot_id) {
-                    // Validate type matches
-                    if data.get_type() != expected_type {
-                        return Err(format!(
-                            "Type mismatch: expected {:?}, got {:?}",
-                            expected_type,
-                            data.get_type()
-                        ));
-                    }
-                    result.push(data.share());
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
     fn get_input_slot_by_index(&self, input_slot_index: usize) -> Option<&InputSlot> {
         self.inputs().get(input_slot_index)
     }
@@ -129,33 +97,6 @@ pub trait NodeValueSetter: NodeCore {
     fn set_node_data(&mut self, data: Data) -> Result<(), String> {
         *self.node_data_mut() = Some(data);
         Ok(())
-    }
-
-    fn set_output_data(
-        &self,
-        cache: SharedExecutionCache,
-        slot_index: usize,
-        data: Data,
-    ) -> Result<(), String> {
-        if let Some(slot) = self.outputs().get(slot_index) {
-            if slot.data_type == data.get_type() {
-                cache.lock()?.outputs.insert(slot.id, data);
-                Ok(())
-            } else {
-                Err(format!(
-                    "Data type mismatch: expected {:?}, but got {:?} in {}",
-                    slot.data_type,
-                    data.get_type(),
-                    std::any::type_name::<Self>()
-                ))
-            }
-        } else {
-            Err(format!(
-                "Index out of range: {} in {}",
-                slot_index,
-                std::any::type_name::<Self>()
-            ))
-        }
     }
 }
 
@@ -252,7 +193,7 @@ macro_rules! register_nodes {
             // Register factory for node creation
             inventory::submit! {
                 $crate::NodeRegistrationEntry {
-                    register: $struct_name::register_in,
+                    register: <$struct_name as $crate::NodeCore>::register_in,
                 }
             }
         )*

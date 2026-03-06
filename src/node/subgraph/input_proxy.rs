@@ -5,8 +5,8 @@
 
 #[allow(unused_imports)]
 use crate::{
-    Data, DefaultValue, InputSlot, NodeCategory, NodeCore, NodeImpl, NodeMeta, NodeValueSetter,
-    OutputSlot, SharedExecutionCache, SlotDef,
+    Data, DefaultValue, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta, OutputSlot,
+    SlotDef,
 };
 
 /// Proxy node inside a subgraph that bridges external inputs.
@@ -31,7 +31,7 @@ impl NodeMeta for SubGraphInputNode {
 
 #[async_trait::async_trait]
 impl NodeImpl for SubGraphInputNode {
-    async fn execute(&self, _cache: SharedExecutionCache) -> Result<(), String> {
+    async fn execute(&self, _ctx: ExecutionContext) -> Result<(), String> {
         // Data is injected directly into outputs by SubGraphNode before execution.
         // This node's execute is a no-op.
         Ok(())

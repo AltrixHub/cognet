@@ -9,8 +9,9 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, GraphError, NodeEntity, NodeGraph,
-    NodeId, NodeImpl, NodeMeta, SubGraphNode,
+    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, ExecutionContext, GraphError, Node,
+    NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta, OutputWriter, SharedExecutionCache,
+    SubGraphNode,
 };
 
 /// Execution event for progress tracking during graph execution.
@@ -57,6 +58,60 @@ impl GraphChanges {
     pub fn is_empty(&self) -> bool {
         self.outputs.is_empty() && self.removed_nodes.is_empty()
     }
+}
+
+/// Build an `ExecutionContext` for a node from the shared cache.
+///
+/// Resolves all input values from upstream outputs (with default value fallback),
+/// captures node_data, and creates an OutputWriter for the node's output slots.
+fn build_execution_context(
+    node_read: &dyn Node,
+    cache: &SharedExecutionCache,
+) -> Result<ExecutionContext, String> {
+    // Resolve input values from cache
+    let input_values = {
+        let cache_read = cache.read()?;
+        node_read
+            .inputs()
+            .iter()
+            .map(|input_slot| {
+                let mut values = Vec::new();
+                for edge_id in cache_read.edges_for_input(&input_slot.id) {
+                    if let Some(edge) = cache_read.edges.get(edge_id) {
+                        if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
+                            values.push(data.share());
+                        }
+                    }
+                }
+                // Default value fallback when no edges are connected
+                if values.is_empty() {
+                    if let Some(default_ref) = input_slot.default_value.as_ref() {
+                        if let Ok(data) = Data::from_any(Arc::clone(default_ref)) {
+                            values.push(data);
+                        }
+                    }
+                }
+                values
+            })
+            .collect()
+    };
+
+    // Capture node data
+    let node_data = node_read.node_data();
+
+    // Build output writer from output slot metadata
+    let slots = node_read
+        .outputs()
+        .iter()
+        .map(|s| (s.id, s.data_type))
+        .collect();
+    let output_writer = OutputWriter::new(cache.share(), slots);
+
+    Ok(ExecutionContext {
+        node_data,
+        input_values,
+        output_writer,
+    })
 }
 
 #[async_trait]
@@ -200,7 +255,10 @@ impl NodeGraphAPI for NodeGraph {
                                     {
                                         sg.execute_internal(shared_cache.share()).await
                                     } else {
-                                        node_read.execute(shared_cache.share()).await
+                                        match build_execution_context(&*node_read, &shared_cache) {
+                                            Ok(ctx) => node_read.execute(ctx).await,
+                                            Err(e) => Err(e),
+                                        }
                                     }
                                 } else {
                                     Ok(())
@@ -270,7 +328,15 @@ impl NodeGraphAPI for NodeGraph {
                                                     {
                                                         sg.execute_internal(cache_clone).await
                                                     } else {
-                                                        node_read.execute(cache_clone).await
+                                                        match build_execution_context(
+                                                            &*node_read,
+                                                            &cache_clone,
+                                                        ) {
+                                                            Ok(ctx) => {
+                                                                node_read.execute(ctx).await
+                                                            }
+                                                            Err(e) => Err(e),
+                                                        }
                                                     }
                                                 })
                                             }),

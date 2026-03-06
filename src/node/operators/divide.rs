@@ -3,8 +3,8 @@
 //! Divides A by B. Returns 0.0 when B is zero.
 
 use crate::{
-    register_nodes, Data, DataType, InputSlot, NodeCategory, NodeCore, NodeImpl, NodeMeta,
-    NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeImpl, NodeMeta,
+    OutputSlot, SlotDef,
 };
 
 /// Divides A by B (A / B)
@@ -39,24 +39,19 @@ impl NodeMeta for DivideNode {
 
 #[async_trait::async_trait]
 impl NodeImpl for DivideNode {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        let a_values = self.input_value(cache.share(), 0)?;
-        let b_values = self.input_value(cache.share(), 1)?;
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+        let a: f64 = ctx.input_values.get(0)
+            .and_then(|v| v.first())
+            .and_then(|d| d.value::<f64>().ok().copied())
+            .unwrap_or(0.0);
 
-        let mut a: f64 = 0.0;
-        for data in a_values {
-            a = *data.value()?;
-            break;
-        }
-
-        let mut b: f64 = 0.0;
-        for data in b_values {
-            b = *data.value()?;
-            break;
-        }
+        let b: f64 = ctx.input_values.get(1)
+            .and_then(|v| v.first())
+            .and_then(|d| d.value::<f64>().ok().copied())
+            .unwrap_or(0.0);
 
         let result = if b == 0.0 { 0.0 } else { a / b };
-        self.set_output_data(cache, 0, Data::new(result)?)?;
+        ctx.output_writer.set(0, Data::new(result)?)?;
         Ok(())
     }
 }
