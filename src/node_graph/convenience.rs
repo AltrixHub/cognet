@@ -18,13 +18,13 @@ impl NodeGraph {
 
     /// Get all edges as `EdgeInfo` structs.
     ///
-    /// Reads from ExecutionCache (sole owner of edge data).
+    /// Reads from NodeStates (sole owner of edge data).
     pub fn edges_info(&self) -> Vec<EdgeInfo> {
-        self.cache
+        self.node_states
             .read()
             .map(|guard| {
                 guard
-                    .edges
+                    .edges()
                     .iter()
                     .map(|(id, edge)| EdgeInfo {
                         id: *id,
@@ -40,8 +40,8 @@ impl NodeGraph {
 
     /// Get a specific edge by ID as `EdgeInfo`.
     pub fn edge_info(&self, edge_id: &EdgeId) -> Option<EdgeInfo> {
-        self.cache.read().ok().and_then(|guard| {
-            guard.edges.get(edge_id).map(|edge| EdgeInfo {
+        self.node_states.read().ok().and_then(|guard| {
+            guard.get_edge(edge_id).map(|edge| EdgeInfo {
                 id: *edge_id,
                 from_node: edge.from_node_id,
                 from_output: edge.from_output_slot_index,

@@ -396,12 +396,11 @@ impl NodeGraph {
         let internal_graph = subgraph.internal_graph();
 
         // 2. Collect internal nodes (excluding proxies)
-        let internal_cache = internal_graph.shared_cache();
-        let internal_cache_read = internal_cache.read()?;
+        let internal_ns = internal_graph.node_states().read().map_err(|e| e.to_string())?;
 
         // Get all internal node IDs by examining edges
         let mut internal_node_ids: HashSet<NodeId> = HashSet::new();
-        for edge in internal_cache_read.edges.values() {
+        for edge in internal_ns.edges().values() {
             if edge.from_node_id != input_proxy_id && edge.from_node_id != output_proxy_id {
                 internal_node_ids.insert(edge.from_node_id);
             }
@@ -413,7 +412,7 @@ impl NodeGraph {
         // 3. Collect edge info we need before dropping locks
         // Edges from InputProxy → internal (maps proxy output slot → internal node/slot)
         let mut input_proxy_edges: Vec<(usize, NodeId, usize)> = Vec::new(); // (proxy_out_idx, to_node, to_slot)
-        for edge in internal_cache_read.edges.values() {
+        for edge in internal_ns.edges().values() {
             if edge.from_node_id == input_proxy_id {
                 input_proxy_edges.push((
                     edge.from_output_slot_index,
@@ -425,7 +424,7 @@ impl NodeGraph {
 
         // Edges from internal → OutputProxy (maps internal node/slot → proxy input slot)
         let mut output_proxy_edges: Vec<(NodeId, usize, usize)> = Vec::new(); // (from_node, from_slot, proxy_in_idx)
-        for edge in internal_cache_read.edges.values() {
+        for edge in internal_ns.edges().values() {
             if edge.to_node_id == output_proxy_id {
                 output_proxy_edges.push((
                     edge.from_node_id,
@@ -437,7 +436,7 @@ impl NodeGraph {
 
         // Internal edges (between non-proxy nodes)
         let mut internal_edges: Vec<(NodeId, usize, NodeId, usize)> = Vec::new();
-        for edge in internal_cache_read.edges.values() {
+        for edge in internal_ns.edges().values() {
             if edge.from_node_id != input_proxy_id
                 && edge.to_node_id != output_proxy_id
                 && internal_node_ids.contains(&edge.from_node_id)
@@ -462,15 +461,14 @@ impl NodeGraph {
             }
         }
 
-        drop(internal_cache_read);
+        drop(internal_ns);
 
         // 4. Collect parent graph edges to/from SubGraphNode
-        let parent_cache = self.shared_cache();
-        let parent_cache_read = parent_cache.read()?;
+        let parent_ns = self.node_states().read().map_err(|e| e.to_string())?;
 
         // Edges entering SubGraphNode (external → subgraph.input[idx])
         let mut parent_incoming: Vec<(NodeId, usize, usize, EdgeId)> = Vec::new(); // (from_node, from_slot, to_slot_idx, edge_id)
-        for (&edge_id, edge) in &parent_cache_read.edges {
+        for (&edge_id, edge) in parent_ns.edges() {
             if edge.to_node_id == subgraph_node_id {
                 parent_incoming.push((
                     edge.from_node_id,
@@ -483,7 +481,7 @@ impl NodeGraph {
 
         // Edges leaving SubGraphNode (subgraph.output[idx] → external)
         let mut parent_outgoing: Vec<(usize, NodeId, usize, EdgeId)> = Vec::new(); // (from_slot_idx, to_node, to_slot, edge_id)
-        for (&edge_id, edge) in &parent_cache_read.edges {
+        for (&edge_id, edge) in parent_ns.edges() {
             if edge.from_node_id == subgraph_node_id {
                 parent_outgoing.push((
                     edge.from_output_slot_index,
@@ -494,7 +492,7 @@ impl NodeGraph {
             }
         }
 
-        drop(parent_cache_read);
+        drop(parent_ns);
         drop(read_subgraph);
 
         // 5. Create copies of internal nodes in parent graph
@@ -555,14 +553,13 @@ impl NodeGraph {
         &self,
         selected: &HashSet<NodeId>,
     ) -> Result<(Vec<BoundaryEdge>, Vec<BoundaryEdge>, Vec<BoundaryEdge>), String> {
-        let cache = self.shared_cache();
-        let cache_read = cache.read()?;
+        let ns = self.node_states().read().map_err(|e| e.to_string())?;
 
         let mut incoming = Vec::new(); // external → selected
         let mut outgoing = Vec::new(); // selected → external
         let mut internal = Vec::new(); // selected → selected
 
-        for (&edge_id, edge) in &cache_read.edges {
+        for (&edge_id, edge) in ns.edges() {
             let from_selected = selected.contains(&edge.from_node_id);
             let to_selected = selected.contains(&edge.to_node_id);
 

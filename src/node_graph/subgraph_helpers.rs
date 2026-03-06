@@ -78,11 +78,9 @@ impl NodeGraph {
             let entity = self.get_node_by_id(node_id)?;
             let guard = entity.read().ok()?;
             let sg = guard.as_any().downcast_ref::<SubGraphNode>()?;
-            let cache = sg.internal_graph().shared_cache();
-            let cache_read = cache.read().ok()?;
+            let ns = sg.internal_graph().node_states().read().ok()?;
             Some(
-                cache_read
-                    .edges
+                ns.edges()
                     .iter()
                     .map(|(id, edge)| EdgeInfo {
                         id: *id,

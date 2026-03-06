@@ -33,10 +33,10 @@ impl NodeGraphSystem for NodeGraph {
             adj_list.insert(node_id, Vec::new());
         }
 
-        let cache = self.cache.lock()?;
+        let ns = self.node_states.read().map_err(|e| e.to_string())?;
         for node_id in target_nodes {
-            for edge_id in cache.outgoing_edges_for_node(node_id) {
-                if let Some(edge) = cache.edges.get(edge_id) {
+            for edge_id in ns.outgoing_edges_for_node(node_id) {
+                if let Some(edge) = ns.get_edge(edge_id) {
                     if target_nodes.contains(&edge.to_node_id) {
                         in_degree
                             .entry(&edge.to_node_id)
@@ -250,22 +250,12 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        // Update NodeStates slot connections and edge storage
+        // Update NodeStates (edge storage + slot connected_edges + indexes)
         {
             let mut guard = self
                 .node_states
                 .write()
                 .map_err(|e| e.to_string())?;
-            if let Some(slot_state) =
-                guard.output_slot_mut(&from_node_id, edge.from_output_slot_index)
-            {
-                slot_state.connected_edges.push(edge_id);
-            }
-            if let Some(slot_state) =
-                guard.input_slot_mut(&to_node_id, edge.to_input_slot_index)
-            {
-                slot_state.connected_edges.push(edge_id);
-            }
             guard.add_edge(edge_id, edge.clone());
         }
 
@@ -273,11 +263,6 @@ impl NodeGraphSystem for NodeGraph {
         let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
         tracing::debug!("[cognet] add_edge: marking dirty nodes...");
         self.mark_dirty_nodes(dirty_nodes);
-        tracing::debug!("[cognet] add_edge: acquiring cache lock...");
-        let mut cache = self.cache.lock()?;
-        cache.add_edge(edge_id, edge);
-        tracing::debug!("[cognet] add_edge: DONE");
-
         Ok(edge_id)
     }
 
@@ -285,12 +270,12 @@ impl NodeGraphSystem for NodeGraph {
         let mut affected = HashSet::new();
         let mut queue = VecDeque::from(initial_nodes);
 
-        let cache = self.cache.lock()?;
+        let ns = self.node_states.read().map_err(|e| e.to_string())?;
 
         while let Some(node_id) = queue.pop_front() {
             if affected.insert(node_id) {
-                for edge_id in cache.outgoing_edges_for_node(&node_id) {
-                    if let Some(edge) = cache.edges.get(edge_id) {
+                for edge_id in ns.outgoing_edges_for_node(&node_id) {
+                    if let Some(edge) = ns.get_edge(edge_id) {
                         if !affected.contains(&edge.to_node_id) {
                             queue.push_back(edge.to_node_id);
                         }
@@ -303,15 +288,14 @@ impl NodeGraphSystem for NodeGraph {
     }
 
     fn remove_edges_from_cache(&self, node_id: &NodeId) -> Result<(), String> {
-        let mut cache = self.cache.lock()?;
-        cache.remove_edges_for_node(node_id);
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+        ns.remove_edges_for_node(node_id);
         Ok(())
     }
 
     fn remove_edge_from_cache(&self, edge_id: &EdgeId) -> Result<Edge, String> {
-        let mut cache = self.cache.lock()?;
-        cache
-            .remove_edge(edge_id)
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+        ns.remove_edge(edge_id)
             .ok_or(format!("Edge does not exist: id: {:?}", edge_id))
     }
 

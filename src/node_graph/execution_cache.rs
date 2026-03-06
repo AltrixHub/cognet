@@ -1,8 +1,5 @@
-use crate::{Data, DataType, Edge, EdgeId, InputSlotId, NodeId, OutputSlotId};
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
-};
+use crate::{Data, DataType, OutputSlotId};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Default, Clone)]
 pub struct SharedExecutionCache {
@@ -35,79 +32,20 @@ impl SharedExecutionCache {
             inner: Arc::clone(&self.inner),
         }
     }
-
 }
 
+/// Cache for computed output values.
+///
+/// Edge topology has been moved to `NodeStates`. This cache only stores
+/// output data produced during graph execution.
 #[derive(Default, Debug)]
 pub struct ExecutionCache {
-    pub(crate) edges: HashMap<EdgeId, Edge>,
     pub(crate) outputs: HashMap<OutputSlotId, Data>,
-    /// Index for fast lookup of edges by input slot.
-    pub(crate) input_connections: HashMap<InputSlotId, Vec<EdgeId>>,
-    /// Index for fast lookup of outgoing edges by source node.
-    pub(crate) outgoing_edges: HashMap<NodeId, Vec<EdgeId>>,
 }
 
+use std::collections::HashMap;
+
 impl ExecutionCache {
-    /// Add an edge and update all connection indexes.
-    pub fn add_edge(&mut self, edge_id: EdgeId, edge: Edge) {
-        let input_slot_id = edge.to_input_slot_id;
-        let from_node_id = edge.from_node_id;
-        self.edges.insert(edge_id, edge);
-        self.input_connections
-            .entry(input_slot_id)
-            .or_default()
-            .push(edge_id);
-        self.outgoing_edges
-            .entry(from_node_id)
-            .or_default()
-            .push(edge_id);
-    }
-
-    /// Remove an edge and update all connection indexes.
-    pub fn remove_edge(&mut self, edge_id: &EdgeId) -> Option<Edge> {
-        if let Some(edge) = self.edges.remove(edge_id) {
-            if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
-                connections.retain(|id| id != edge_id);
-            }
-            if let Some(outgoing) = self.outgoing_edges.get_mut(&edge.from_node_id) {
-                outgoing.retain(|id| id != edge_id);
-            }
-            Some(edge)
-        } else {
-            None
-        }
-    }
-
-    /// Remove all edges involving a node, maintaining all indexes.
-    pub fn remove_edges_for_node(&mut self, node_id: &NodeId) {
-        let edge_ids: Vec<EdgeId> = self
-            .edges
-            .iter()
-            .filter(|(_, edge)| edge.from_node_id == *node_id || edge.to_node_id == *node_id)
-            .map(|(id, _)| *id)
-            .collect();
-        for edge_id in edge_ids {
-            self.remove_edge(&edge_id);
-        }
-    }
-
-    /// Get edges connected to an input slot.
-    pub fn edges_for_input(&self, input_slot_id: &InputSlotId) -> &[EdgeId] {
-        self.input_connections
-            .get(input_slot_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Get outgoing edge IDs from a node.
-    pub fn outgoing_edges_for_node(&self, node_id: &NodeId) -> &[EdgeId] {
-        self.outgoing_edges
-            .get(node_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     /// Get output value by slot ID.
     pub fn get_output(&self, output_slot_id: &OutputSlotId) -> Option<&Data> {
         self.outputs.get(output_slot_id)

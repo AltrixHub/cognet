@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::{
     Data, DataType, ExecutionContext, InputSlot, NodeCategory, NodeCore, NodeGraph, NodeGraphAPI,
     NodeId, NodeImpl, NodeManager, NodeMeta, NodeValueSetter, OutputSlot, SharedExecutionCache,
-    SlotDef,
+    SharedNodeStates, SlotDef,
 };
 
 /// A node that contains a nested NodeGraph.
@@ -273,7 +273,13 @@ impl SubGraphNode {
     /// Uses a cursor to map external inputs to proxy outputs:
     /// - For normal inputs (count=1): one value → one proxy output (with default fallback)
     /// - For multi-inputs (count>1): N edge values → N proxy outputs (no default)
-    fn inject_inputs(&self, parent_cache: SharedExecutionCache) -> Result<(), String> {
+    ///
+    /// Edge topology is read from `parent_node_states`; output values from `parent_cache`.
+    fn inject_inputs(
+        &self,
+        parent_cache: &SharedExecutionCache,
+        parent_node_states: &SharedNodeStates,
+    ) -> Result<(), String> {
         let proxy = self
             .internal_graph
             .get_node_by_id(&self.input_proxy_id)
@@ -287,16 +293,19 @@ impl SubGraphNode {
             let count = self.input_proxy_counts.get(idx).copied().unwrap_or(1);
 
             // Collect all edge values for this input slot
+            // Edges from parent NodeStates, output data from parent cache
+            let ns = parent_node_states.read().map_err(|e| e.to_string())?;
             let parent_cache_read = parent_cache.read()?;
             let mut data_values = Vec::new();
-            for edge_id in parent_cache_read.edges_for_input(&input_slot.id) {
-                if let Some(edge) = parent_cache_read.edges.get(edge_id) {
+            for edge_id in ns.edges_for_input(&input_slot.id) {
+                if let Some(edge) = ns.get_edge(edge_id) {
                     if let Some(data) = parent_cache_read.outputs.get(&edge.from_output_slot_id) {
                         data_values.push(data.share());
                     }
                 }
             }
             drop(parent_cache_read);
+            drop(ns);
 
             if count == 1 {
                 // Normal 1:1 mapping with default value fallback
@@ -345,36 +354,37 @@ impl SubGraphNode {
     pub async fn execute_internal(
         &self,
         parent_cache: SharedExecutionCache,
+        parent_node_states: SharedNodeStates,
     ) -> Result<(), String> {
-        self.inject_inputs(parent_cache.share())?;
+        self.inject_inputs(&parent_cache, &parent_node_states)?;
         // Mark all internal nodes dirty so they execute.
         // This is needed because the internal graph doesn't know that
         // its proxy inputs changed.
         self.internal_graph.mark_all_nodes_dirty();
         let _changes = self.internal_graph.execute().await?;
-        self.collect_outputs(parent_cache)?;
+        self.collect_outputs(&parent_cache)?;
         Ok(())
     }
 
     /// Read results from the internal output proxy and write to this node's outputs.
-    fn collect_outputs(&self, parent_cache: SharedExecutionCache) -> Result<(), String> {
-        let proxy = self
+    ///
+    /// Edge topology is read from internal graph's NodeStates; output values
+    /// from internal cache. Results are written to parent cache.
+    fn collect_outputs(&self, parent_cache: &SharedExecutionCache) -> Result<(), String> {
+        let internal_ns = self
             .internal_graph
-            .get_node_by_id(&self.output_proxy_id)
-            .ok_or("Output proxy not found")?;
-        let read_proxy = proxy.read().map_err(|e| e.to_string())?;
+            .node_states()
+            .read()
+            .map_err(|e| e.to_string())?;
         let internal_cache = self.internal_graph.shared_cache();
 
         for (idx, output_slot) in self.outputs.iter().enumerate() {
-            // Read data from the output proxy's input in the internal cache
-            if let Some(proxy_input_slot) = read_proxy.inputs().get(idx) {
+            // Find edges connected to the output proxy's input slot at this index
+            if let Some(slot_state) = internal_ns.input_slot(&self.output_proxy_id, idx) {
                 let cache_read = internal_cache.read()?;
-                // Find edges connected to this proxy input
-                for edge_id in cache_read.edges_for_input(&proxy_input_slot.id) {
-                    if let Some(edge) = cache_read.edges.get(edge_id) {
-                        if let Some(data) =
-                            cache_read.outputs.get(&edge.from_output_slot_id)
-                        {
+                for edge_id in &slot_state.connected_edges {
+                    if let Some(edge) = internal_ns.get_edge(edge_id) {
+                        if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
                             let data = data.share();
                             drop(cache_read);
                             // Write to parent cache output

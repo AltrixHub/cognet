@@ -11,7 +11,7 @@ use std::{collections::HashSet, sync::Arc};
 use crate::{
     node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, ExecutionContext, GraphError, Node,
     NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta, OutputWriter, SharedExecutionCache,
-    SubGraphNode,
+    SharedNodeStates, SubGraphNode,
 };
 
 /// Execution event for progress tracking during graph execution.
@@ -60,24 +60,27 @@ impl GraphChanges {
     }
 }
 
-/// Build an `ExecutionContext` for a node from the shared cache.
+/// Build an `ExecutionContext` for a node.
 ///
-/// Resolves all input values from upstream outputs (with default value fallback),
-/// captures node_data, and creates an OutputWriter for the node's output slots.
+/// Resolves all input values from upstream outputs (with default value fallback)
+/// using NodeStates for edge topology and ExecutionCache for output values.
+/// Captures node_data and creates an OutputWriter for the node's output slots.
 fn build_execution_context(
     node_read: &dyn Node,
+    node_states: &SharedNodeStates,
     cache: &SharedExecutionCache,
 ) -> Result<ExecutionContext, String> {
-    // Resolve input values from cache
+    // Resolve input values: edges from NodeStates, output data from cache
     let input_values = {
+        let ns = node_states.read().map_err(|e| e.to_string())?;
         let cache_read = cache.read()?;
         node_read
             .inputs()
             .iter()
             .map(|input_slot| {
                 let mut values = Vec::new();
-                for edge_id in cache_read.edges_for_input(&input_slot.id) {
-                    if let Some(edge) = cache_read.edges.get(edge_id) {
+                for edge_id in ns.edges_for_input(&input_slot.id) {
+                    if let Some(edge) = ns.get_edge(edge_id) {
                         if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
                             values.push(data.share());
                         }
@@ -221,6 +224,7 @@ impl NodeGraphAPI for NodeGraph {
 
         let shared_nodes = self.node_manager.nodes();
         let shared_cache = self.cache.share();
+        let shared_node_states = self.node_states.clone();
         let on_progress = Arc::new(on_progress);
 
         #[cfg(target_arch = "wasm32")]
@@ -231,6 +235,7 @@ impl NodeGraphAPI for NodeGraph {
                     .map(|node_id| {
                         let shared_nodes = shared_nodes.share();
                         let shared_cache = shared_cache.share();
+                        let shared_node_states = shared_node_states.clone();
                         let on_progress = Arc::clone(&on_progress);
                         async move {
                             on_progress(ExecutionEvent::Started(node_id));
@@ -253,9 +258,17 @@ impl NodeGraphAPI for NodeGraph {
                                         .as_any()
                                         .downcast_ref::<SubGraphNode>()
                                     {
-                                        sg.execute_internal(shared_cache.share()).await
+                                        sg.execute_internal(
+                                            shared_cache.share(),
+                                            shared_node_states.clone(),
+                                        )
+                                        .await
                                     } else {
-                                        match build_execution_context(&*node_read, &shared_cache) {
+                                        match build_execution_context(
+                                            &*node_read,
+                                            &shared_node_states,
+                                            &shared_cache,
+                                        ) {
                                             Ok(ctx) => node_read.execute(ctx).await,
                                             Err(e) => Err(e),
                                         }
@@ -293,6 +306,7 @@ impl NodeGraphAPI for NodeGraph {
                 let results: Vec<(NodeId, Result<(), String>)> = task::spawn_blocking({
                     let shared_nodes = shared_nodes.share();
                     let shared_cache = shared_cache.share();
+                    let shared_node_states = shared_node_states.clone();
                     let rt_handle = Arc::clone(&rt_handle);
                     let on_progress = Arc::clone(&on_progress);
                     move || {
@@ -309,6 +323,7 @@ impl NodeGraphAPI for NodeGraph {
                                     if let Some(node) = nodes_guard.get(&node_id) {
                                         let node_clone = Arc::clone(node);
                                         let cache_clone = shared_cache.share();
+                                        let ns_clone = shared_node_states.clone();
                                         let rt_clone = Arc::clone(&rt_handle);
                                         drop(nodes_guard);
                                         // Catch panics so a single node failure
@@ -326,10 +341,15 @@ impl NodeGraphAPI for NodeGraph {
                                                         .as_any()
                                                         .downcast_ref::<SubGraphNode>()
                                                     {
-                                                        sg.execute_internal(cache_clone).await
+                                                        sg.execute_internal(
+                                                            cache_clone,
+                                                            ns_clone,
+                                                        )
+                                                        .await
                                                     } else {
                                                         match build_execution_context(
                                                             &*node_read,
+                                                            &ns_clone,
                                                             &cache_clone,
                                                         ) {
                                                             Ok(ctx) => {
@@ -531,37 +551,20 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
+        // remove_edge_from_cache now removes from NodeStates
+        // (including slot connected_edges and all indexes)
         let edge = self.remove_edge_from_cache(&edge_id)?;
 
-        let from_node_id = edge.from_node_id;
-        let to_node_id = edge.to_node_id;
-
-        // Update NodeStates slot connections
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            if let Some(slot_state) =
-                guard.output_slot_mut(&from_node_id, edge.from_output_slot_index)
-            {
-                slot_state.connected_edges.retain(|id| *id != edge_id);
-            }
-            if let Some(slot_state) =
-                guard.input_slot_mut(&to_node_id, edge.to_input_slot_index)
-            {
-                slot_state.connected_edges.retain(|id| *id != edge_id);
-            }
-        }
-
-        let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
+        let dirty_nodes =
+            self.collect_dirty_nodes(vec![edge.from_node_id, edge.to_node_id])?;
         self.mark_dirty_nodes(dirty_nodes);
 
         Ok(())
     }
 
     fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String> {
-        let cache = self.cache.lock()?;
-        cache
-            .edges
-            .get(&edge_id)
+        let ns = self.node_states.read().map_err(|e| e.to_string())?;
+        ns.get_edge(&edge_id)
             .cloned()
             .ok_or(format!("Edge not found: id {:?}", edge_id))
     }
