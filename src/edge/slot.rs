@@ -119,6 +119,36 @@ impl DataType {
         ]
     }
 
+    /// Field names for composite types. Primitive types return an empty slice.
+    pub fn field_names(&self) -> &'static [&'static str] {
+        match self {
+            DataType::Vector3 => &["x", "y", "z"],
+            DataType::Color => &["r", "g", "b", "a"],
+            _ => &[],
+        }
+    }
+
+    /// Assemble a `Data` value from individual field values.
+    /// Returns `None` for primitive (non-composite) types.
+    pub fn assemble(&self, read_field: impl Fn(&str) -> f64) -> Option<Data> {
+        match self {
+            DataType::Vector3 => Data::new(Vector3::new(
+                read_field("x"),
+                read_field("y"),
+                read_field("z"),
+            ))
+            .ok(),
+            DataType::Color => Data::new(ColorValue::new(
+                read_field("r"),
+                read_field("g"),
+                read_field("b"),
+                read_field("a"),
+            ))
+            .ok(),
+            _ => None,
+        }
+    }
+
     fn type_id(&self) -> TypeId {
         match self {
             DataType::Number => TypeId::of::<f64>(),

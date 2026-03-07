@@ -61,6 +61,18 @@ pub enum DefaultValue {
 }
 
 impl DefaultValue {
+    /// Return the `DataType` corresponding to this default value.
+    pub fn data_type(&self) -> Option<DataType> {
+        match self {
+            Self::None => None,
+            Self::Number(_) => Some(DataType::Number),
+            Self::String(_) => Some(DataType::String),
+            Self::Vector3 { .. } => Some(DataType::Vector3),
+            Self::Color { .. } => Some(DataType::Color),
+            Self::Bool(_) => Some(DataType::Bool),
+        }
+    }
+
     /// Convert to Option<Data> at runtime.
     pub fn to_data(self) -> Option<Data> {
         match self {
