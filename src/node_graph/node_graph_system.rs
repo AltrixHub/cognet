@@ -13,14 +13,6 @@ pub(crate) trait NodeGraphSystem {
     ) -> Result<Edge, &'static str>;
 
     fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
-
-    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String>;
-
-    fn mark_dirty_nodes(&self, nodes: Vec<NodeId>);
-
-    fn remove_edges_from_cache(&self, node_id: &NodeId) -> Result<(), String>;
-
-    fn remove_edge_from_cache(&self, edge_id: &EdgeId) -> Result<Edge, String>;
 }
 
 impl NodeGraphSystem for NodeGraph {
@@ -216,53 +208,12 @@ impl NodeGraphSystem for NodeGraph {
 
         let edge_id = EdgeId::new();
 
-        // Update NodeStates (edge storage + indexes)
+        // Update NodeStates (edge storage + indexes + auto-tracks changed)
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             guard.add_edge(edge_id, edge.clone());
         }
 
-        tracing::debug!("[cognet] add_edge: collecting dirty nodes...");
-        let dirty_nodes = self.collect_dirty_nodes(vec![from_node_id, to_node_id])?;
-        tracing::debug!("[cognet] add_edge: marking dirty nodes...");
-        self.mark_dirty_nodes(dirty_nodes);
         Ok(edge_id)
-    }
-
-    fn collect_dirty_nodes(&self, initial_nodes: Vec<NodeId>) -> Result<Vec<NodeId>, String> {
-        let mut affected = HashSet::new();
-        let mut queue = VecDeque::from(initial_nodes);
-
-        let ns = self.node_states.read().map_err(|e| e.to_string())?;
-
-        while let Some(node_id) = queue.pop_front() {
-            if affected.insert(node_id) {
-                for edge_id in ns.outgoing_edges_for_node(&node_id) {
-                    if let Some(edge) = ns.get_edge(edge_id) {
-                        if !affected.contains(&edge.to_node_id) {
-                            queue.push_back(edge.to_node_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(affected.into_iter().collect())
-    }
-
-    fn remove_edges_from_cache(&self, node_id: &NodeId) -> Result<(), String> {
-        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        ns.remove_edges_for_node(node_id);
-        Ok(())
-    }
-
-    fn remove_edge_from_cache(&self, edge_id: &EdgeId) -> Result<Edge, String> {
-        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        ns.remove_edge(edge_id)
-            .ok_or(format!("Edge does not exist: id: {:?}", edge_id))
-    }
-
-    fn mark_dirty_nodes(&self, nodes: Vec<NodeId>) {
-        self.mark_dirty(nodes);
     }
 }

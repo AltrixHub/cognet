@@ -177,7 +177,6 @@ impl DataType {
             DataType::Domain(name) => name,
         }
     }
-
 }
 
 pub type DataValue = Arc<dyn Any + Send + Sync>;
@@ -351,10 +350,7 @@ impl Data {
             _ => return Err("Unsupported data type".to_string()),
         };
 
-        Ok(Data {
-            value,
-            data_type,
-        })
+        Ok(Data { value, data_type })
     }
 
     pub fn share(&self) -> Self {
@@ -402,4 +398,3 @@ impl Data {
         self.data_type
     }
 }
-

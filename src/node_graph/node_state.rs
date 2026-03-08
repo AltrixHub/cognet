@@ -1,7 +1,7 @@
 //! Runtime state for node instances.
 
 use crate::{Data, DataType, DataValue, Edge, EdgeId, InputSlotId, NodeId, OutputSlotId, SlotDef};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// Runtime state for a single node instance.
@@ -58,6 +58,8 @@ pub struct NodeStates {
     input_connections: HashMap<InputSlotId, Vec<EdgeId>>,
     /// Index: source node → outgoing edge IDs.
     outgoing_edges: HashMap<NodeId, Vec<EdgeId>>,
+    /// Nodes changed since last drain (for deferred dirty tracking).
+    changed_nodes: HashSet<NodeId>,
 }
 
 impl NodeStates {
@@ -102,6 +104,8 @@ impl NodeStates {
                 },
             );
         }
+
+        self.changed_nodes.insert(node_id);
     }
 
     /// Add a dynamic input slot (for SubGraphNode).
@@ -255,6 +259,7 @@ impl NodeStates {
 
     /// Add an edge and update lookup indexes.
     pub fn add_edge(&mut self, edge_id: EdgeId, edge: Edge) {
+        self.changed_nodes.insert(edge.to_node_id);
         self.input_connections
             .entry(edge.to_input_slot_id)
             .or_default()
@@ -269,6 +274,7 @@ impl NodeStates {
     /// Remove an edge and update lookup indexes.
     pub fn remove_edge(&mut self, edge_id: &EdgeId) -> Option<Edge> {
         if let Some(edge) = self.edges.remove(edge_id) {
+            self.changed_nodes.insert(edge.to_node_id);
             if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
                 connections.retain(|id| id != edge_id);
             }
@@ -320,4 +326,18 @@ impl NodeStates {
             .unwrap_or(&[])
     }
 
+    /// Mark a node as changed (needs re-execution).
+    pub fn mark_changed(&mut self, node_id: NodeId) {
+        self.changed_nodes.insert(node_id);
+    }
+
+    /// Mark all nodes as changed (forces full re-execution).
+    pub fn mark_all_changed(&mut self) {
+        self.changed_nodes.extend(self.nodes.keys().copied());
+    }
+
+    /// Drain and return all changed node IDs since last drain.
+    pub fn drain_changed_nodes(&mut self) -> HashSet<NodeId> {
+        std::mem::take(&mut self.changed_nodes)
+    }
 }

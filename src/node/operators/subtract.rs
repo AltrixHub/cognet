@@ -30,12 +30,16 @@ impl NodeMeta for SubtractNode {
 #[async_trait::async_trait]
 impl NodeImpl for SubtractNode {
     async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
-        let a: f64 = ctx.input_values.first()
+        let a: f64 = ctx
+            .input_values
+            .first()
             .and_then(|v| v.first())
             .and_then(|d| d.value::<f64>().ok().copied())
             .unwrap_or(0.0);
 
-        let b: f64 = ctx.input_values.get(1)
+        let b: f64 = ctx
+            .input_values
+            .get(1)
             .and_then(|v| v.first())
             .and_then(|d| d.value::<f64>().ok().copied())
             .unwrap_or(0.0);

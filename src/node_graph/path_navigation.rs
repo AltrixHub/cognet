@@ -154,9 +154,7 @@ mod tests {
 
         // Create a node inside the subgraph
         let internal_id = graph
-            .with_subgraph_mut(&sg, |internal| {
-                internal.create_node_by_name("Number")
-            })
+            .with_subgraph_mut(&sg, |internal| internal.create_node_by_name("Number"))
             .expect("access subgraph")
             .expect("create internal node");
 
@@ -175,9 +173,7 @@ mod tests {
             .expect("create subgraph");
 
         // Empty path returns None (can't mutate self with &self)
-        assert!(graph
-            .with_graph_at_path_mut(&[], |_g| ())
-            .is_none());
+        assert!(graph.with_graph_at_path_mut(&[], |_g| ()).is_none());
 
         // Non-empty path: mutate inside subgraph
         let id = graph

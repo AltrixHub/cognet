@@ -33,7 +33,8 @@ impl NodeImpl for SubtractListNode {
                 Some(r) => result = Some(r - value),
             }
         }
-        ctx.output_writer.set(0, Data::new(result.unwrap_or(0.0))?)?;
+        ctx.output_writer
+            .set(0, Data::new(result.unwrap_or(0.0))?)?;
         Ok(())
     }
 }

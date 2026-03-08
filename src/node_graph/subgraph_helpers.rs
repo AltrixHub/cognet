@@ -147,11 +147,7 @@ impl NodeGraph {
     }
 
     /// Remove an input port from a SubGraphNode by index.
-    pub fn remove_subgraph_input(
-        &self,
-        node_id: &NodeId,
-        index: usize,
-    ) -> Result<(), String> {
+    pub fn remove_subgraph_input(&self, node_id: &NodeId, index: usize) -> Result<(), String> {
         let entity = self
             .get_node_by_id(node_id)
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
@@ -194,11 +190,7 @@ impl NodeGraph {
     }
 
     /// Remove an output port from a SubGraphNode by index.
-    pub fn remove_subgraph_output(
-        &self,
-        node_id: &NodeId,
-        index: usize,
-    ) -> Result<(), String> {
+    pub fn remove_subgraph_output(&self, node_id: &NodeId, index: usize) -> Result<(), String> {
         let entity = self
             .get_node_by_id(node_id)
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
@@ -255,15 +247,14 @@ impl NodeGraph {
         data: Data,
     ) -> Result<(), String> {
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        let slot = ns
-            .input_slot_mut(node_id, input_index)
-            .ok_or_else(|| {
-                format!(
-                    "Input slot {} not found for node {:?}",
-                    input_index, node_id
-                )
-            })?;
+        let slot = ns.input_slot_mut(node_id, input_index).ok_or_else(|| {
+            format!(
+                "Input slot {} not found for node {:?}",
+                input_index, node_id
+            )
+        })?;
         slot.default_value = Some(data.into_value());
+        ns.mark_changed(*node_id);
         Ok(())
     }
 }
@@ -338,9 +329,7 @@ mod tests {
 
         // Remove
         graph.remove_subgraph_input(&sg, 0).expect("remove input");
-        graph
-            .remove_subgraph_output(&sg, 0)
-            .expect("remove output");
+        graph.remove_subgraph_output(&sg, 0).expect("remove output");
 
         {
             let ns = graph.node_states().read().unwrap();
@@ -364,9 +353,7 @@ mod tests {
 
         // Mut access: create a node inside
         let internal_id = graph
-            .with_subgraph_mut(&sg, |internal| {
-                internal.create_node_by_name("Number")
-            })
+            .with_subgraph_mut(&sg, |internal| internal.create_node_by_name("Number"))
             .expect("with_subgraph_mut")
             .expect("create internal node");
 

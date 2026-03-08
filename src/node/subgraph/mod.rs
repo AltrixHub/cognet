@@ -264,8 +264,7 @@ impl SubGraphNode {
             let default_value_ref = if let Some(slot_state) = ns.input_slot(parent_node_id, idx) {
                 for edge_id in ns.edges_for_input(&slot_state.id) {
                     if let Some(edge) = ns.get_edge(edge_id) {
-                        if let Some(data) =
-                            parent_cache_read.outputs.get(&edge.from_output_slot_id)
+                        if let Some(data) = parent_cache_read.outputs.get(&edge.from_output_slot_id)
                         {
                             data_values.push(data.share());
                         }
@@ -281,13 +280,17 @@ impl SubGraphNode {
             if count == 1 {
                 // Normal 1:1 mapping with default value fallback
                 if let Some(data) = data_values.into_iter().next() {
-                    if let Some(proxy_slot) = internal_ns.output_slot(&self.input_proxy_id, proxy_cursor) {
+                    if let Some(proxy_slot) =
+                        internal_ns.output_slot(&self.input_proxy_id, proxy_cursor)
+                    {
                         let mut cache = internal_cache.lock()?;
                         cache.outputs.insert(proxy_slot.id, data);
                     }
                 } else if let Some(default_ref) = default_value_ref {
                     if let Ok(default_data) = Data::from_any(default_ref) {
-                        if let Some(proxy_slot) = internal_ns.output_slot(&self.input_proxy_id, proxy_cursor) {
+                        if let Some(proxy_slot) =
+                            internal_ns.output_slot(&self.input_proxy_id, proxy_cursor)
+                        {
                             let mut cache = internal_cache.lock()?;
                             cache.outputs.insert(proxy_slot.id, default_data);
                         }
@@ -297,11 +300,11 @@ impl SubGraphNode {
                 // Multi-input: distribute N edge values to N proxy outputs
                 let distribute_count = data_values.len().min(count);
                 for (i, data) in data_values.iter().enumerate().take(distribute_count) {
-                    if let Some(proxy_slot) = internal_ns.output_slot(&self.input_proxy_id, proxy_cursor + i) {
+                    if let Some(proxy_slot) =
+                        internal_ns.output_slot(&self.input_proxy_id, proxy_cursor + i)
+                    {
                         let mut cache = internal_cache.lock()?;
-                        cache
-                            .outputs
-                            .insert(proxy_slot.id, data.share());
+                        cache.outputs.insert(proxy_slot.id, data.share());
                     }
                 }
             }
@@ -412,9 +415,8 @@ impl NodeCore for SubGraphNode {
 
     fn register_in(manager: &mut NodeManager) -> Result<(), String> {
         let factory = Arc::new(|| {
-            SubGraphNode::new("SubGraph").map(|node| {
-                Arc::new(std::sync::RwLock::new(node)) as crate::NodeEntity
-            })
+            SubGraphNode::new("SubGraph")
+                .map(|node| Arc::new(std::sync::RwLock::new(node)) as crate::NodeEntity)
         });
         manager.register_factory::<SubGraphNode>(factory.clone())?;
         manager.register_factory_with_name("SubGraph", factory, None);
@@ -447,7 +449,9 @@ mod tests {
     #[tokio::test]
     async fn test_subgraph_creation() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
-        let subgraph_id = graph.create_node::<SubGraphNode>().expect("Failed to create subgraph");
+        let subgraph_id = graph
+            .create_node::<SubGraphNode>()
+            .expect("Failed to create subgraph");
 
         let node = graph.get_node_by_id(&subgraph_id).expect("Node not found");
         let read = node.read().expect("Lock failed");
@@ -462,17 +466,13 @@ mod tests {
     #[tokio::test]
     async fn test_subgraph_has_proxies() {
         let subgraph = SubGraphNode::new("Test").expect("Failed to create subgraph");
-        assert!(
-            subgraph
-                .internal_graph
-                .get_node_by_id(&subgraph.input_proxy_id)
-                .is_some()
-        );
-        assert!(
-            subgraph
-                .internal_graph
-                .get_node_by_id(&subgraph.output_proxy_id)
-                .is_some()
-        );
+        assert!(subgraph
+            .internal_graph
+            .get_node_by_id(&subgraph.input_proxy_id)
+            .is_some());
+        assert!(subgraph
+            .internal_graph
+            .get_node_by_id(&subgraph.output_proxy_id)
+            .is_some());
     }
 }

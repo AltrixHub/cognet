@@ -175,8 +175,13 @@ impl NodeManager {
         factory: NodeFactory,
         default_data: Option<Data>,
     ) {
-        self.name_registry
-            .insert(name, NodeFactoryWithMeta { factory, default_data });
+        self.name_registry.insert(
+            name,
+            NodeFactoryWithMeta {
+                factory,
+                default_data,
+            },
+        );
     }
 
     /// Create a node by type (compile-time dispatch).
@@ -194,10 +199,7 @@ impl NodeManager {
     /// Create a node by name (runtime dispatch).
     ///
     /// Returns the node ID and default data if successful.
-    pub fn create_node_by_name(
-        &self,
-        name: &str,
-    ) -> Result<(NodeId, Option<Data>), String> {
+    pub fn create_node_by_name(&self, name: &str) -> Result<(NodeId, Option<Data>), String> {
         let factory_meta = self
             .name_registry
             .get(name)

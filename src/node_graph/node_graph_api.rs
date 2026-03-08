@@ -6,12 +6,15 @@ use futures::future::join_all;
 
 use async_trait::async_trait;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+};
 
 use crate::{
-    node_graph_system::NodeGraphSystem, Data, Edge, EdgeId, ExecutionContext, GraphError,
-    NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta, OutputWriter, SharedExecutionCache,
-    SharedNodeStates, SubGraphNode,
+    node_graph_system::NodeGraphSystem, ColorValue, Data, DataType, DataValue, Edge, EdgeId,
+    ExecutionContext, GraphError, NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta, OutputWriter,
+    SharedExecutionCache, SharedNodeStates, SubGraphNode, Vector3,
 };
 
 /// Execution event for progress tracking during graph execution.
@@ -107,10 +110,7 @@ fn build_execution_context(
     // Build output writer from NodeStates output slot metadata
     let output_count = ns.output_slot_count(node_id);
     let slots = (0..output_count)
-        .filter_map(|idx| {
-            ns.output_slot(node_id, idx)
-                .map(|s| (s.id, s.data_type))
-        })
+        .filter_map(|idx| ns.output_slot(node_id, idx).map(|s| (s.id, s.data_type)))
         .collect();
     let output_writer = OutputWriter::new(cache.share(), slots);
 
@@ -119,6 +119,65 @@ fn build_execution_context(
         input_values,
         output_writer,
     })
+}
+
+/// Extract field name/value pairs from a `Data` value for composite types.
+fn extract_fields_from_data(data_type: DataType, data: Option<&Data>) -> Vec<(&'static str, f64)> {
+    let fields = data_type.field_names();
+    if fields.is_empty() {
+        return Vec::new();
+    }
+    let Some(data) = data else {
+        return fields.iter().map(|&f| (f, 0.0)).collect();
+    };
+    match data_type {
+        DataType::Vector3 => {
+            if let Ok(v) = data.value::<Vector3>() {
+                vec![("x", v.x), ("y", v.y), ("z", v.z)]
+            } else {
+                fields.iter().map(|&f| (f, 0.0)).collect()
+            }
+        }
+        DataType::Color => {
+            if let Ok(c) = data.value::<ColorValue>() {
+                vec![("r", c.r), ("g", c.g), ("b", c.b), ("a", c.a)]
+            } else {
+                fields.iter().map(|&f| (f, 0.0)).collect()
+            }
+        }
+        _ => fields.iter().map(|&f| (f, 0.0)).collect(),
+    }
+}
+
+/// Extract field name/value pairs from a `DataValue` (slot default) for composite types.
+fn extract_fields_from_default_value(
+    data_type: DataType,
+    default_value: Option<&DataValue>,
+) -> Vec<(&'static str, f64)> {
+    let fields = data_type.field_names();
+    if fields.is_empty() {
+        return Vec::new();
+    }
+    let Some(dv) = default_value else {
+        return fields.iter().map(|&f| (f, 0.0)).collect();
+    };
+    match data_type {
+        DataType::Vector3 => {
+            if let Some(v) = dv.downcast_ref::<Vector3>() {
+                vec![("x", v.x), ("y", v.y), ("z", v.z)]
+            } else {
+                fields.iter().map(|&f| (f, 0.0)).collect()
+            }
+        }
+        DataType::Color => {
+            if let Some(c) = dv.downcast_ref::<ColorValue>() {
+                vec![("r", c.r), ("g", c.g), ("b", c.b), ("a", c.a)]
+            } else {
+                fields.iter().map(|&f| (f, 0.0)).collect()
+            }
+        }
+        _ => fields.iter().map(|&f| (f, 0.0)).collect(),
+    }
 }
 
 #[async_trait]
@@ -155,6 +214,20 @@ pub trait NodeGraphAPI {
         slot_index: usize,
         data: Data,
     ) -> Result<(), String>;
+    fn update_node_data_field(
+        &mut self,
+        node_id: &NodeId,
+        data_type: DataType,
+        field_name: &str,
+        value: f64,
+    ) -> Result<(), String>;
+    fn update_input_slot_default_field(
+        &mut self,
+        node_id: &NodeId,
+        slot_index: usize,
+        field_name: &str,
+        value: f64,
+    ) -> Result<(), String>;
     fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
     fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId>;
     fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)>;
@@ -185,30 +258,30 @@ impl NodeGraphAPI for NodeGraph {
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static,
     {
-        // Drain bookkeeping state atomically
-        let (dirty_nodes, removed) = {
-            let mut b = self
-                .bookkeeping
-                .lock()
-                .map_err(|e| e.to_string())?;
-            let dirty = std::mem::take(&mut b.dirty_nodes);
-            let removed = std::mem::take(&mut b.removed_since_last_execute);
-            (dirty, removed)
+        // Drain removed list from bookkeeping
+        let removed = {
+            let mut b = self.bookkeeping.lock().map_err(|e| e.to_string())?;
+            std::mem::take(&mut b.removed_since_last_execute)
         };
+
+        // Drain changed nodes from NodeStates
+        let changed = {
+            let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+            ns.drain_changed_nodes()
+        }; // write lock dropped
 
         tracing::debug!(
             target: "graph",
-            "[cognet] execute: dirty={} removed={}",
-            dirty_nodes.len(),
+            "[cognet] execute: changed={} removed={}",
+            changed.len(),
             removed.len(),
         );
 
-        if dirty_nodes.is_empty() && removed.is_empty() {
+        if changed.is_empty() && removed.is_empty() {
             return Ok(GraphChanges::empty());
         }
 
-        // If only removals (no dirty nodes), return just the removed list
-        if dirty_nodes.is_empty() {
+        if changed.is_empty() {
             return Ok(GraphChanges {
                 outputs: Vec::new(),
                 removed_nodes: removed,
@@ -217,6 +290,25 @@ impl NodeGraphAPI for NodeGraph {
 
         // Clear previous execution errors before running
         self.clear_execution_errors();
+
+        // BFS: changed nodes → all downstream nodes
+        let dirty_nodes: HashSet<NodeId> = {
+            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+            let mut affected = HashSet::new();
+            let mut queue: VecDeque<NodeId> = changed.into_iter().collect();
+            while let Some(node_id) = queue.pop_front() {
+                if affected.insert(node_id) {
+                    for edge_id in ns.outgoing_edges_for_node(&node_id) {
+                        if let Some(edge) = ns.get_edge(edge_id) {
+                            if !affected.contains(&edge.to_node_id) {
+                                queue.push_back(edge.to_node_id);
+                            }
+                        }
+                    }
+                }
+            }
+            affected
+        };
 
         let sorted_node_levels = self.topological_sort(&dirty_nodes)?;
 
@@ -258,9 +350,8 @@ impl NodeGraphAPI for NodeGraph {
                                             return (node_id, Err("Node lock poisoned".to_string()))
                                         }
                                     };
-                                    if let Some(sg) = node_read
-                                        .as_any()
-                                        .downcast_ref::<SubGraphNode>()
+                                    if let Some(sg) =
+                                        node_read.as_any().downcast_ref::<SubGraphNode>()
                                     {
                                         sg.execute_internal(
                                             &node_id,
@@ -323,7 +414,9 @@ impl NodeGraphAPI for NodeGraph {
                                 let result = {
                                     let nodes_guard = match shared_nodes.lock() {
                                         Ok(g) => g,
-                                        Err(_) => return (node_id, Err("Lock poisoned".to_string())),
+                                        Err(_) => {
+                                            return (node_id, Err("Lock poisoned".to_string()))
+                                        }
                                     };
                                     if let Some(node) = nodes_guard.get(&node_id) {
                                         let node_clone = Arc::clone(node);
@@ -360,9 +453,7 @@ impl NodeGraphAPI for NodeGraph {
                                                             &ns_clone,
                                                             &cache_clone,
                                                         ) {
-                                                            Ok(ctx) => {
-                                                                node_read.execute(ctx).await
-                                                            }
+                                                            Ok(ctx) => node_read.execute(ctx).await,
                                                             Err(e) => Err(e),
                                                         }
                                                     }
@@ -483,19 +574,11 @@ impl NodeGraphAPI for NodeGraph {
 
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
         if self.node_manager.node_remove(&node_id).is_some() {
-            let dirty_nodes = self.collect_dirty_nodes(vec![node_id])?;
-            self.remove_edges_from_cache(&node_id)?;
-            self.mark_dirty_nodes(dirty_nodes);
-
-            // Clean up NodeStates
             {
                 let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-                guard.remove_node(&node_id);
+                guard.remove_node(&node_id); // remove_edge auto-tracks downstream
             }
-
-            // Track removal for GraphChanges in next execute()
             self.record_removal(node_id);
-
             Ok(())
         } else {
             Err("Node not found.".to_string())
@@ -503,16 +586,12 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            let node_state = guard
-                .get_mut(node_id)
-                .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-            node_state.data = Some(data);
-        }
-
-        let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
-        self.mark_dirty_nodes(dirty_nodes);
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+        let node_state = guard
+            .get_mut(node_id)
+            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
+        node_state.data = Some(data);
+        guard.mark_changed(*node_id);
         Ok(())
     }
 
@@ -522,17 +601,93 @@ impl NodeGraphAPI for NodeGraph {
         slot_index: usize,
         data: Data,
     ) -> Result<(), String> {
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            let slot = guard
-                .input_slot_mut(node_id, slot_index)
-                .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
-            slot.default_value = Some(data.into_value());
-        }
-
-        let dirty_nodes = self.collect_dirty_nodes(vec![*node_id])?;
-        self.mark_dirty_nodes(dirty_nodes);
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+        let slot = guard
+            .input_slot_mut(node_id, slot_index)
+            .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
+        slot.default_value = Some(data.into_value());
+        guard.mark_changed(*node_id);
         Ok(())
+    }
+
+    fn update_node_data_field(
+        &mut self,
+        node_id: &NodeId,
+        data_type: DataType,
+        field_name: &str,
+        value: f64,
+    ) -> Result<(), String> {
+        // Read current field values from existing node data
+        let current_fields: Vec<(&str, f64)> = {
+            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+            let state = ns
+                .get(node_id)
+                .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
+            extract_fields_from_data(data_type, state.data.as_ref())
+        };
+
+        // Assemble new Data by replacing the target field
+        let data = data_type
+            .assemble(|f| {
+                if f == field_name {
+                    value
+                } else {
+                    current_fields
+                        .iter()
+                        .find(|(name, _)| *name == f)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0)
+                }
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Cannot assemble data for type {:?} (non-composite type)",
+                    data_type
+                )
+            })?;
+
+        self.update_node_data(node_id, data)
+    }
+
+    fn update_input_slot_default_field(
+        &mut self,
+        node_id: &NodeId,
+        slot_index: usize,
+        field_name: &str,
+        value: f64,
+    ) -> Result<(), String> {
+        // Read current field values and data_type from existing slot default
+        let (data_type, current_fields) = {
+            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+            let slot = ns.input_slot(node_id, slot_index).ok_or_else(|| {
+                format!("Input slot {} not found for node {:?}", slot_index, node_id)
+            })?;
+            let dt = slot.data_type;
+            let fields = extract_fields_from_default_value(dt, slot.default_value.as_ref());
+            (dt, fields)
+        };
+
+        // Assemble new Data by replacing the target field
+        let data = data_type
+            .assemble(|f| {
+                if f == field_name {
+                    value
+                } else {
+                    current_fields
+                        .iter()
+                        .find(|(name, _)| *name == f)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0)
+                }
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Cannot assemble data for type {:?} (non-composite type)",
+                    data_type
+                )
+            })?;
+
+        self.update_input_slot_default_data(node_id, slot_index, data)
     }
 
     fn connect_nodes(
@@ -555,13 +710,9 @@ impl NodeGraphAPI for NodeGraph {
     }
 
     fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
-        // remove_edge_from_cache removes from NodeStates (including all indexes)
-        let edge = self.remove_edge_from_cache(&edge_id)?;
-
-        let dirty_nodes =
-            self.collect_dirty_nodes(vec![edge.from_node_id, edge.to_node_id])?;
-        self.mark_dirty_nodes(dirty_nodes);
-
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+        ns.remove_edge(&edge_id)
+            .ok_or(format!("Edge does not exist: id: {:?}", edge_id))?;
         Ok(())
     }
 

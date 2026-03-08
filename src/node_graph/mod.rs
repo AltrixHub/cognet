@@ -17,7 +17,7 @@ pub use node_state::*;
 pub use subgraph_ops::*;
 
 use crate::{ErrorTarget, GraphError, NodeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Mutable bookkeeping state used during execution and graph mutation.
@@ -27,7 +27,6 @@ use std::sync::{Arc, Mutex, RwLock};
 /// app layer to hold a write lock on `NodeGraph` during execution.
 #[derive(Default)]
 struct Bookkeeping {
-    dirty_nodes: HashSet<NodeId>,
     errors: HashMap<ErrorTarget, GraphError>,
     removed_since_last_execute: Vec<NodeId>,
 }
@@ -119,16 +118,8 @@ impl NodeGraph {
     /// Used by SubGraphNode to ensure all internal nodes execute
     /// after external inputs are injected into the input proxy.
     pub fn mark_all_nodes_dirty(&self) {
-        let all_ids: Vec<NodeId> = self.node_manager.all_node_ids();
-        if let Ok(mut b) = self.bookkeeping.lock() {
-            b.dirty_nodes.extend(all_ids);
-        }
-    }
-
-    /// Mark specific nodes as dirty.
-    pub(crate) fn mark_dirty(&self, nodes: impl IntoIterator<Item = NodeId>) {
-        if let Ok(mut b) = self.bookkeeping.lock() {
-            b.dirty_nodes.extend(nodes);
+        if let Ok(mut ns) = self.node_states.write() {
+            ns.mark_all_changed();
         }
     }
 

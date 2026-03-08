@@ -65,7 +65,8 @@ impl ExecutionCache {
     /// only outputs of a specific concrete type while keeping others.
     pub fn evict_mesh_outputs(&mut self) -> usize {
         let before = self.outputs.len();
-        self.outputs.retain(|_, data| data.get_type() != DataType::Mesh);
+        self.outputs
+            .retain(|_, data| data.get_type() != DataType::Mesh);
         before - self.outputs.len()
     }
 
