@@ -7,14 +7,14 @@ use futures::future::join_all;
 use async_trait::async_trait;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use crate::{
     node_graph_system::NodeGraphSystem, ColorValue, Data, DataType, DataValue, Edge, EdgeId,
-    ExecutionContext, GraphError, NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta, OutputWriter,
-    SharedExecutionCache, SharedNodeStates, SubGraphNode, Vector3,
+    ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta,
+    OutputWriter, SharedExecutionCache, SharedNodeStates, SubGraphNode, Vector3,
 };
 
 /// Execution event for progress tracking during graph execution.
@@ -39,20 +39,42 @@ pub struct NodeOutput {
     pub data: Data,
 }
 
-/// Changes produced by a graph execution.
-///
-/// Contains all outputs from nodes that were (re)computed, plus any nodes
-/// that were removed since the last execution.
-#[derive(Debug, Clone, Default)]
-pub struct GraphChanges {
-    /// Outputs from nodes computed in this execution (new + updated).
-    pub outputs: Vec<NodeOutput>,
-    /// Nodes removed since the last execute() call.
-    pub removed_nodes: Vec<NodeId>,
+/// Value flowing through an edge after execution.
+#[derive(Debug, Clone)]
+pub struct EdgeValue {
+    pub from_node: NodeId,
+    pub from_slot: usize,
+    pub to_node: NodeId,
+    pub to_slot: usize,
+    pub data: Option<Data>,
 }
 
-impl GraphChanges {
-    /// Create empty changes.
+/// Error from a single node execution.
+#[derive(Debug, Clone)]
+pub struct NodeError {
+    pub message: String,
+}
+
+/// Result of a graph execution.
+///
+/// Contains all outputs from nodes that were (re)computed, edge values,
+/// execution errors, and removed nodes.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionResult {
+    /// Outputs from nodes computed in this execution (new + updated).
+    pub node_outputs: HashMap<NodeId, Vec<Option<Data>>>,
+    /// Values flowing through edges after execution.
+    pub edge_values: HashMap<EdgeId, EdgeValue>,
+    /// Execution errors per node.
+    pub errors: HashMap<NodeId, NodeError>,
+    /// Nodes removed since the last execute() call.
+    pub removed_nodes: Vec<NodeId>,
+    /// Raw outputs for backward compatibility during migration.
+    pub outputs: Vec<NodeOutput>,
+}
+
+impl ExecutionResult {
+    /// Create empty result.
     pub fn empty() -> Self {
         Self::default()
     }
@@ -62,6 +84,9 @@ impl GraphChanges {
         self.outputs.is_empty() && self.removed_nodes.is_empty()
     }
 }
+
+/// Backward-compatible type alias during migration.
+pub type GraphChanges = ExecutionResult;
 
 /// Build an `ExecutionContext` for a node.
 ///
@@ -188,18 +213,18 @@ pub trait NodeGraphAPI {
 
     /// Execute the graph asynchronously.
     ///
-    /// Returns `GraphChanges` containing outputs from computed nodes
-    /// and IDs of nodes removed since the last execution.
-    async fn execute(&self) -> Result<GraphChanges, String>;
+    /// Returns `ExecutionResult` containing outputs from computed nodes,
+    /// edge values, execution errors, and IDs of removed nodes.
+    async fn execute(&self) -> Result<ExecutionResult, String>;
 
     /// Execute the graph with progress callback.
     ///
     /// The callback is called for each node as it starts executing,
     /// completes, or fails. This enables real-time UI updates.
     ///
-    /// Returns `GraphChanges` containing outputs from computed nodes
-    /// and IDs of nodes removed since the last execution.
-    async fn execute_with_progress<F>(&self, on_progress: F) -> Result<GraphChanges, String>
+    /// Returns `ExecutionResult` containing outputs from computed nodes,
+    /// edge values, execution errors, and IDs of removed nodes.
+    async fn execute_with_progress<F>(&self, on_progress: F) -> Result<ExecutionResult, String>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static;
 
@@ -250,11 +275,11 @@ impl NodeGraphAPI for NodeGraph {
         NodeGraph::new()
     }
 
-    async fn execute(&self) -> Result<GraphChanges, String> {
+    async fn execute(&self) -> Result<ExecutionResult, String> {
         self.execute_with_progress(|_| {}).await
     }
 
-    async fn execute_with_progress<F>(&self, on_progress: F) -> Result<GraphChanges, String>
+    async fn execute_with_progress<F>(&self, on_progress: F) -> Result<ExecutionResult, String>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static,
     {
@@ -278,13 +303,13 @@ impl NodeGraphAPI for NodeGraph {
         );
 
         if changed.is_empty() && removed.is_empty() {
-            return Ok(GraphChanges::empty());
+            return Ok(ExecutionResult::empty());
         }
 
         if changed.is_empty() {
-            return Ok(GraphChanges {
-                outputs: Vec::new(),
+            return Ok(ExecutionResult {
                 removed_nodes: removed,
+                ..Default::default()
             });
         }
 
@@ -506,13 +531,18 @@ impl NodeGraphAPI for NodeGraph {
 
         // Collect outputs from executed nodes (Arc-shared for zero-copy)
         let mut outputs = Vec::new();
+        let mut node_outputs: HashMap<NodeId, Vec<Option<Data>>> = HashMap::new();
+        let mut edge_values: HashMap<EdgeId, EdgeValue> = HashMap::new();
+
         if let Ok(ns) = shared_node_states.read() {
             if let Ok(cache) = shared_cache.read() {
                 for node_id in &executed_node_ids {
                     let output_count = ns.output_slot_count(node_id);
-                    for idx in 0..output_count {
+                    let mut slot_outputs = vec![None; output_count];
+                    for (idx, slot_out) in slot_outputs.iter_mut().enumerate() {
                         if let Some(slot) = ns.output_slot(node_id, idx) {
                             if let Some(data) = cache.outputs.get(&slot.id) {
+                                *slot_out = Some(data.share());
                                 outputs.push(NodeOutput {
                                     node_id: *node_id,
                                     slot_index: idx,
@@ -521,13 +551,53 @@ impl NodeGraphAPI for NodeGraph {
                             }
                         }
                     }
+                    node_outputs.insert(*node_id, slot_outputs);
+                }
+
+                // Build edge values from all edges involving executed nodes
+                for (edge_id, edge) in ns.edges() {
+                    if executed_node_ids.contains(&edge.from_node_id) {
+                        let data = cache
+                            .outputs
+                            .get(&edge.from_output_slot_id)
+                            .map(|d| d.share());
+                        edge_values.insert(
+                            *edge_id,
+                            EdgeValue {
+                                from_node: edge.from_node_id,
+                                from_slot: edge.from_output_slot_index,
+                                to_node: edge.to_node_id,
+                                to_slot: edge.to_input_slot_index,
+                                data,
+                            },
+                        );
+                    }
                 }
             }
         }
 
-        Ok(GraphChanges {
-            outputs,
+        // Extract execution errors for nodes
+        let mut errors: HashMap<NodeId, NodeError> = HashMap::new();
+        let all_errors = self.errors();
+        for (target, err) in &all_errors {
+            if let ErrorTarget::Node(node_id) = target {
+                if err.is_execution_error() {
+                    errors.insert(
+                        *node_id,
+                        NodeError {
+                            message: err.message(),
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(ExecutionResult {
+            node_outputs,
+            edge_values,
+            errors,
             removed_nodes: removed,
+            outputs,
         })
     }
 

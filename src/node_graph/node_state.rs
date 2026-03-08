@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 /// Runtime state for a single node instance.
 #[derive(Debug, Clone)]
-pub struct NodeState {
+pub(crate) struct NodeState {
     /// The node type name (references NodeMeta::NAME).
     pub type_name: &'static str,
     /// Current data value (can be modified at runtime).
@@ -24,7 +24,7 @@ impl NodeState {
 
 /// Runtime state for input slots.
 #[derive(Debug, Default, Clone)]
-pub struct InputSlotState {
+pub(crate) struct InputSlotState {
     pub id: InputSlotId,
     pub label: &'static str,
     pub data_type: DataType,
@@ -34,18 +34,18 @@ pub struct InputSlotState {
 
 /// Runtime state for output slots.
 #[derive(Debug, Default, Clone)]
-pub struct OutputSlotState {
+pub(crate) struct OutputSlotState {
     pub id: OutputSlotId,
     pub label: &'static str,
     pub data_type: DataType,
 }
 
 /// Shared handle to `NodeStates` for cross-thread access.
-pub type SharedNodeStates = Arc<RwLock<NodeStates>>;
+pub(crate) type SharedNodeStates = Arc<RwLock<NodeStates>>;
 
 /// Manages all node states in the graph.
 #[derive(Debug, Default, Clone)]
-pub struct NodeStates {
+pub(crate) struct NodeStates {
     /// Node data by NodeId.
     nodes: HashMap<NodeId, NodeState>,
     /// Input slot states by (NodeId, slot_index).
@@ -238,23 +238,9 @@ impl NodeStates {
         self.output_slots.get(&(*node_id, slot_index))
     }
 
-    /// Get mutable output slot state.
-    pub fn output_slot_mut(
-        &mut self,
-        node_id: &NodeId,
-        slot_index: usize,
-    ) -> Option<&mut OutputSlotState> {
-        self.output_slots.get_mut(&(*node_id, slot_index))
-    }
-
     /// Get all node IDs.
     pub fn node_ids(&self) -> impl Iterator<Item = &NodeId> {
         self.nodes.keys()
-    }
-
-    /// Get all nodes.
-    pub fn iter(&self) -> impl Iterator<Item = (&NodeId, &NodeState)> {
-        self.nodes.iter()
     }
 
     /// Add an edge and update lookup indexes.

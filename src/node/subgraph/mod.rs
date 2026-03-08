@@ -325,7 +325,7 @@ impl SubGraphNode {
     /// 1. Inject external inputs into the internal input proxy
     /// 2. Execute the internal graph
     /// 3. Collect outputs from the internal output proxy
-    pub async fn execute_internal(
+    pub(crate) async fn execute_internal(
         &self,
         parent_node_id: &NodeId,
         parent_cache: SharedExecutionCache,

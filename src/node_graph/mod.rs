@@ -4,7 +4,7 @@ pub mod execution_cache;
 pub mod node_graph_api;
 pub mod node_graph_system;
 pub mod node_manager;
-pub mod node_state;
+pub(crate) mod node_state;
 pub mod path_navigation;
 pub mod subgraph_helpers;
 pub mod subgraph_ops;
@@ -13,12 +13,30 @@ pub use edge_info::*;
 pub use execution_cache::*;
 pub use node_graph_api::*;
 pub use node_manager::*;
-pub use node_state::*;
+pub(crate) use node_state::*;
 pub use subgraph_ops::*;
 
-use crate::{ErrorTarget, GraphError, NodeId};
+use crate::{
+    Data, DataType, DataValue, Edge, EdgeId, ErrorTarget, GraphError, InputSlotId, NodeId,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
+
+/// Combined slot information returned by high-level query methods.
+#[derive(Debug, Clone)]
+pub struct SlotInfo {
+    pub label: &'static str,
+    pub data_type: DataType,
+}
+
+/// Combined input slot information including default value.
+#[derive(Debug, Clone)]
+pub struct InputSlotInfo {
+    pub id: InputSlotId,
+    pub label: &'static str,
+    pub data_type: DataType,
+    pub default_value: Option<DataValue>,
+}
 
 /// Mutable bookkeeping state used during execution and graph mutation.
 ///
@@ -52,7 +70,7 @@ impl NodeGraph {
     }
 
     /// Get shared reference to the NodeStates storage.
-    pub fn node_states(&self) -> &Arc<RwLock<NodeStates>> {
+    pub(crate) fn node_states(&self) -> &Arc<RwLock<NodeStates>> {
         &self.node_states
     }
 
@@ -121,6 +139,143 @@ impl NodeGraph {
         if let Ok(mut ns) = self.node_states.write() {
             ns.mark_all_changed();
         }
+    }
+
+    // ── High-level query API ──
+    // These methods provide access to node/slot/edge data without exposing
+    // the internal NodeStates structure.
+
+    /// Get the type name of a node.
+    pub fn node_type_name(&self, node_id: &NodeId) -> Option<&'static str> {
+        let ns = self.node_states.read().ok()?;
+        ns.get(node_id).map(|s| s.type_name)
+    }
+
+    /// Get the data value of a node.
+    pub fn node_data(&self, node_id: &NodeId) -> Option<Data> {
+        let ns = self.node_states.read().ok()?;
+        ns.get(node_id)
+            .and_then(|s| s.data.as_ref().map(|d| d.share()))
+    }
+
+    /// Check if a node exists.
+    pub fn has_node(&self, node_id: &NodeId) -> bool {
+        self.node_states
+            .read()
+            .ok()
+            .map(|ns| ns.get(node_id).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Get input slot count for a node.
+    pub fn input_slot_count(&self, node_id: &NodeId) -> usize {
+        self.node_states
+            .read()
+            .ok()
+            .map(|ns| ns.input_slot_count(node_id))
+            .unwrap_or(0)
+    }
+
+    /// Get output slot count for a node.
+    pub fn output_slot_count(&self, node_id: &NodeId) -> usize {
+        self.node_states
+            .read()
+            .ok()
+            .map(|ns| ns.output_slot_count(node_id))
+            .unwrap_or(0)
+    }
+
+    /// Get the label of an input slot.
+    pub fn input_slot_label(&self, node_id: &NodeId, slot: usize) -> Option<&'static str> {
+        let ns = self.node_states.read().ok()?;
+        ns.input_slot(node_id, slot).map(|s| s.label)
+    }
+
+    /// Get the data type of an input slot.
+    pub fn input_slot_data_type(&self, node_id: &NodeId, slot: usize) -> Option<DataType> {
+        let ns = self.node_states.read().ok()?;
+        ns.input_slot(node_id, slot).map(|s| s.data_type)
+    }
+
+    /// Get the default value of an input slot.
+    pub fn input_slot_default_value(&self, node_id: &NodeId, slot: usize) -> Option<DataValue> {
+        let ns = self.node_states.read().ok()?;
+        ns.input_slot(node_id, slot)
+            .and_then(|s| s.default_value.as_ref().map(Arc::clone))
+    }
+
+    /// Get combined info for an input slot (label + data_type + default_value).
+    pub fn input_slot_info(&self, node_id: &NodeId, slot: usize) -> Option<InputSlotInfo> {
+        let ns = self.node_states.read().ok()?;
+        ns.input_slot(node_id, slot).map(|s| InputSlotInfo {
+            id: s.id,
+            label: s.label,
+            data_type: s.data_type,
+            default_value: s.default_value.as_ref().map(Arc::clone),
+        })
+    }
+
+    /// Get combined info for an output slot (label + data_type).
+    pub fn output_slot_info(&self, node_id: &NodeId, slot: usize) -> Option<SlotInfo> {
+        let ns = self.node_states.read().ok()?;
+        ns.output_slot(node_id, slot).map(|s| SlotInfo {
+            label: s.label,
+            data_type: s.data_type,
+        })
+    }
+
+    /// Get the InputSlotId for an input slot.
+    pub fn input_slot_id(&self, node_id: &NodeId, slot: usize) -> Option<InputSlotId> {
+        let ns = self.node_states.read().ok()?;
+        ns.input_slot(node_id, slot).map(|s| s.id)
+    }
+
+    /// Get the label of an output slot.
+    pub fn output_slot_label(&self, node_id: &NodeId, slot: usize) -> Option<&'static str> {
+        let ns = self.node_states.read().ok()?;
+        ns.output_slot(node_id, slot).map(|s| s.label)
+    }
+
+    /// Get the data type of an output slot.
+    pub fn output_slot_data_type(&self, node_id: &NodeId, slot: usize) -> Option<DataType> {
+        let ns = self.node_states.read().ok()?;
+        ns.output_slot(node_id, slot).map(|s| s.data_type)
+    }
+
+    /// Get all edges (cloned).
+    pub fn edges(&self) -> HashMap<EdgeId, Edge> {
+        self.node_states
+            .read()
+            .ok()
+            .map(|ns| ns.edges().clone())
+            .unwrap_or_default()
+    }
+
+    /// Get an edge by ID.
+    pub fn get_edge_by_id(&self, edge_id: &EdgeId) -> Option<Edge> {
+        let ns = self.node_states.read().ok()?;
+        ns.get_edge(edge_id).cloned()
+    }
+
+    /// Get edges connected to an input slot by (node_id, slot_index).
+    pub fn edges_for_input_slot(&self, node_id: &NodeId, slot: usize) -> Vec<EdgeId> {
+        self.node_states
+            .read()
+            .ok()
+            .and_then(|ns| {
+                let slot_state = ns.input_slot(node_id, slot)?;
+                Some(ns.edges_for_input(&slot_state.id).to_vec())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get outgoing edge IDs from a node.
+    pub fn outgoing_edges(&self, node_id: &NodeId) -> Vec<EdgeId> {
+        self.node_states
+            .read()
+            .ok()
+            .map(|ns| ns.outgoing_edges_for_node(node_id).to_vec())
+            .unwrap_or_default()
     }
 
     /// Record a node removal (will be reported in next execute()).
