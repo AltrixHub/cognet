@@ -551,7 +551,25 @@ impl NodeGraphAPI for NodeGraph {
                             }
                         }
                     }
-                    node_outputs.insert(*node_id, slot_outputs);
+
+                    // For sink nodes (0 outputs), resolve input values via edges
+                    // so display/output nodes can show their received values.
+                    if output_count == 0 {
+                        let input_count = ns.input_slot_count(node_id);
+                        let mut slot_inputs = vec![None; input_count];
+                        for edge in ns.edges().values() {
+                            if edge.to_node_id == *node_id
+                                && (edge.to_input_slot_index) < slot_inputs.len()
+                            {
+                                if let Some(data) = cache.outputs.get(&edge.from_output_slot_id) {
+                                    slot_inputs[edge.to_input_slot_index] = Some(data.share());
+                                }
+                            }
+                        }
+                        node_outputs.insert(*node_id, slot_inputs);
+                    } else {
+                        node_outputs.insert(*node_id, slot_outputs);
+                    }
                 }
 
                 // Build edge values from all edges involving executed nodes
