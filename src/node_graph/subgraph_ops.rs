@@ -5,9 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    DataType, Edge, EdgeId, InputSlot, NodeGraph, NodeGraphAPI, NodeId, OutputSlot, SubGraphNode,
-};
+use crate::{DataType, Edge, EdgeId, NodeGraph, NodeGraphAPI, NodeId, SubGraphNode};
 
 /// Information about an edge crossing the subgraph boundary.
 #[derive(Debug)]
@@ -15,6 +13,9 @@ struct BoundaryEdge {
     edge_id: EdgeId,
     edge: Edge,
 }
+
+/// Classified boundary edges: (incoming, outgoing, internal).
+type BoundaryClassification = (Vec<BoundaryEdge>, Vec<BoundaryEdge>, Vec<BoundaryEdge>);
 
 /// Result of grouping nodes into a subgraph.
 #[derive(Debug)]
@@ -120,20 +121,15 @@ impl NodeGraph {
             let data_type = self.get_edge_data_type(&first.edge)?;
             // Use source node's output slot label (e.g. Vertex→"Position", Number→"Value")
             let source_label = self
-                .get_node_by_id(&first.edge.from_node_id)
-                .and_then(|e| {
-                    e.read().ok().and_then(|g| {
-                        g.get_output_slot_by_index(first.edge.from_output_slot_index)
-                            .map(|s| s.label)
-                    })
+                .node_states
+                .read()
+                .ok()
+                .and_then(|ns| {
+                    ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
+                        .map(|s| s.label)
                 })
                 .unwrap_or("");
-            let input_slot = InputSlot {
-                label: source_label,
-                data_type,
-                ..Default::default()
-            };
-            subgraph.add_input(input_slot)?;
+            subgraph.add_input(source_label, data_type)?;
             for edge in group {
                 input_slot_map.insert(edge.edge_id, idx);
             }
@@ -145,20 +141,15 @@ impl NodeGraph {
             let first = &group[0];
             let data_type = self.get_edge_data_type(&first.edge)?;
             let source_label = self
-                .get_node_by_id(&first.edge.from_node_id)
-                .and_then(|e| {
-                    e.read().ok().and_then(|g| {
-                        g.get_output_slot_by_index(first.edge.from_output_slot_index)
-                            .map(|s| s.label)
-                    })
+                .node_states
+                .read()
+                .ok()
+                .and_then(|ns| {
+                    ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
+                        .map(|s| s.label)
                 })
                 .unwrap_or("");
-            let output_slot = OutputSlot {
-                label: source_label,
-                data_type,
-                ..Default::default()
-            };
-            subgraph.add_output(output_slot)?;
+            subgraph.add_output(source_label, data_type)?;
             for edge in group {
                 output_slot_map.insert(edge.edge_id, idx);
             }
@@ -191,10 +182,11 @@ impl NodeGraph {
         }
 
         let mut terminal_outputs: Vec<TerminalOutput> = Vec::new();
-        for &node_id in node_ids {
-            if let Some(node_entity) = self.get_node_by_id(&node_id) {
-                if let Ok(read_node) = node_entity.read() {
-                    for (slot_idx, slot) in read_node.outputs().iter().enumerate() {
+        if let Ok(ns) = self.node_states.read() {
+            for &node_id in node_ids {
+                let output_count = ns.output_slot_count(&node_id);
+                for slot_idx in 0..output_count {
+                    if let Some(slot) = ns.output_slot(&node_id, slot_idx) {
                         if !consumed_slots.contains(&(node_id, slot_idx))
                             && !slot.label.starts_with('_')
                         {
@@ -214,19 +206,15 @@ impl NodeGraph {
         let terminal_start_idx = deduped_outgoing.len();
         let mut terminal_slot_map: Vec<(NodeId, usize, usize)> = Vec::new();
         for (i, terminal) in terminal_outputs.iter().enumerate() {
-            let output_slot = OutputSlot {
-                label: terminal.label,
-                data_type: terminal.data_type,
-                ..Default::default()
-            };
-            subgraph.add_output(output_slot)?;
-            terminal_slot_map.push((terminal.node_id, terminal.slot_index, terminal_start_idx + i));
+            subgraph.add_output(terminal.label, terminal.data_type)?;
+            terminal_slot_map.push((
+                terminal.node_id,
+                terminal.slot_index,
+                terminal_start_idx + i,
+            ));
         }
 
-        tracing::debug!(
-            "group_nodes: terminal_outputs={}",
-            terminal_outputs.len(),
-        );
+        tracing::debug!("group_nodes: terminal_outputs={}", terminal_outputs.len(),);
 
         let input_proxy_id = subgraph.input_proxy_id();
         let output_proxy_id = subgraph.output_proxy_id();
@@ -242,12 +230,12 @@ impl NodeGraph {
 
                 let internal_id = internal_graph.create_node_by_name(type_name)?;
 
-                // Copy node data
-                if let Some(original) = self.get_node_by_id(&node_id) {
-                    let read_original = original.read().map_err(|e| e.to_string())?;
-                    if let Some(data) = read_original.node_data() {
-                        drop(read_original);
-                        internal_graph.update_node_data(&internal_id, data)?;
+                // Copy node data from NodeStates
+                if let Ok(ns) = self.node_states.read() {
+                    if let Some(state) = ns.get(&node_id) {
+                        if let Some(data) = state.data.as_ref() {
+                            internal_graph.update_node_data(&internal_id, data.share())?;
+                        }
                     }
                 }
 
@@ -310,6 +298,61 @@ impl NodeGraph {
                 &output_proxy_id,
                 *proxy_input_idx,
             )?;
+        }
+
+        // Sync parent NodeStates with SubGraphNode's dynamic slots.
+        // Collect slot info first (needs read), then write.
+        let input_slot_info: Vec<(&'static str, DataType)> = deduped_incoming
+            .iter()
+            .map(|group| {
+                let first = &group[0];
+                let data_type = self
+                    .get_edge_data_type(&first.edge)
+                    .unwrap_or(DataType::Number);
+                let label = self
+                    .node_states
+                    .read()
+                    .ok()
+                    .and_then(|ns| {
+                        ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
+                            .map(|s| s.label)
+                    })
+                    .unwrap_or("");
+                (label, data_type)
+            })
+            .collect();
+
+        let output_slot_info: Vec<(&'static str, DataType)> = deduped_outgoing
+            .iter()
+            .map(|group| {
+                let first = &group[0];
+                let data_type = self
+                    .get_edge_data_type(&first.edge)
+                    .unwrap_or(DataType::Number);
+                let label = self
+                    .node_states
+                    .read()
+                    .ok()
+                    .and_then(|ns| {
+                        ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
+                            .map(|s| s.label)
+                    })
+                    .unwrap_or("");
+                (label, data_type)
+            })
+            .collect();
+
+        {
+            let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+            for (label, data_type) in &input_slot_info {
+                ns.add_input_slot(&subgraph_id, label, *data_type, None);
+            }
+            for (label, data_type) in &output_slot_info {
+                ns.add_output_slot(&subgraph_id, label, *data_type);
+            }
+            for terminal in &terminal_outputs {
+                ns.add_output_slot(&subgraph_id, terminal.label, terminal.data_type);
+            }
         }
 
         // Release the write lock before modifying the parent graph
@@ -396,12 +439,14 @@ impl NodeGraph {
         let internal_graph = subgraph.internal_graph();
 
         // 2. Collect internal nodes (excluding proxies)
-        let internal_cache = internal_graph.shared_cache();
-        let internal_cache_read = internal_cache.read()?;
+        let internal_ns = internal_graph
+            .node_states()
+            .read()
+            .map_err(|e| e.to_string())?;
 
         // Get all internal node IDs by examining edges
         let mut internal_node_ids: HashSet<NodeId> = HashSet::new();
-        for edge in internal_cache_read.edges.values() {
+        for edge in internal_ns.edges().values() {
             if edge.from_node_id != input_proxy_id && edge.from_node_id != output_proxy_id {
                 internal_node_ids.insert(edge.from_node_id);
             }
@@ -413,7 +458,7 @@ impl NodeGraph {
         // 3. Collect edge info we need before dropping locks
         // Edges from InputProxy → internal (maps proxy output slot → internal node/slot)
         let mut input_proxy_edges: Vec<(usize, NodeId, usize)> = Vec::new(); // (proxy_out_idx, to_node, to_slot)
-        for edge in internal_cache_read.edges.values() {
+        for edge in internal_ns.edges().values() {
             if edge.from_node_id == input_proxy_id {
                 input_proxy_edges.push((
                     edge.from_output_slot_index,
@@ -425,7 +470,7 @@ impl NodeGraph {
 
         // Edges from internal → OutputProxy (maps internal node/slot → proxy input slot)
         let mut output_proxy_edges: Vec<(NodeId, usize, usize)> = Vec::new(); // (from_node, from_slot, proxy_in_idx)
-        for edge in internal_cache_read.edges.values() {
+        for edge in internal_ns.edges().values() {
             if edge.to_node_id == output_proxy_id {
                 output_proxy_edges.push((
                     edge.from_node_id,
@@ -437,7 +482,7 @@ impl NodeGraph {
 
         // Internal edges (between non-proxy nodes)
         let mut internal_edges: Vec<(NodeId, usize, NodeId, usize)> = Vec::new();
-        for edge in internal_cache_read.edges.values() {
+        for edge in internal_ns.edges().values() {
             if edge.from_node_id != input_proxy_id
                 && edge.to_node_id != output_proxy_id
                 && internal_node_ids.contains(&edge.from_node_id)
@@ -462,15 +507,14 @@ impl NodeGraph {
             }
         }
 
-        drop(internal_cache_read);
+        drop(internal_ns);
 
         // 4. Collect parent graph edges to/from SubGraphNode
-        let parent_cache = self.shared_cache();
-        let parent_cache_read = parent_cache.read()?;
+        let parent_ns = self.node_states().read().map_err(|e| e.to_string())?;
 
         // Edges entering SubGraphNode (external → subgraph.input[idx])
         let mut parent_incoming: Vec<(NodeId, usize, usize, EdgeId)> = Vec::new(); // (from_node, from_slot, to_slot_idx, edge_id)
-        for (&edge_id, edge) in &parent_cache_read.edges {
+        for (&edge_id, edge) in parent_ns.edges() {
             if edge.to_node_id == subgraph_node_id {
                 parent_incoming.push((
                     edge.from_node_id,
@@ -483,7 +527,7 @@ impl NodeGraph {
 
         // Edges leaving SubGraphNode (subgraph.output[idx] → external)
         let mut parent_outgoing: Vec<(usize, NodeId, usize, EdgeId)> = Vec::new(); // (from_slot_idx, to_node, to_slot, edge_id)
-        for (&edge_id, edge) in &parent_cache_read.edges {
+        for (&edge_id, edge) in parent_ns.edges() {
             if edge.from_node_id == subgraph_node_id {
                 parent_outgoing.push((
                     edge.from_output_slot_index,
@@ -494,7 +538,7 @@ impl NodeGraph {
             }
         }
 
-        drop(parent_cache_read);
+        drop(parent_ns);
         drop(read_subgraph);
 
         // 5. Create copies of internal nodes in parent graph
@@ -545,24 +589,21 @@ impl NodeGraph {
         self.remove_node(subgraph_node_id)?;
 
         let extracted_node_ids: Vec<NodeId> = node_id_remap.values().copied().collect();
-        Ok(UngroupResult {
-            extracted_node_ids,
-        })
+        Ok(UngroupResult { extracted_node_ids })
     }
 
     /// Classify edges relative to a set of selected node IDs.
     fn classify_boundary_edges(
         &self,
         selected: &HashSet<NodeId>,
-    ) -> Result<(Vec<BoundaryEdge>, Vec<BoundaryEdge>, Vec<BoundaryEdge>), String> {
-        let cache = self.shared_cache();
-        let cache_read = cache.read()?;
+    ) -> Result<BoundaryClassification, String> {
+        let ns = self.node_states().read().map_err(|e| e.to_string())?;
 
         let mut incoming = Vec::new(); // external → selected
         let mut outgoing = Vec::new(); // selected → external
         let mut internal = Vec::new(); // selected → selected
 
-        for (&edge_id, edge) in &cache_read.edges {
+        for (&edge_id, edge) in ns.edges() {
             let from_selected = selected.contains(&edge.from_node_id);
             let to_selected = selected.contains(&edge.to_node_id);
 
@@ -588,12 +629,9 @@ impl NodeGraph {
 
     /// Get the DataType for an edge by examining its source output slot.
     fn get_edge_data_type(&self, edge: &Edge) -> Result<DataType, String> {
-        let node = self
-            .get_node_by_id(&edge.from_node_id)
-            .ok_or("Edge source node not found")?;
-        let read_node = node.read().map_err(|e| e.to_string())?;
-        let slot = read_node
-            .get_output_slot_by_index(edge.from_output_slot_index)
+        let ns = self.node_states.read().map_err(|e| e.to_string())?;
+        let slot = ns
+            .output_slot(&edge.from_node_id, edge.from_output_slot_index)
             .ok_or("Edge source output slot not found")?;
         Ok(slot.data_type)
     }
@@ -666,15 +704,12 @@ mod tests {
             .expect("group_nodes");
 
         // Verify SubGraphNode was created
-        let sg_entity = graph
-            .get_node_by_id(&result.subgraph_node_id)
-            .expect("subgraph exists");
-        let read_sg = sg_entity.read().expect("read");
-        assert_eq!(read_sg.node_name(), "SubGraph");
-        // Should have 2 inputs (from num1 and num2) and 1 output (to output)
-        assert_eq!(read_sg.inputs().len(), 2);
-        assert_eq!(read_sg.outputs().len(), 1);
-        drop(read_sg);
+        // Verify SubGraphNode was created with correct ports via NodeStates
+        {
+            let ns = graph.node_states().read().expect("ns");
+            assert_eq!(ns.input_slot_count(&result.subgraph_node_id), 2);
+            assert_eq!(ns.output_slot_count(&result.subgraph_node_id), 1);
+        }
 
         // Verify original add node was removed
         assert!(graph.get_node_by_id(&add).is_none());
@@ -711,7 +746,7 @@ mod tests {
         let external = graph.create_node::<crate::NumberOutput>().unwrap();
 
         graph.connect_nodes(&num1, 0, &add, 0).unwrap();
-        graph.connect_nodes(&add, 0, &mul, 0).unwrap();  // internal
+        graph.connect_nodes(&add, 0, &mul, 0).unwrap(); // internal
         graph.connect_nodes(&add, 0, &external, 0).unwrap(); // intermediate tap
         graph.connect_nodes(&mul, 0, &output, 0).unwrap();
 
@@ -719,14 +754,22 @@ mod tests {
         let selected: HashSet<NodeId> = [add, mul].into_iter().collect();
         let result = graph.group_nodes(&selected, "FilterTest").unwrap();
 
-        let sg_entity = graph.get_node_by_id(&result.subgraph_node_id).unwrap();
-        let read_sg = sg_entity.read().unwrap();
-
-        // 1 input (from num1). Add's second input (slot 1) has no edge → no port.
-        assert_eq!(read_sg.inputs().len(), 1, "should have 1 input port");
-        // 1 output (mul→output). The add→external edge is intermediate
-        // (add's output also feeds mul internally) and should be filtered out.
-        assert_eq!(read_sg.outputs().len(), 1, "should have 1 output port (intermediate filtered)");
+        {
+            let ns = graph.node_states().read().unwrap();
+            // 1 input (from num1). Add's second input (slot 1) has no edge → no port.
+            assert_eq!(
+                ns.input_slot_count(&result.subgraph_node_id),
+                1,
+                "should have 1 input port"
+            );
+            // 1 output (mul→output). The add→external edge is intermediate
+            // (add's output also feeds mul internally) and should be filtered out.
+            assert_eq!(
+                ns.output_slot_count(&result.subgraph_node_id),
+                1,
+                "should have 1 output port (intermediate filtered)"
+            );
+        }
     }
 
     /// Test terminal output detection: a node with no downstream consumers
@@ -745,13 +788,21 @@ mod tests {
         let selected: HashSet<NodeId> = [add].into_iter().collect();
         let result = graph.group_nodes(&selected, "TerminalTest").unwrap();
 
-        let sg_entity = graph.get_node_by_id(&result.subgraph_node_id).unwrap();
-        let read_sg = sg_entity.read().unwrap();
-
-        // 1 input (from num1)
-        assert_eq!(read_sg.inputs().len(), 1, "should have 1 input port");
-        // 1 output (add.output0 is terminal — no consumers)
-        assert_eq!(read_sg.outputs().len(), 1, "should have 1 terminal output port");
+        {
+            let ns = graph.node_states().read().unwrap();
+            // 1 input (from num1)
+            assert_eq!(
+                ns.input_slot_count(&result.subgraph_node_id),
+                1,
+                "should have 1 input port"
+            );
+            // 1 output (add.output0 is terminal — no consumers)
+            assert_eq!(
+                ns.output_slot_count(&result.subgraph_node_id),
+                1,
+                "should have 1 terminal output port"
+            );
+        }
     }
 
     /// Test source-based dedup: same source feeding multiple internal targets
@@ -777,12 +828,20 @@ mod tests {
         let selected: HashSet<NodeId> = [a, b].into_iter().collect();
         let result = graph.group_nodes(&selected, "DedupTest").unwrap();
 
-        let sg_entity = graph.get_node_by_id(&result.subgraph_node_id).unwrap();
-        let read_sg = sg_entity.read().unwrap();
-
-        // With source-based dedup: source.output0 → 1 input port (fans out to A and B)
-        assert_eq!(read_sg.inputs().len(), 1, "should have 1 input port (source deduped)");
-        // 2 outputs (A→out_a, B→out_b)
-        assert_eq!(read_sg.outputs().len(), 2, "should have 2 output ports");
+        {
+            let ns = graph.node_states().read().unwrap();
+            // With source-based dedup: source.output0 → 1 input port (fans out to A and B)
+            assert_eq!(
+                ns.input_slot_count(&result.subgraph_node_id),
+                1,
+                "should have 1 input port (source deduped)"
+            );
+            // 2 outputs (A→out_a, B→out_b)
+            assert_eq!(
+                ns.output_slot_count(&result.subgraph_node_id),
+                2,
+                "should have 2 output ports"
+            );
+        }
     }
 }

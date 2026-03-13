@@ -1,14 +1,14 @@
 use std::sync::{Mutex, MutexGuard, RwLock};
 
-use crate::{Data, NodeCore, NodeId, NodeImpl, NodeValueSetter};
+use crate::{Data, NodeCore, NodeId, NodeImpl};
 use std::{
     any::{type_name, Any, TypeId},
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
-pub trait Node: NodeImpl + NodeValueSetter + NodeCore {}
-impl<T: NodeImpl + NodeValueSetter + NodeCore> Node for T {}
+pub trait Node: NodeImpl + NodeCore {}
+impl<T: NodeImpl + NodeCore> Node for T {}
 
 pub type NodeEntity = Arc<RwLock<dyn Node>>;
 type NodeFactory = Arc<dyn Fn() -> Result<NodeEntity, String> + Send + Sync>;
@@ -89,7 +89,7 @@ impl NodeManager {
 
     pub fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
         let nodes = self.nodes.lock().ok()?;
-        nodes.get(id).map(|node| Arc::clone(node))
+        nodes.get(id).cloned()
     }
 
     pub fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
@@ -175,8 +175,13 @@ impl NodeManager {
         factory: NodeFactory,
         default_data: Option<Data>,
     ) {
-        self.name_registry
-            .insert(name, NodeFactoryWithMeta { factory, default_data });
+        self.name_registry.insert(
+            name,
+            NodeFactoryWithMeta {
+                factory,
+                default_data,
+            },
+        );
     }
 
     /// Create a node by type (compile-time dispatch).
@@ -194,10 +199,7 @@ impl NodeManager {
     /// Create a node by name (runtime dispatch).
     ///
     /// Returns the node ID and default data if successful.
-    pub fn create_node_by_name(
-        &self,
-        name: &str,
-    ) -> Result<(NodeId, Option<Data>), String> {
+    pub fn create_node_by_name(&self, name: &str) -> Result<(NodeId, Option<Data>), String> {
         let factory_meta = self
             .name_registry
             .get(name)

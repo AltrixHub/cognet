@@ -1,15 +1,10 @@
 use crate::{
-    register_nodes, Data, DataType, InputSlot, NodeCategory, NodeCore, NodeImpl, NodeMeta,
-    NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
+    register_nodes, Data, DataType, ExecutionContext, NodeCategory, NodeImpl, NodeMeta, SlotDef,
 };
 
 /// Adds all input numbers together
 #[derive(Debug)]
-pub struct AddListNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct AddListNode;
 
 impl NodeMeta for AddListNode {
     const NAME: &'static str = "AddList";
@@ -28,13 +23,13 @@ impl NodeMeta for AddListNode {
 
 #[async_trait::async_trait]
 impl NodeImpl for AddListNode {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        let data_list = self.input_value(cache.share(), 0)?;
-        let mut result = 0.;
-        for data in data_list {
-            result += data.value()?;
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+        let data_list = ctx.input_values.first().cloned().unwrap_or_default();
+        let mut result = 0.0_f64;
+        for data in &data_list {
+            result += data.value::<f64>()?;
         }
-        self.set_output_data(cache, 0, Data::new(result)?)?;
+        ctx.output_writer.set(0, Data::new(result)?)?;
         Ok(())
     }
 }

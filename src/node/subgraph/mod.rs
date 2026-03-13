@@ -13,8 +13,8 @@ pub use output_proxy::SubGraphOutputNode;
 use std::sync::Arc;
 
 use crate::{
-    Data, DataType, InputSlot, NodeCategory, NodeCore, NodeGraph, NodeGraphAPI, NodeId, NodeImpl,
-    NodeManager, NodeMeta, NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
+    Data, DataType, ExecutionContext, NodeCategory, NodeCore, NodeGraph, NodeGraphAPI, NodeId,
+    NodeImpl, NodeManager, NodeMeta, SharedExecutionCache, SharedNodeStates, SlotDef,
 };
 
 /// A node that contains a nested NodeGraph.
@@ -36,9 +36,6 @@ use crate::{
 /// └──────────────────┘
 /// ```
 pub struct SubGraphNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
     /// The nested graph that this subgraph node manages.
     internal_graph: NodeGraph,
     /// NodeId of the SubGraphInputNode inside the internal graph.
@@ -55,8 +52,8 @@ pub struct SubGraphNode {
 impl std::fmt::Debug for SubGraphNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubGraphNode")
-            .field("inputs", &self.inputs.len())
-            .field("outputs", &self.outputs.len())
+            .field("inputs", &self.input_proxy_counts.len())
+            .field("outputs", &self.output_count())
             .field("input_proxy_id", &self.input_proxy_id)
             .field("output_proxy_id", &self.output_proxy_id)
             .field("label", &self.label)
@@ -73,9 +70,6 @@ impl SubGraphNode {
         let output_proxy_id = internal_graph.create_node::<SubGraphOutputNode>()?;
 
         Ok(Self {
-            node_data: None,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
             internal_graph,
             input_proxy_id,
             output_proxy_id,
@@ -114,26 +108,27 @@ impl SubGraphNode {
         self.label = label.into();
     }
 
+    /// Number of output slots, derived from the internal OutputProxy's input slot count.
+    pub fn output_count(&self) -> usize {
+        self.internal_graph
+            .node_states()
+            .read()
+            .map(|ns| ns.input_slot_count(&self.output_proxy_id))
+            .unwrap_or(0)
+    }
+
     /// Add an input slot to this subgraph node and a corresponding
-    /// output slot on the internal SubGraphInputNode.
-    pub fn add_input(&mut self, slot: InputSlot) -> Result<(), String> {
-        let data_type = slot.data_type;
-        let label = slot.label;
-        self.inputs.push(slot);
+    /// output slot on the internal SubGraphInputNode (via NodeStates).
+    pub fn add_input(&mut self, label: &'static str, data_type: DataType) -> Result<(), String> {
         self.input_proxy_counts.push(1);
 
-        // Add corresponding output on the input proxy (with same label)
-        let proxy = self
+        // Add corresponding output on the input proxy via NodeStates
+        let mut ns = self
             .internal_graph
-            .get_node_by_id(&self.input_proxy_id)
-            .ok_or("Input proxy not found")?;
-        let mut write_proxy = proxy.write().map_err(|e| e.to_string())?;
-        let output_slot = OutputSlot {
-            label,
-            data_type,
-            ..Default::default()
-        };
-        write_proxy.outputs_mut().push(output_slot);
+            .node_states()
+            .write()
+            .map_err(|e| e.to_string())?;
+        ns.add_output_slot(&self.input_proxy_id, label, data_type);
         Ok(())
     }
 
@@ -144,40 +139,34 @@ impl SubGraphNode {
     /// the internal graph.
     pub fn add_multi_input(
         &mut self,
-        slot: InputSlot,
         proxy_count: usize,
         proxy_data_type: DataType,
         proxy_label: &'static str,
     ) -> Result<(), String> {
-        self.inputs.push(slot);
         self.input_proxy_counts.push(proxy_count);
 
-        // Add proxy_count output slots on the input proxy
-        let proxy = self
+        // Add proxy_count output slots on the input proxy via NodeStates
+        let mut ns = self
             .internal_graph
-            .get_node_by_id(&self.input_proxy_id)
-            .ok_or("Input proxy not found")?;
-        let mut write_proxy = proxy.write().map_err(|e| e.to_string())?;
+            .node_states()
+            .write()
+            .map_err(|e| e.to_string())?;
         for _ in 0..proxy_count {
-            write_proxy.outputs_mut().push(OutputSlot {
-                label: proxy_label,
-                data_type: proxy_data_type,
-                ..Default::default()
-            });
+            ns.add_output_slot(&self.input_proxy_id, proxy_label, proxy_data_type);
         }
         Ok(())
     }
 
-    /// Remove the last input slot from this subgraph node and the
+    /// Remove an input slot from this subgraph node and the
     /// corresponding output slot(s) from the internal SubGraphInputNode.
     ///
     /// Returns an error if there are no inputs to remove.
     pub fn remove_input(&mut self, index: usize) -> Result<(), String> {
-        if index >= self.inputs.len() {
+        let input_count = self.input_proxy_counts.len();
+        if index >= input_count {
             return Err(format!(
                 "Input index {} out of range (have {})",
-                index,
-                self.inputs.len()
+                index, input_count
             ));
         }
 
@@ -185,21 +174,17 @@ impl SubGraphNode {
         let proxy_start: usize = self.input_proxy_counts[..index].iter().sum();
         let proxy_count = self.input_proxy_counts[index];
 
-        // Remove from proxy outputs
-        let proxy = self
+        // Remove from internal NodeStates
+        let mut ns = self
             .internal_graph
-            .get_node_by_id(&self.input_proxy_id)
-            .ok_or("Input proxy not found")?;
-        let mut write_proxy = proxy.write().map_err(|e| e.to_string())?;
+            .node_states()
+            .write()
+            .map_err(|e| e.to_string())?;
         for _ in 0..proxy_count {
-            if proxy_start < write_proxy.outputs().len() {
-                write_proxy.outputs_mut().remove(proxy_start);
-            }
+            ns.remove_output_slot(&self.input_proxy_id, proxy_start);
         }
-        drop(write_proxy);
+        drop(ns);
 
-        // Remove from self
-        self.inputs.remove(index);
         self.input_proxy_counts.remove(index);
 
         Ok(())
@@ -210,61 +195,36 @@ impl SubGraphNode {
     ///
     /// Returns an error if the index is out of range.
     pub fn remove_output(&mut self, index: usize) -> Result<(), String> {
-        if index >= self.outputs.len() {
+        let count = self.output_count();
+        if index >= count {
             return Err(format!(
                 "Output index {} out of range (have {})",
-                index,
-                self.outputs.len()
+                index, count
             ));
         }
 
-        // Remove from proxy inputs
-        let proxy = self
+        // Remove from internal NodeStates
+        let mut ns = self
             .internal_graph
-            .get_node_by_id(&self.output_proxy_id)
-            .ok_or("Output proxy not found")?;
-        let mut write_proxy = proxy.write().map_err(|e| e.to_string())?;
-        if index < write_proxy.inputs().len() {
-            write_proxy.inputs_mut().remove(index);
-        }
-        drop(write_proxy);
-
-        // Remove from self
-        self.outputs.remove(index);
+            .node_states()
+            .write()
+            .map_err(|e| e.to_string())?;
+        ns.remove_input_slot(&self.output_proxy_id, index);
 
         Ok(())
     }
 
     /// Add an output slot to this subgraph node and a corresponding
-    /// input slot on the internal SubGraphOutputNode.
-    pub fn add_output(&mut self, slot: OutputSlot) -> Result<(), String> {
-        let data_type = slot.data_type;
-        let label = slot.label;
-        self.outputs.push(slot);
-
-        // Add corresponding input on the output proxy (with same label)
-        let proxy = self
+    /// input slot on the internal SubGraphOutputNode (via NodeStates).
+    pub fn add_output(&mut self, label: &'static str, data_type: DataType) -> Result<(), String> {
+        // Add corresponding input on the output proxy via NodeStates
+        let mut ns = self
             .internal_graph
-            .get_node_by_id(&self.output_proxy_id)
-            .ok_or("Output proxy not found")?;
-        let mut write_proxy = proxy.write().map_err(|e| e.to_string())?;
-        let input_slot = InputSlot {
-            label,
-            data_type,
-            ..Default::default()
-        };
-        write_proxy.inputs_mut().push(input_slot);
+            .node_states()
+            .write()
+            .map_err(|e| e.to_string())?;
+        ns.add_input_slot(&self.output_proxy_id, label, data_type, None);
         Ok(())
-    }
-
-    /// Set the default value for an input port.
-    /// Used for promoted properties - when not connected, this value is injected.
-    pub fn set_input_default(&mut self, input_index: usize, data: Data) -> Result<(), String> {
-        let slot = self
-            .inputs
-            .get_mut(input_index)
-            .ok_or_else(|| format!("Input index {} out of range", input_index))?;
-        slot.set_default_value(data)
     }
 
     /// Inject external input data into the internal input proxy's output cache.
@@ -272,55 +232,79 @@ impl SubGraphNode {
     /// Uses a cursor to map external inputs to proxy outputs:
     /// - For normal inputs (count=1): one value → one proxy output (with default fallback)
     /// - For multi-inputs (count>1): N edge values → N proxy outputs (no default)
-    fn inject_inputs(&self, parent_cache: SharedExecutionCache) -> Result<(), String> {
-        let proxy = self
+    ///
+    /// All slot metadata is read from NodeStates (parent and internal).
+    fn inject_inputs(
+        &self,
+        parent_node_id: &NodeId,
+        parent_cache: &SharedExecutionCache,
+        parent_node_states: &SharedNodeStates,
+    ) -> Result<(), String> {
+        let internal_ns = self
             .internal_graph
-            .get_node_by_id(&self.input_proxy_id)
-            .ok_or("Input proxy not found")?;
-        let read_proxy = proxy.read().map_err(|e| e.to_string())?;
+            .node_states()
+            .read()
+            .map_err(|e| e.to_string())?;
         let internal_cache = self.internal_graph.shared_cache();
 
         let mut proxy_cursor: usize = 0;
+        let input_count = {
+            let ns = parent_node_states.read().map_err(|e| e.to_string())?;
+            ns.input_slot_count(parent_node_id)
+        };
 
-        for (idx, input_slot) in self.inputs.iter().enumerate() {
+        for idx in 0..input_count {
             let count = self.input_proxy_counts.get(idx).copied().unwrap_or(1);
 
             // Collect all edge values for this input slot
+            // Read from parent NodeStates for edge topology, parent cache for output data
+            let ns = parent_node_states.read().map_err(|e| e.to_string())?;
             let parent_cache_read = parent_cache.read()?;
             let mut data_values = Vec::new();
-            for edge_id in parent_cache_read.edges_for_input(&input_slot.id) {
-                if let Some(edge) = parent_cache_read.edges.get(edge_id) {
-                    if let Some(data) = parent_cache_read.outputs.get(&edge.from_output_slot_id) {
-                        data_values.push(data.share());
+            let default_value_ref = if let Some(slot_state) = ns.input_slot(parent_node_id, idx) {
+                for edge_id in ns.edges_for_input(&slot_state.id) {
+                    if let Some(edge) = ns.get_edge(edge_id) {
+                        if let Some(data) = parent_cache_read.outputs.get(&edge.from_output_slot_id)
+                        {
+                            data_values.push(data.share());
+                        }
                     }
                 }
-            }
+                slot_state.default_value.as_ref().map(Arc::clone)
+            } else {
+                None
+            };
             drop(parent_cache_read);
+            drop(ns);
 
             if count == 1 {
                 // Normal 1:1 mapping with default value fallback
                 if let Some(data) = data_values.into_iter().next() {
-                    if let Some(proxy_output_slot) = read_proxy.outputs().get(proxy_cursor) {
+                    if let Some(proxy_slot) =
+                        internal_ns.output_slot(&self.input_proxy_id, proxy_cursor)
+                    {
                         let mut cache = internal_cache.lock()?;
-                        cache.outputs.insert(proxy_output_slot.id, data);
+                        cache.outputs.insert(proxy_slot.id, data);
                     }
-                } else if let Some(default_ref) = input_slot.default_value.as_ref() {
-                    if let Ok(default_data) = Data::from_any(Arc::clone(default_ref)) {
-                        if let Some(proxy_output_slot) = read_proxy.outputs().get(proxy_cursor) {
+                } else if let Some(default_ref) = default_value_ref {
+                    if let Ok(default_data) = Data::from_any(default_ref) {
+                        if let Some(proxy_slot) =
+                            internal_ns.output_slot(&self.input_proxy_id, proxy_cursor)
+                        {
                             let mut cache = internal_cache.lock()?;
-                            cache.outputs.insert(proxy_output_slot.id, default_data);
+                            cache.outputs.insert(proxy_slot.id, default_data);
                         }
                     }
                 }
             } else {
                 // Multi-input: distribute N edge values to N proxy outputs
                 let distribute_count = data_values.len().min(count);
-                for i in 0..distribute_count {
-                    if let Some(proxy_output_slot) = read_proxy.outputs().get(proxy_cursor + i) {
+                for (i, data) in data_values.iter().enumerate().take(distribute_count) {
+                    if let Some(proxy_slot) =
+                        internal_ns.output_slot(&self.input_proxy_id, proxy_cursor + i)
+                    {
                         let mut cache = internal_cache.lock()?;
-                        cache
-                            .outputs
-                            .insert(proxy_output_slot.id, data_values[i].share());
+                        cache.outputs.insert(proxy_slot.id, data.share());
                     }
                 }
             }
@@ -339,46 +323,61 @@ impl SubGraphNode {
     ///
     /// Performs the full execution cycle:
     /// 1. Inject external inputs into the internal input proxy
-    /// 2. Execute the internal graph (requires `&mut self`)
+    /// 2. Execute the internal graph
     /// 3. Collect outputs from the internal output proxy
-    pub async fn execute_internal(
-        &mut self,
+    pub(crate) async fn execute_internal(
+        &self,
+        parent_node_id: &NodeId,
         parent_cache: SharedExecutionCache,
+        parent_node_states: SharedNodeStates,
     ) -> Result<(), String> {
-        self.inject_inputs(parent_cache.share())?;
+        self.inject_inputs(parent_node_id, &parent_cache, &parent_node_states)?;
         // Mark all internal nodes dirty so they execute.
         // This is needed because the internal graph doesn't know that
         // its proxy inputs changed.
         self.internal_graph.mark_all_nodes_dirty();
         let _changes = self.internal_graph.execute().await?;
-        self.collect_outputs(parent_cache)?;
+        self.collect_outputs(parent_node_id, &parent_cache, &parent_node_states)?;
         Ok(())
     }
 
     /// Read results from the internal output proxy and write to this node's outputs.
-    fn collect_outputs(&self, parent_cache: SharedExecutionCache) -> Result<(), String> {
-        let proxy = self
+    ///
+    /// Edge topology is read from internal graph's NodeStates; output values
+    /// from internal cache. Results are written to parent cache using output
+    /// slot IDs from parent NodeStates.
+    fn collect_outputs(
+        &self,
+        parent_node_id: &NodeId,
+        parent_cache: &SharedExecutionCache,
+        parent_node_states: &SharedNodeStates,
+    ) -> Result<(), String> {
+        let internal_ns = self
             .internal_graph
-            .get_node_by_id(&self.output_proxy_id)
-            .ok_or("Output proxy not found")?;
-        let read_proxy = proxy.read().map_err(|e| e.to_string())?;
+            .node_states()
+            .read()
+            .map_err(|e| e.to_string())?;
         let internal_cache = self.internal_graph.shared_cache();
+        let parent_ns = parent_node_states.read().map_err(|e| e.to_string())?;
+        let output_count = parent_ns.output_slot_count(parent_node_id);
 
-        for (idx, output_slot) in self.outputs.iter().enumerate() {
-            // Read data from the output proxy's input in the internal cache
-            if let Some(proxy_input_slot) = read_proxy.inputs().get(idx) {
+        for idx in 0..output_count {
+            let parent_output_slot_id = match parent_ns.output_slot(parent_node_id, idx) {
+                Some(s) => s.id,
+                None => continue,
+            };
+
+            // Find edges connected to the output proxy's input slot at this index
+            if let Some(slot_state) = internal_ns.input_slot(&self.output_proxy_id, idx) {
                 let cache_read = internal_cache.read()?;
-                // Find edges connected to this proxy input
-                for edge_id in cache_read.edges_for_input(&proxy_input_slot.id) {
-                    if let Some(edge) = cache_read.edges.get(edge_id) {
-                        if let Some(data) =
-                            cache_read.outputs.get(&edge.from_output_slot_id)
-                        {
+                for edge_id in internal_ns.edges_for_input(&slot_state.id) {
+                    if let Some(edge) = internal_ns.get_edge(edge_id) {
+                        if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
                             let data = data.share();
                             drop(cache_read);
                             // Write to parent cache output
                             let mut parent_write = parent_cache.lock()?;
-                            parent_write.outputs.insert(output_slot.id, data);
+                            parent_write.outputs.insert(parent_output_slot_id, data);
                             break;
                         }
                     }
@@ -400,22 +399,10 @@ impl NodeMeta for SubGraphNode {
 
 #[async_trait::async_trait]
 impl NodeImpl for SubGraphNode {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        // 1. Inject external inputs into internal input proxy outputs
-        self.inject_inputs(cache.share())?;
-
-        // 2. Execute the internal graph
-        // Note: We need mutable access for execute(), but we only have &self.
-        // The internal graph's dirty nodes are all nodes since we inject fresh inputs.
-        // We use the shared cache directly instead.
-        //
-        // For now, mark all internal nodes as dirty by creating a temporary mutable graph.
-        // This is a limitation - in practice, the UI layer will call execute() on
-        // the parent graph which owns SubGraphNode mutably.
-
-        // 3. Collect outputs from internal output proxy
-        self.collect_outputs(cache)?;
-
+    async fn execute(&self, _ctx: ExecutionContext) -> Result<(), String> {
+        // SubGraphNode execution is handled by execute_internal() which is called
+        // directly by the execution engine with the parent cache.
+        // This NodeImpl::execute() is not called for SubGraphNode.
         Ok(())
     }
 }
@@ -426,43 +413,16 @@ impl NodeCore for SubGraphNode {
         "SubGraph"
     }
 
-    fn node_data(&self) -> Option<Data> {
-        self.node_data.as_ref().map(|d| d.share())
-    }
-
-    fn node_data_mut(&mut self) -> &mut Option<Data> {
-        &mut self.node_data
-    }
-
-    fn inputs(&self) -> &Vec<InputSlot> {
-        &self.inputs
-    }
-
-    fn inputs_mut(&mut self) -> &mut Vec<InputSlot> {
-        &mut self.inputs
-    }
-
-    fn outputs(&self) -> &Vec<OutputSlot> {
-        &self.outputs
-    }
-
-    fn outputs_mut(&mut self) -> &mut Vec<OutputSlot> {
-        &mut self.outputs
-    }
-
     fn register_in(manager: &mut NodeManager) -> Result<(), String> {
         let factory = Arc::new(|| {
-            SubGraphNode::new("SubGraph").map(|node| {
-                Arc::new(std::sync::RwLock::new(node)) as crate::NodeEntity
-            })
+            SubGraphNode::new("SubGraph")
+                .map(|node| Arc::new(std::sync::RwLock::new(node)) as crate::NodeEntity)
         });
         manager.register_factory::<SubGraphNode>(factory.clone())?;
         manager.register_factory_with_name("SubGraph", factory, None);
         Ok(())
     }
 }
-
-impl NodeValueSetter for SubGraphNode {}
 
 // Register the SubGraphNode factory
 inventory::submit! {
@@ -489,29 +449,30 @@ mod tests {
     #[tokio::test]
     async fn test_subgraph_creation() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
-        let subgraph_id = graph.create_node::<SubGraphNode>().expect("Failed to create subgraph");
+        let subgraph_id = graph
+            .create_node::<SubGraphNode>()
+            .expect("Failed to create subgraph");
 
         let node = graph.get_node_by_id(&subgraph_id).expect("Node not found");
         let read = node.read().expect("Lock failed");
         assert_eq!(read.node_name(), "SubGraph");
-        assert!(read.inputs().is_empty());
-        assert!(read.outputs().is_empty());
+        drop(read);
+
+        let ns = graph.node_states().read().expect("NodeStates lock");
+        assert_eq!(ns.input_slot_count(&subgraph_id), 0);
+        assert_eq!(ns.output_slot_count(&subgraph_id), 0);
     }
 
     #[tokio::test]
     async fn test_subgraph_has_proxies() {
         let subgraph = SubGraphNode::new("Test").expect("Failed to create subgraph");
-        assert!(
-            subgraph
-                .internal_graph
-                .get_node_by_id(&subgraph.input_proxy_id)
-                .is_some()
-        );
-        assert!(
-            subgraph
-                .internal_graph
-                .get_node_by_id(&subgraph.output_proxy_id)
-                .is_some()
-        );
+        assert!(subgraph
+            .internal_graph
+            .get_node_by_id(&subgraph.input_proxy_id)
+            .is_some());
+        assert!(subgraph
+            .internal_graph
+            .get_node_by_id(&subgraph.output_proxy_id)
+            .is_some());
     }
 }

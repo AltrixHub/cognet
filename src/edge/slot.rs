@@ -1,6 +1,5 @@
 use std::{
     any::{type_name, Any, TypeId},
-    fmt::Debug,
     sync::Arc,
 };
 
@@ -120,6 +119,36 @@ impl DataType {
         ]
     }
 
+    /// Field names for composite types. Primitive types return an empty slice.
+    pub fn field_names(&self) -> &'static [&'static str] {
+        match self {
+            DataType::Vector3 => &["x", "y", "z"],
+            DataType::Color => &["r", "g", "b", "a"],
+            _ => &[],
+        }
+    }
+
+    /// Assemble a `Data` value from individual field values.
+    /// Returns `None` for primitive (non-composite) types.
+    pub fn assemble(&self, read_field: impl Fn(&str) -> f64) -> Option<Data> {
+        match self {
+            DataType::Vector3 => Data::new(Vector3::new(
+                read_field("x"),
+                read_field("y"),
+                read_field("z"),
+            ))
+            .ok(),
+            DataType::Color => Data::new(ColorValue::new(
+                read_field("r"),
+                read_field("g"),
+                read_field("b"),
+                read_field("a"),
+            ))
+            .ok(),
+            _ => None,
+        }
+    }
+
     fn type_id(&self) -> TypeId {
         match self {
             DataType::Number => TypeId::of::<f64>(),
@@ -146,23 +175,6 @@ impl DataType {
             DataType::Bool => "Bool",
             DataType::BRep => "BRep",
             DataType::Domain(name) => name,
-        }
-    }
-
-    fn valid_data(&self, data: &Data) -> bool {
-        *self == data.data_type
-    }
-
-    fn _valid_data_value_type(&self, value: &DataValue) -> bool {
-        match self {
-            DataType::Number => value.downcast_ref::<f64>().is_some(),
-            DataType::String => value.downcast_ref::<String>().is_some(),
-            // Mesh, BRep, Domain accept any type (dynamic downcast)
-            DataType::Mesh | DataType::BRep | DataType::Domain(_) => true,
-            DataType::Vector3 => value.downcast_ref::<Vector3>().is_some(),
-            DataType::Color => value.downcast_ref::<ColorValue>().is_some(),
-            DataType::Vertices => value.downcast_ref::<Vertices>().is_some(),
-            DataType::Bool => value.downcast_ref::<bool>().is_some(),
         }
     }
 }
@@ -338,10 +350,7 @@ impl Data {
             _ => return Err("Unsupported data type".to_string()),
         };
 
-        Ok(Data {
-            value: Arc::from(value),
-            data_type,
-        })
+        Ok(Data { value, data_type })
     }
 
     pub fn share(&self) -> Self {
@@ -349,6 +358,11 @@ impl Data {
             value: Arc::clone(&self.value),
             data_type: self.data_type,
         }
+    }
+
+    /// Consume this Data and return the inner `DataValue` (`Arc<dyn Any + Send + Sync>`).
+    pub fn into_value(self) -> DataValue {
+        self.value
     }
 
     pub fn value<T: 'static>(&self) -> Result<&T, String> {
@@ -383,59 +397,4 @@ impl Data {
     pub fn get_type(&self) -> DataType {
         self.data_type
     }
-}
-
-#[derive(Debug, Default)]
-pub struct InputSlot {
-    pub id: InputSlotId,
-    pub label: &'static str,
-    pub data_type: DataType,
-    pub default_value: Option<DataValue>,
-    pub max_connections: Option<usize>,
-}
-
-impl InputSlot {
-    pub fn default_value<T: 'static>(&self) -> Result<&T, String> {
-        if TypeId::of::<T>() == self.data_type.type_id() {
-            let default_value = self
-                .default_value
-                .as_ref()
-                .ok_or_else(|| format!("Input slot doesn't have default value"))?;
-            default_value.downcast_ref::<T>().ok_or_else(|| {
-                format!(
-                    "Data type mismatch: Expected {}, but got {}",
-                    self.data_type.type_name(),
-                    type_name::<T>()
-                )
-            })
-        } else {
-            Err(format!(
-                "Data type mismatch: Expected {}, but got {}",
-                self.data_type.type_name(),
-                type_name::<T>()
-            ))
-        }
-    }
-
-    pub fn set_default_value(&mut self, data: Data) -> Result<(), String> {
-        if !self.data_type.valid_data(&data) {
-            return Err(format!(
-                "Failed set input slot default value due to type mismatch: expected {}",
-                self.data_type.type_name(),
-            ));
-        }
-        self.default_value = Some(data.value);
-        Ok(())
-    }
-
-    pub fn max_connections(&self) -> &Option<usize> {
-        &self.max_connections
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct OutputSlot {
-    pub id: OutputSlotId,
-    pub label: &'static str,
-    pub data_type: DataType,
 }

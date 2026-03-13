@@ -1,14 +1,10 @@
 use crate::{
-    register_nodes, Data, DataType, DefaultValue, InputSlot, NodeCategory, NodeCore, NodeImpl,
-    NodeMeta, NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
+    register_nodes, DataType, DefaultValue, ExecutionContext, NodeCategory, NodeImpl, NodeMeta,
+    SlotDef,
 };
 
 #[derive(Debug)]
-pub struct StringNode {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct StringNode;
 
 impl NodeMeta for StringNode {
     const NAME: &'static str = "String";
@@ -24,9 +20,9 @@ impl NodeMeta for StringNode {
 
 #[async_trait::async_trait]
 impl NodeImpl for StringNode {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        let node_data = self.node_data().ok_or("Failed to get node data")?;
-        self.set_output_data(cache, 0, node_data)?;
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+        let node_data = ctx.node_data.ok_or("Failed to get node data")?;
+        ctx.output_writer.set(0, node_data)?;
         Ok(())
     }
 }

@@ -4,17 +4,13 @@
 //! which is passed through to the output.
 
 use crate::{
-    register_nodes, Data, DataType, DefaultValue, InputSlot, NodeCategory, NodeCore, NodeImpl,
-    NodeMeta, NodeValueSetter, OutputSlot, SharedExecutionCache, SlotDef,
+    register_nodes, DataType, DefaultValue, ExecutionContext, NodeCategory, NodeImpl, NodeMeta,
+    SlotDef,
 };
 
 /// A Vector3 value node that outputs a 3D vector (x, y, z).
 #[derive(Debug)]
-pub struct Vector3Node {
-    pub node_data: Option<Data>,
-    pub inputs: Vec<InputSlot>,
-    pub outputs: Vec<OutputSlot>,
-}
+pub struct Vector3Node;
 
 impl NodeMeta for Vector3Node {
     const NAME: &'static str = "Vector3";
@@ -34,9 +30,9 @@ impl NodeMeta for Vector3Node {
 
 #[async_trait::async_trait]
 impl NodeImpl for Vector3Node {
-    async fn execute(&self, cache: SharedExecutionCache) -> Result<(), String> {
-        let node_data = self.node_data().ok_or("Failed to get node data")?;
-        self.set_output_data(cache, 0, node_data)?;
+    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+        let node_data = ctx.node_data.ok_or("Failed to get node data")?;
+        ctx.output_writer.set(0, node_data)?;
         Ok(())
     }
 }

@@ -3,7 +3,7 @@
 //! This module provides compile-time metadata about node types,
 //! allowing UI to access node information without async locks.
 
-use crate::{ColorValue, Data, DataType, InputSlot, OutputSlot, Vector3};
+use crate::{ColorValue, Data, DataType, Vector3};
 use std::collections::HashMap;
 
 /// Category for organizing nodes in the UI.
@@ -61,6 +61,18 @@ pub enum DefaultValue {
 }
 
 impl DefaultValue {
+    /// Return the `DataType` corresponding to this default value.
+    pub fn data_type(&self) -> Option<DataType> {
+        match self {
+            Self::None => None,
+            Self::Number(_) => Some(DataType::Number),
+            Self::String(_) => Some(DataType::String),
+            Self::Vector3 { .. } => Some(DataType::Vector3),
+            Self::Color { .. } => Some(DataType::Color),
+            Self::Bool(_) => Some(DataType::Bool),
+        }
+    }
+
     /// Convert to Option<Data> at runtime.
     pub fn to_data(self) -> Option<Data> {
         match self {
@@ -80,37 +92,6 @@ pub struct SlotDef {
     pub label: &'static str,
     pub data_type: DataType,
     pub max_connections: Option<usize>,
-}
-
-impl SlotDef {
-    /// Create an InputSlot from this definition.
-    pub fn to_input_slot(&self) -> InputSlot {
-        InputSlot {
-            label: self.label,
-            data_type: self.data_type,
-            max_connections: self.max_connections,
-            ..Default::default()
-        }
-    }
-
-    /// Create an OutputSlot from this definition.
-    pub fn to_output_slot(&self) -> OutputSlot {
-        OutputSlot {
-            label: self.label,
-            data_type: self.data_type,
-            ..Default::default()
-        }
-    }
-}
-
-/// Create InputSlots from a slice of SlotDefs.
-pub fn inputs_from_defs(defs: &[SlotDef]) -> Vec<InputSlot> {
-    defs.iter().map(|d| d.to_input_slot()).collect()
-}
-
-/// Create OutputSlots from a slice of SlotDefs.
-pub fn outputs_from_defs(defs: &[SlotDef]) -> Vec<OutputSlot> {
-    defs.iter().map(|d| d.to_output_slot()).collect()
 }
 
 /// Trait for nodes to provide static metadata.
