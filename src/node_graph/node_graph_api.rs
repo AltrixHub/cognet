@@ -230,6 +230,10 @@ pub trait NodeGraphAPI {
 
     // Sync methods for graph structure operations
     fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String>;
+    fn create_node_with_id<T: NodeImpl + NodeMeta + 'static>(
+        &mut self,
+        id: NodeId,
+    ) -> Result<NodeId, String>;
     fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String>;
     fn create_node_by_name_with_id(&mut self, id: NodeId, name: &str) -> Result<NodeId, String>;
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
@@ -624,6 +628,26 @@ impl NodeGraphAPI for NodeGraph {
         let node_id = self.node_manager.create_node::<T>()?;
 
         // Register in NodeStates
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            guard.add_node(
+                node_id,
+                T::NAME,
+                T::DEFAULT_VALUE.to_data(),
+                T::INPUTS,
+                T::OUTPUTS,
+            );
+        }
+
+        Ok(node_id)
+    }
+
+    fn create_node_with_id<T: NodeImpl + NodeMeta + 'static>(
+        &mut self,
+        id: NodeId,
+    ) -> Result<NodeId, String> {
+        let node_id = self.node_manager.create_node_with_id::<T>(id)?;
+
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             guard.add_node(

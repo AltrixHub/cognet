@@ -196,6 +196,24 @@ impl NodeManager {
         }
     }
 
+    /// Create a node by type with a pre-generated NodeId (compile-time dispatch).
+    ///
+    /// Same as `create_node()` but uses the caller-provided `id` instead of
+    /// generating a fresh one. Allows callers to know the NodeId before the
+    /// node is actually created (e.g., for declarative change queues).
+    pub fn create_node_with_id<T: NodeImpl + 'static>(
+        &mut self,
+        id: NodeId,
+    ) -> Result<NodeId, String> {
+        if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
+            let node = factory()?;
+            self.node_insert(id, node);
+            Ok(id)
+        } else {
+            Err(format!("{:?} is not registered", TypeId::of::<T>()))
+        }
+    }
+
     /// Create a node by name (runtime dispatch).
     ///
     /// Returns the node ID and default data if successful.
