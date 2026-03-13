@@ -231,6 +231,7 @@ pub trait NodeGraphAPI {
     // Sync methods for graph structure operations
     fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String>;
     fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String>;
+    fn create_node_by_name_with_id(&mut self, id: NodeId, name: &str) -> Result<NodeId, String>;
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), String>;
     fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String>;
     fn update_input_slot_default_data(
@@ -658,6 +659,26 @@ impl NodeGraphAPI for NodeGraph {
         }
 
         Ok(node_id)
+    }
+
+    fn create_node_by_name_with_id(&mut self, id: NodeId, name: &str) -> Result<NodeId, String> {
+        let (_node_id, default_data) = self.node_manager.create_node_by_name_with_id(id, name)?;
+
+        let type_info = crate::get_node_type_info(name)
+            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
+
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            guard.add_node(
+                id,
+                type_info.name,
+                default_data,
+                type_info.inputs,
+                type_info.outputs,
+            );
+        }
+
+        Ok(id)
     }
 
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
