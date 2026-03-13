@@ -1,4 +1,4 @@
-use cognet::{AddNode, Data, NodeGraph, NodeGraphAPI, NumberNode};
+use cognet::{AddNode, Data, NodeGraph, NodeGraphRead, NodeGraphWrite, NumberNode};
 
 #[tokio::main]
 async fn main() -> Result<(), String> {

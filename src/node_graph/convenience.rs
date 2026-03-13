@@ -54,7 +54,7 @@ impl NodeGraph {
 
 #[cfg(test)]
 mod tests {
-    use crate::NodeGraphAPI;
+    use crate::NodeGraphWrite;
 
     #[tokio::test]
     async fn test_node_ids() {

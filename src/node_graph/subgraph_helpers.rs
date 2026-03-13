@@ -3,7 +3,7 @@
 //! These methods provide direct access to SubGraphNode operations
 //! without requiring callers to perform entity lookup + downcast manually.
 
-use crate::{Data, DataType, NodeGraph, NodeGraphAPI, NodeId, SubGraphNode};
+use crate::{Data, DataType, NodeGraph, NodeGraphRead, NodeId, SubGraphNode};
 
 use super::EdgeInfo;
 
@@ -261,7 +261,7 @@ impl NodeGraph {
 
 #[cfg(test)]
 mod tests {
-    use crate::NodeGraphAPI;
+    use crate::NodeGraphWrite;
 
     #[tokio::test]
     async fn test_is_subgraph_node() {

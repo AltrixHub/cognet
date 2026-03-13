@@ -4,7 +4,6 @@ use tokio::{runtime::Handle, task};
 #[cfg(target_arch = "wasm32")]
 use futures::future::join_all;
 
-use async_trait::async_trait;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -205,30 +204,18 @@ fn extract_fields_from_default_value(
     }
 }
 
-#[async_trait]
-pub trait NodeGraphAPI {
-    fn new() -> Result<Self, String>
-    where
-        Self: Sized;
+/// Read-only queries on a node graph.
+pub trait NodeGraphRead {
+    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
+    fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId>;
+    fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)>;
+    fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
+    fn node_variants(&self) -> &HashSet<String>;
+    fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
+}
 
-    /// Execute the graph asynchronously.
-    ///
-    /// Returns `ExecutionResult` containing outputs from computed nodes,
-    /// edge values, execution errors, and IDs of removed nodes.
-    async fn execute(&self) -> Result<ExecutionResult, String>;
-
-    /// Execute the graph with progress callback.
-    ///
-    /// The callback is called for each node as it starts executing,
-    /// completes, or fails. This enables real-time UI updates.
-    ///
-    /// Returns `ExecutionResult` containing outputs from computed nodes,
-    /// edge values, execution errors, and IDs of removed nodes.
-    async fn execute_with_progress<F>(&self, on_progress: F) -> Result<ExecutionResult, String>
-    where
-        F: Fn(ExecutionEvent) + Send + Sync + 'static;
-
-    // Sync methods for graph structure operations
+/// Mutation methods on a node graph.
+pub trait NodeGraphWrite {
     fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String>;
     fn create_node_with_id<T: NodeImpl + NodeMeta + 'static>(
         &mut self,
@@ -258,9 +245,6 @@ pub trait NodeGraphAPI {
         field_name: &str,
         value: f64,
     ) -> Result<(), String>;
-    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
-    fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId>;
-    fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)>;
     fn connect_nodes(
         &mut self,
         from_node_id: &NodeId,
@@ -269,22 +253,287 @@ pub trait NodeGraphAPI {
         to_input_slot_index: usize,
     ) -> Result<EdgeId, String>;
     fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String>;
-    fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String>;
-    fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
-    fn node_variants(&self) -> &HashSet<String>;
 }
 
-#[async_trait]
-impl NodeGraphAPI for NodeGraph {
-    fn new() -> Result<Self, String> {
-        NodeGraph::new()
+impl NodeGraphRead for NodeGraph {
+    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity> {
+        self.node_manager.get_node_by_id(node_id)
     }
 
-    async fn execute(&self) -> Result<ExecutionResult, String> {
+    fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
+        self.node_manager.get_node_ids_by_type::<T>()
+    }
+
+    fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
+        self.node_manager.get_nodes_by_ids(ids)
+    }
+
+    fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
+        let ns = self.node_states.read().ok()?;
+        let slot = ns.output_slot(node_id, output_slot_index)?;
+        let slot_id = slot.id;
+        drop(ns);
+
+        let cache = self.cache.read().ok()?;
+        cache.outputs.get(&slot_id).map(|data| data.share())
+    }
+
+    fn node_variants(&self) -> &HashSet<String> {
+        self.node_manager.variants()
+    }
+
+    fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String> {
+        let ns = self.node_states.read().map_err(|e| e.to_string())?;
+        ns.get_edge(&edge_id)
+            .cloned()
+            .ok_or(format!("Edge not found: id {:?}", edge_id))
+    }
+}
+
+impl NodeGraphWrite for NodeGraph {
+    fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
+        let node_id = self.node_manager.create_node::<T>()?;
+
+        // Register in NodeStates
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            guard.add_node(
+                node_id,
+                T::NAME,
+                T::DEFAULT_VALUE.to_data(),
+                T::INPUTS,
+                T::OUTPUTS,
+            );
+        }
+
+        Ok(node_id)
+    }
+
+    fn create_node_with_id<T: NodeImpl + NodeMeta + 'static>(
+        &mut self,
+        id: NodeId,
+    ) -> Result<NodeId, String> {
+        let node_id = self.node_manager.create_node_with_id::<T>(id)?;
+
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            guard.add_node(
+                node_id,
+                T::NAME,
+                T::DEFAULT_VALUE.to_data(),
+                T::INPUTS,
+                T::OUTPUTS,
+            );
+        }
+
+        Ok(node_id)
+    }
+
+    fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String> {
+        // Create node and get default data from factory
+        let (node_id, default_data) = self.node_manager.create_node_by_name(name)?;
+
+        // Get type info for slot counts
+        let type_info = crate::get_node_type_info(name)
+            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
+
+        // Register in NodeStates
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            guard.add_node(
+                node_id,
+                type_info.name,
+                default_data,
+                type_info.inputs,
+                type_info.outputs,
+            );
+        }
+
+        Ok(node_id)
+    }
+
+    fn create_node_by_name_with_id(&mut self, id: NodeId, name: &str) -> Result<NodeId, String> {
+        let (_node_id, default_data) = self.node_manager.create_node_by_name_with_id(id, name)?;
+
+        let type_info = crate::get_node_type_info(name)
+            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
+
+        {
+            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            guard.add_node(
+                id,
+                type_info.name,
+                default_data,
+                type_info.inputs,
+                type_info.outputs,
+            );
+        }
+
+        Ok(id)
+    }
+
+    fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
+        if self.node_manager.node_remove(&node_id).is_some() {
+            {
+                let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+                guard.remove_node(&node_id); // remove_edge auto-tracks downstream
+            }
+            self.record_removal(node_id);
+            Ok(())
+        } else {
+            Err("Node not found.".to_string())
+        }
+    }
+
+    fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+        let node_state = guard
+            .get_mut(node_id)
+            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
+        node_state.data = Some(data);
+        guard.mark_changed(*node_id);
+        Ok(())
+    }
+
+    fn update_input_slot_default_data(
+        &mut self,
+        node_id: &NodeId,
+        slot_index: usize,
+        data: Data,
+    ) -> Result<(), String> {
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+        let slot = guard
+            .input_slot_mut(node_id, slot_index)
+            .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
+        slot.default_value = Some(data.into_value());
+        guard.mark_changed(*node_id);
+        Ok(())
+    }
+
+    fn update_node_data_field(
+        &mut self,
+        node_id: &NodeId,
+        data_type: DataType,
+        field_name: &str,
+        value: f64,
+    ) -> Result<(), String> {
+        // Read current field values from existing node data
+        let current_fields: Vec<(&str, f64)> = {
+            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+            let state = ns
+                .get(node_id)
+                .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
+            extract_fields_from_data(data_type, state.data.as_ref())
+        };
+
+        // Assemble new Data by replacing the target field
+        let data = data_type
+            .assemble(|f| {
+                if f == field_name {
+                    value
+                } else {
+                    current_fields
+                        .iter()
+                        .find(|(name, _)| *name == f)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0)
+                }
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Cannot assemble data for type {:?} (non-composite type)",
+                    data_type
+                )
+            })?;
+
+        self.update_node_data(node_id, data)
+    }
+
+    fn update_input_slot_default_field(
+        &mut self,
+        node_id: &NodeId,
+        slot_index: usize,
+        field_name: &str,
+        value: f64,
+    ) -> Result<(), String> {
+        // Read current field values and data_type from existing slot default
+        let (data_type, current_fields) = {
+            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+            let slot = ns.input_slot(node_id, slot_index).ok_or_else(|| {
+                format!("Input slot {} not found for node {:?}", slot_index, node_id)
+            })?;
+            let dt = slot.data_type;
+            let fields = extract_fields_from_default_value(dt, slot.default_value.as_ref());
+            (dt, fields)
+        };
+
+        // Assemble new Data by replacing the target field
+        let data = data_type
+            .assemble(|f| {
+                if f == field_name {
+                    value
+                } else {
+                    current_fields
+                        .iter()
+                        .find(|(name, _)| *name == f)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0)
+                }
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Cannot assemble data for type {:?} (non-composite type)",
+                    data_type
+                )
+            })?;
+
+        self.update_input_slot_default_data(node_id, slot_index, data)
+    }
+
+    fn connect_nodes(
+        &mut self,
+        from_node_id: &NodeId,
+        from_output_slot_index: usize,
+        to_node_id: &NodeId,
+        to_input_slot_index: usize,
+    ) -> Result<EdgeId, String> {
+        let edge = self
+            .create_edge(
+                from_node_id,
+                from_output_slot_index,
+                to_node_id,
+                to_input_slot_index,
+            )
+            .map_err(|e| e.to_string())?;
+
+        self.add_edge(edge)
+    }
+
+    fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+        ns.remove_edge(&edge_id)
+            .ok_or(format!("Edge does not exist: id: {:?}", edge_id))?;
+        Ok(())
+    }
+}
+
+impl NodeGraph {
+    /// Execute the graph asynchronously.
+    ///
+    /// Returns `ExecutionResult` containing outputs from computed nodes,
+    /// edge values, execution errors, and IDs of removed nodes.
+    pub async fn execute(&self) -> Result<ExecutionResult, String> {
         self.execute_with_progress(|_| {}).await
     }
 
-    async fn execute_with_progress<F>(&self, on_progress: F) -> Result<ExecutionResult, String>
+    /// Execute the graph with progress callback.
+    ///
+    /// The callback is called for each node as it starts executing,
+    /// completes, or fails. This enables real-time UI updates.
+    ///
+    /// Returns `ExecutionResult` containing outputs from computed nodes,
+    /// edge values, execution errors, and IDs of removed nodes.
+    pub async fn execute_with_progress<F>(&self, on_progress: F) -> Result<ExecutionResult, String>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static,
     {
@@ -622,263 +871,5 @@ impl NodeGraphAPI for NodeGraph {
             removed_nodes: removed,
             outputs,
         })
-    }
-
-    fn create_node<T: NodeImpl + NodeMeta + 'static>(&mut self) -> Result<NodeId, String> {
-        let node_id = self.node_manager.create_node::<T>()?;
-
-        // Register in NodeStates
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            guard.add_node(
-                node_id,
-                T::NAME,
-                T::DEFAULT_VALUE.to_data(),
-                T::INPUTS,
-                T::OUTPUTS,
-            );
-        }
-
-        Ok(node_id)
-    }
-
-    fn create_node_with_id<T: NodeImpl + NodeMeta + 'static>(
-        &mut self,
-        id: NodeId,
-    ) -> Result<NodeId, String> {
-        let node_id = self.node_manager.create_node_with_id::<T>(id)?;
-
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            guard.add_node(
-                node_id,
-                T::NAME,
-                T::DEFAULT_VALUE.to_data(),
-                T::INPUTS,
-                T::OUTPUTS,
-            );
-        }
-
-        Ok(node_id)
-    }
-
-    fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String> {
-        // Create node and get default data from factory
-        let (node_id, default_data) = self.node_manager.create_node_by_name(name)?;
-
-        // Get type info for slot counts
-        let type_info = crate::get_node_type_info(name)
-            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
-
-        // Register in NodeStates
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            guard.add_node(
-                node_id,
-                type_info.name,
-                default_data,
-                type_info.inputs,
-                type_info.outputs,
-            );
-        }
-
-        Ok(node_id)
-    }
-
-    fn create_node_by_name_with_id(&mut self, id: NodeId, name: &str) -> Result<NodeId, String> {
-        let (_node_id, default_data) = self.node_manager.create_node_by_name_with_id(id, name)?;
-
-        let type_info = crate::get_node_type_info(name)
-            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
-
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            guard.add_node(
-                id,
-                type_info.name,
-                default_data,
-                type_info.inputs,
-                type_info.outputs,
-            );
-        }
-
-        Ok(id)
-    }
-
-    fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
-        if self.node_manager.node_remove(&node_id).is_some() {
-            {
-                let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-                guard.remove_node(&node_id); // remove_edge auto-tracks downstream
-            }
-            self.record_removal(node_id);
-            Ok(())
-        } else {
-            Err("Node not found.".to_string())
-        }
-    }
-
-    fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
-        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-        let node_state = guard
-            .get_mut(node_id)
-            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-        node_state.data = Some(data);
-        guard.mark_changed(*node_id);
-        Ok(())
-    }
-
-    fn update_input_slot_default_data(
-        &mut self,
-        node_id: &NodeId,
-        slot_index: usize,
-        data: Data,
-    ) -> Result<(), String> {
-        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-        let slot = guard
-            .input_slot_mut(node_id, slot_index)
-            .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
-        slot.default_value = Some(data.into_value());
-        guard.mark_changed(*node_id);
-        Ok(())
-    }
-
-    fn update_node_data_field(
-        &mut self,
-        node_id: &NodeId,
-        data_type: DataType,
-        field_name: &str,
-        value: f64,
-    ) -> Result<(), String> {
-        // Read current field values from existing node data
-        let current_fields: Vec<(&str, f64)> = {
-            let ns = self.node_states.read().map_err(|e| e.to_string())?;
-            let state = ns
-                .get(node_id)
-                .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-            extract_fields_from_data(data_type, state.data.as_ref())
-        };
-
-        // Assemble new Data by replacing the target field
-        let data = data_type
-            .assemble(|f| {
-                if f == field_name {
-                    value
-                } else {
-                    current_fields
-                        .iter()
-                        .find(|(name, _)| *name == f)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0)
-                }
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Cannot assemble data for type {:?} (non-composite type)",
-                    data_type
-                )
-            })?;
-
-        self.update_node_data(node_id, data)
-    }
-
-    fn update_input_slot_default_field(
-        &mut self,
-        node_id: &NodeId,
-        slot_index: usize,
-        field_name: &str,
-        value: f64,
-    ) -> Result<(), String> {
-        // Read current field values and data_type from existing slot default
-        let (data_type, current_fields) = {
-            let ns = self.node_states.read().map_err(|e| e.to_string())?;
-            let slot = ns.input_slot(node_id, slot_index).ok_or_else(|| {
-                format!("Input slot {} not found for node {:?}", slot_index, node_id)
-            })?;
-            let dt = slot.data_type;
-            let fields = extract_fields_from_default_value(dt, slot.default_value.as_ref());
-            (dt, fields)
-        };
-
-        // Assemble new Data by replacing the target field
-        let data = data_type
-            .assemble(|f| {
-                if f == field_name {
-                    value
-                } else {
-                    current_fields
-                        .iter()
-                        .find(|(name, _)| *name == f)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0)
-                }
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Cannot assemble data for type {:?} (non-composite type)",
-                    data_type
-                )
-            })?;
-
-        self.update_input_slot_default_data(node_id, slot_index, data)
-    }
-
-    fn connect_nodes(
-        &mut self,
-        from_node_id: &NodeId,
-        from_output_slot_index: usize,
-        to_node_id: &NodeId,
-        to_input_slot_index: usize,
-    ) -> Result<EdgeId, String> {
-        let edge = self
-            .create_edge(
-                from_node_id,
-                from_output_slot_index,
-                to_node_id,
-                to_input_slot_index,
-            )
-            .map_err(|e| e.to_string())?;
-
-        self.add_edge(edge)
-    }
-
-    fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
-        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        ns.remove_edge(&edge_id)
-            .ok_or(format!("Edge does not exist: id: {:?}", edge_id))?;
-        Ok(())
-    }
-
-    fn get_edge(&self, edge_id: EdgeId) -> Result<Edge, String> {
-        let ns = self.node_states.read().map_err(|e| e.to_string())?;
-        ns.get_edge(&edge_id)
-            .cloned()
-            .ok_or(format!("Edge not found: id {:?}", edge_id))
-    }
-
-    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity> {
-        self.node_manager.get_node_by_id(node_id)
-    }
-
-    fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
-        self.node_manager.get_node_ids_by_type::<T>()
-    }
-
-    fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
-        self.node_manager.get_nodes_by_ids(ids)
-    }
-
-    fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
-        let ns = self.node_states.read().ok()?;
-        let slot = ns.output_slot(node_id, output_slot_index)?;
-        let slot_id = slot.id;
-        drop(ns);
-
-        let cache = self.cache.read().ok()?;
-        cache.outputs.get(&slot_id).map(|data| data.share())
-    }
-
-    fn node_variants(&self) -> &HashSet<String> {
-        self.node_manager.variants()
     }
 }

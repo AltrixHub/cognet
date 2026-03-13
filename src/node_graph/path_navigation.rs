@@ -8,7 +8,7 @@
 //! - `[A]` = A's internal graph
 //! - `[A, B]` = B's internal graph inside A's internal graph
 
-use crate::{Data, NodeGraph, NodeGraphAPI, NodeId, SubGraphNode};
+use crate::{Data, NodeGraph, NodeGraphRead, NodeId, SubGraphNode};
 
 use super::EdgeInfo;
 
@@ -129,7 +129,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::NodeGraphAPI;
+    use crate::NodeGraphWrite;
 
     #[tokio::test]
     async fn test_with_graph_at_path_empty() {
