@@ -5,7 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{DataType, Edge, EdgeId, NodeGraph, NodeGraphAPI, NodeId, SubGraphNode};
+use crate::{
+    DataType, Edge, EdgeId, NodeGraph, NodeGraphRead, NodeGraphWrite, NodeId, SubGraphNode,
+};
 
 /// Information about an edge crossing the subgraph boundary.
 #[derive(Debug)]
@@ -668,7 +670,7 @@ impl NodeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NodeGraphAPI;
+    use crate::{NodeGraphRead, NodeGraphWrite};
 
     #[tokio::test]
     async fn test_group_and_ungroup() {

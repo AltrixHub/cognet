@@ -196,6 +196,24 @@ impl NodeManager {
         }
     }
 
+    /// Create a node by type with a pre-generated NodeId (compile-time dispatch).
+    ///
+    /// Same as `create_node()` but uses the caller-provided `id` instead of
+    /// generating a fresh one. Allows callers to know the NodeId before the
+    /// node is actually created (e.g., for declarative change queues).
+    pub fn create_node_with_id<T: NodeImpl + 'static>(
+        &mut self,
+        id: NodeId,
+    ) -> Result<NodeId, String> {
+        if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
+            let node = factory()?;
+            self.node_insert(id, node);
+            Ok(id)
+        } else {
+            Err(format!("{:?} is not registered", TypeId::of::<T>()))
+        }
+    }
+
     /// Create a node by name (runtime dispatch).
     ///
     /// Returns the node ID and default data if successful.
@@ -211,6 +229,28 @@ impl NodeManager {
         self.node_insert(node_id, node);
 
         Ok((node_id, default_data))
+    }
+
+    /// Create a node by name with a pre-generated NodeId (runtime dispatch).
+    ///
+    /// Same as `create_node_by_name()` but uses the caller-provided `id` instead
+    /// of generating a fresh one. This allows callers to know the NodeId before
+    /// the node is actually created (e.g., for declarative change queues).
+    pub fn create_node_by_name_with_id(
+        &self,
+        id: NodeId,
+        name: &str,
+    ) -> Result<(NodeId, Option<Data>), String> {
+        let factory_meta = self
+            .name_registry
+            .get(name)
+            .ok_or_else(|| format!("Node type '{}' is not registered", name))?;
+
+        let node = (factory_meta.factory)()?;
+        let default_data = factory_meta.default_data.as_ref().map(|d| d.share());
+        self.node_insert(id, node);
+
+        Ok((id, default_data))
     }
 
     /// Check if a node type is registered by name.

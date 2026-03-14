@@ -13,7 +13,7 @@ pub use output_proxy::SubGraphOutputNode;
 use std::sync::Arc;
 
 use crate::{
-    Data, DataType, ExecutionContext, NodeCategory, NodeCore, NodeGraph, NodeGraphAPI, NodeId,
+    Data, DataType, ExecutionContext, NodeCategory, NodeCore, NodeGraph, NodeGraphWrite, NodeId,
     NodeImpl, NodeManager, NodeMeta, SharedExecutionCache, SharedNodeStates, SlotDef,
 };
 
@@ -444,7 +444,7 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NodeGraphAPI;
+    use crate::{NodeGraphRead, NodeGraphWrite};
 
     #[tokio::test]
     async fn test_subgraph_creation() {
