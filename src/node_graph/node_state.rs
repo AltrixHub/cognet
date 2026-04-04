@@ -1,6 +1,7 @@
 //! Runtime state for node instances.
 
 use crate::{Data, DataType, DataValue, Edge, EdgeId, InputSlotId, NodeId, OutputSlotId, SlotDef};
+use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -9,14 +10,21 @@ use std::sync::{Arc, RwLock};
 pub(crate) struct NodeState {
     /// The node type name (references NodeMeta::NAME).
     pub type_name: &'static str,
+    /// Rust TypeId for type-safe identification (None for legacy/untyped nodes).
+    pub rust_type_id: Option<TypeId>,
     /// Current data value (can be modified at runtime).
     pub data: Option<Data>,
 }
 
 impl NodeState {
-    pub fn new(type_name: &'static str, default_data: Option<Data>) -> Self {
+    pub fn new(
+        type_name: &'static str,
+        type_id: Option<TypeId>,
+        default_data: Option<Data>,
+    ) -> Self {
         Self {
             type_name,
+            rust_type_id: type_id,
             data: default_data,
         }
     }
@@ -74,12 +82,13 @@ impl NodeStates {
         &mut self,
         node_id: NodeId,
         type_name: &'static str,
+        type_id: Option<TypeId>,
         default_data: Option<Data>,
         input_defs: &[SlotDef],
         output_defs: &[SlotDef],
     ) {
         self.nodes
-            .insert(node_id, NodeState::new(type_name, default_data));
+            .insert(node_id, NodeState::new(type_name, type_id, default_data));
 
         // Initialize input slot states with metadata
         for (i, def) in input_defs.iter().enumerate() {
@@ -396,7 +405,6 @@ impl NodeStates {
         let id = connections.remove(old_index);
         let insert_at = new_index.min(connections.len());
         connections.insert(insert_at, id);
-
 
         // Mark the target node as changed so the graph re-executes
         self.changed_nodes.insert(to_node_id);

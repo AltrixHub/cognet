@@ -18,7 +18,9 @@ pub use subgraph_ops::*;
 
 use crate::{
     Data, DataType, DataValue, Edge, EdgeId, ErrorTarget, GraphError, InputSlotId, NodeId,
+    SubGraphNode,
 };
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -149,6 +151,51 @@ impl NodeGraph {
     pub fn node_type_name(&self, node_id: &NodeId) -> Option<&'static str> {
         let ns = self.node_states.read().ok()?;
         ns.get(node_id).map(|s| s.type_name)
+    }
+
+    /// Get the Rust TypeId of a node for type-safe identification.
+    ///
+    /// For SubGraphNodes with a template type, returns the template's TypeId
+    /// instead of the generic SubGraphNode TypeId. This enables callers to
+    /// identify what kind of subgraph this is (e.g., StairTemplate vs WallTemplate).
+    pub fn node_type_id(&self, node_id: &NodeId) -> Option<TypeId> {
+        // Check for SubGraph template TypeId first
+        if let Some(template_id) = self.subgraph_template_type_id(node_id) {
+            return Some(template_id);
+        }
+        let ns = self.node_states.read().ok()?;
+        let state = ns.get(node_id)?;
+        state.rust_type_id
+    }
+
+    /// Set the template TypeId for a SubGraphNode.
+    ///
+    /// This associates a template type with a SubGraphNode, allowing
+    /// `node_type_id()` to return the template's TypeId instead of
+    /// the generic SubGraphNode TypeId.
+    pub fn set_subgraph_template_type_id(
+        &self,
+        node_id: &NodeId,
+        type_id: TypeId,
+    ) -> Result<(), String> {
+        let entity = self
+            .get_node_by_id(node_id)
+            .ok_or_else(|| format!("Node {:?} not found", node_id))?;
+        let mut write = entity.write().map_err(|e| e.to_string())?;
+        let sg = write
+            .as_any_mut()
+            .downcast_mut::<SubGraphNode>()
+            .ok_or("Node is not a SubGraphNode")?;
+        sg.set_template_type_id(type_id);
+        Ok(())
+    }
+
+    /// Get the template TypeId of a SubGraphNode.
+    pub fn subgraph_template_type_id(&self, node_id: &NodeId) -> Option<TypeId> {
+        let entity = self.get_node_by_id(node_id)?;
+        let read = entity.read().ok()?;
+        let sg = read.as_any().downcast_ref::<SubGraphNode>()?;
+        sg.template_type_id()
     }
 
     /// Get the data value of a node.

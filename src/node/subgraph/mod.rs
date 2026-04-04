@@ -10,6 +10,7 @@ pub mod output_proxy;
 pub use input_proxy::SubGraphInputNode;
 pub use output_proxy::SubGraphOutputNode;
 
+use std::any::TypeId;
 use std::sync::Arc;
 
 use crate::{
@@ -52,6 +53,8 @@ pub struct SubGraphNode {
     /// Per-slot dynamic input target info. `None` = normal/multi input.
     /// `Some(...)` = dynamic input that auto-resizes proxy outputs at execution time.
     dynamic_input_targets: Vec<Option<DynamicInputTarget>>,
+    /// TypeId of the template that built this subgraph (for type-safe identification).
+    template_type_id: Option<TypeId>,
 }
 
 /// Target info for a dynamic multi-input port.
@@ -98,6 +101,7 @@ impl SubGraphNode {
             label: label.into(),
             input_proxy_counts: Vec::new(),
             dynamic_input_targets: Vec::new(),
+            template_type_id: None,
         })
     }
 
@@ -129,6 +133,16 @@ impl SubGraphNode {
     /// Set the display label.
     pub fn set_label(&mut self, label: impl Into<String>) {
         self.label = label.into();
+    }
+
+    /// Get the template TypeId (identifies the template that built this subgraph).
+    pub fn template_type_id(&self) -> Option<TypeId> {
+        self.template_type_id
+    }
+
+    /// Set the template TypeId for type-safe identification.
+    pub fn set_template_type_id(&mut self, type_id: TypeId) {
+        self.template_type_id = Some(type_id);
     }
 
     /// Number of output slots, derived from the internal OutputProxy's input slot count.
@@ -291,8 +305,8 @@ impl SubGraphNode {
                         target.proxy_data_type,
                     );
                     // Create internal edge: new proxy output → target node's multi-input slot
-                    if let Some(to_slot) = internal_ns
-                        .input_slot(&target.internal_node_id, target.internal_slot)
+                    if let Some(to_slot) =
+                        internal_ns.input_slot(&target.internal_node_id, target.internal_slot)
                     {
                         let edge_id = EdgeId::new();
                         let edge = Edge {
@@ -601,7 +615,12 @@ impl NodeCore for SubGraphNode {
                 .map(|node| Arc::new(std::sync::RwLock::new(node)) as crate::NodeEntity)
         });
         manager.register_factory::<SubGraphNode>(factory.clone())?;
-        manager.register_factory_with_name("SubGraph", factory, None);
+        manager.register_factory_with_name(
+            "SubGraph",
+            factory,
+            None,
+            Some(std::any::TypeId::of::<SubGraphNode>()),
+        );
         Ok(())
     }
 }

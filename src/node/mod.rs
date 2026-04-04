@@ -93,6 +93,7 @@ macro_rules! register_nodes {
                         <$struct_name as $crate::NodeMeta>::NAME,
                         factory,
                         <$struct_name as $crate::NodeMeta>::DEFAULT_VALUE.to_data(),
+                        Some(std::any::TypeId::of::<$struct_name>()),
                     );
 
                     Ok(())
