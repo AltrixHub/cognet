@@ -623,15 +623,23 @@ impl NodeGraph {
                                 if let Some(node) = nodes_guard.get(&node_id) {
                                     let node_clone = Arc::clone(node);
                                     drop(nodes_guard);
+                                    // Read lock for regular nodes (allows concurrent UI reads).
+                                    // SubGraphNode upgrades to write lock (needs &mut self).
                                     let node_read = match node_clone.read() {
                                         Ok(r) => r,
-                                        Err(_) => {
-                                            return (node_id, Err("Node lock poisoned".to_string()))
-                                        }
+                                        Err(poisoned) => poisoned.into_inner(),
                                     };
-                                    if let Some(sg) =
-                                        node_read.as_any().downcast_ref::<SubGraphNode>()
+                                    if node_read.as_any().downcast_ref::<SubGraphNode>().is_some()
                                     {
+                                        drop(node_read);
+                                        let mut node_write = match node_clone.write() {
+                                            Ok(w) => w,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        let sg = node_write
+                                            .as_any_mut()
+                                            .downcast_mut::<SubGraphNode>()
+                                            .expect("downcast verified above");
                                         sg.execute_internal(
                                             &node_id,
                                             shared_cache.share(),
@@ -709,17 +717,28 @@ impl NodeGraph {
                                             std::panic::AssertUnwindSafe(|| {
                                                 #[allow(clippy::await_holding_lock)]
                                                 rt_clone.block_on(async {
-                                                    // Read lock held across await — intentional.
-                                                    // execute() takes &self, so the read guard
-                                                    // must live for the duration of the call.
+                                                    // Read lock for regular nodes; write for SubGraphNode.
                                                     let node_read = match node_clone.read() {
                                                         Ok(r) => r,
                                                         Err(poisoned) => poisoned.into_inner(),
                                                     };
-                                                    if let Some(sg) = node_read
+                                                    if node_read
                                                         .as_any()
                                                         .downcast_ref::<SubGraphNode>()
+                                                        .is_some()
                                                     {
+                                                        drop(node_read);
+                                                        let mut node_write =
+                                                            match node_clone.write() {
+                                                                Ok(w) => w,
+                                                                Err(poisoned) => {
+                                                                    poisoned.into_inner()
+                                                                }
+                                                            };
+                                                        let sg = node_write
+                                                            .as_any_mut()
+                                                            .downcast_mut::<SubGraphNode>()
+                                                            .expect("downcast verified above");
                                                         sg.execute_internal(
                                                             &node_id,
                                                             cache_clone,
@@ -732,7 +751,9 @@ impl NodeGraph {
                                                             &ns_clone,
                                                             &cache_clone,
                                                         ) {
-                                                            Ok(ctx) => node_read.execute(ctx).await,
+                                                            Ok(ctx) => {
+                                                                node_read.execute(ctx).await
+                                                            }
                                                             Err(e) => Err(e),
                                                         }
                                                     }

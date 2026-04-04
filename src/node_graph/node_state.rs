@@ -149,6 +149,37 @@ impl NodeStates {
         index
     }
 
+    /// Insert an output slot at a specific index, shifting higher-indexed slots up.
+    ///
+    /// Used by dynamic multi-input to insert proxy outputs at the correct
+    /// position so that existing edge references to higher slots remain valid.
+    pub fn insert_output_slot_at(
+        &mut self,
+        node_id: &NodeId,
+        index: usize,
+        label: &'static str,
+        data_type: DataType,
+    ) -> OutputSlotId {
+        let count = self.output_slot_count(node_id);
+        // Shift existing slots at index..count up by 1 (iterate in reverse)
+        for i in (index..count).rev() {
+            if let Some(slot) = self.output_slots.remove(&(*node_id, i)) {
+                self.output_slots.insert((*node_id, i + 1), slot);
+            }
+        }
+        // Insert new slot at index
+        let id = OutputSlotId::new();
+        self.output_slots.insert(
+            (*node_id, index),
+            OutputSlotState {
+                id,
+                label,
+                data_type,
+            },
+        );
+        id
+    }
+
     /// Remove a dynamic input slot by index and shift higher-indexed slots down.
     pub fn remove_input_slot(&mut self, node_id: &NodeId, index: usize) {
         let count = self.input_slot_count(node_id);

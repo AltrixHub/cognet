@@ -13,8 +13,9 @@ pub use output_proxy::SubGraphOutputNode;
 use std::sync::Arc;
 
 use crate::{
-    Data, DataType, ExecutionContext, NodeCategory, NodeCore, NodeGraph, NodeGraphWrite, NodeId,
-    NodeImpl, NodeManager, NodeMeta, SharedExecutionCache, SharedNodeStates, SlotDef,
+    Data, DataType, Edge, EdgeId, ExecutionContext, NodeCategory, NodeCore, NodeGraph,
+    NodeGraphWrite, NodeId, NodeImpl, NodeManager, NodeMeta, SharedExecutionCache,
+    SharedNodeStates, SlotDef,
 };
 
 /// A node that contains a nested NodeGraph.
@@ -46,7 +47,28 @@ pub struct SubGraphNode {
     label: String,
     /// Number of proxy outputs each external input maps to.
     /// Normally 1 (1:1 mapping). For multi-input ports like Baseline, this is N.
+    /// For dynamic inputs, this starts at 0 and is adjusted at execution time.
     input_proxy_counts: Vec<usize>,
+    /// Per-slot dynamic input target info. `None` = normal/multi input.
+    /// `Some(...)` = dynamic input that auto-resizes proxy outputs at execution time.
+    dynamic_input_targets: Vec<Option<DynamicInputTarget>>,
+}
+
+/// Target info for a dynamic multi-input port.
+///
+/// Stores which internal node and slot the proxy outputs should connect to,
+/// so that `sync_dynamic_inputs` can automatically create/remove internal
+/// edges when the number of external connections changes.
+#[derive(Debug, Clone)]
+struct DynamicInputTarget {
+    /// Internal node to connect proxy outputs to.
+    internal_node_id: NodeId,
+    /// Input slot index on the internal node (must be multi-connection).
+    internal_slot: usize,
+    /// Data type for dynamically created proxy output slots.
+    proxy_data_type: DataType,
+    /// Label for dynamically created proxy output slots.
+    proxy_label: &'static str,
 }
 
 impl std::fmt::Debug for SubGraphNode {
@@ -75,6 +97,7 @@ impl SubGraphNode {
             output_proxy_id,
             label: label.into(),
             input_proxy_counts: Vec::new(),
+            dynamic_input_targets: Vec::new(),
         })
     }
 
@@ -154,6 +177,164 @@ impl SubGraphNode {
         for _ in 0..proxy_count {
             ns.add_output_slot(&self.input_proxy_id, proxy_label, proxy_data_type);
         }
+        Ok(())
+    }
+
+    /// Add a dynamic multi-input slot (phase 1: reserve the slot).
+    ///
+    /// Unlike `add_multi_input` (fixed proxy count), a dynamic input starts
+    /// with zero proxy outputs. Call [`set_dynamic_input_target`] afterwards
+    /// to register the internal target node (phase 2).
+    pub fn add_dynamic_input_slot(&mut self) {
+        self.input_proxy_counts.push(0);
+        self.dynamic_input_targets.push(None);
+    }
+
+    /// Register the internal target for a dynamic multi-input slot (phase 2).
+    ///
+    /// Must be called after `add_dynamic_input_slot` and after internal wiring
+    /// has created the target node.
+    pub fn set_dynamic_input_target(
+        &mut self,
+        slot_index: usize,
+        target_node_id: NodeId,
+        target_slot: usize,
+        proxy_data_type: DataType,
+        proxy_label: &'static str,
+    ) {
+        // Ensure dynamic_input_targets is long enough
+        while self.dynamic_input_targets.len() <= slot_index {
+            self.dynamic_input_targets.push(None);
+        }
+        self.dynamic_input_targets[slot_index] = Some(DynamicInputTarget {
+            internal_node_id: target_node_id,
+            internal_slot: target_slot,
+            proxy_data_type,
+            proxy_label,
+        });
+    }
+
+    /// Combined add + target setup for use outside `build_bim_subgraph`.
+    pub fn add_dynamic_input(
+        &mut self,
+        target_node_id: NodeId,
+        target_slot: usize,
+        proxy_data_type: DataType,
+        proxy_label: &'static str,
+    ) {
+        self.add_dynamic_input_slot();
+        let slot_index = self.input_proxy_counts.len() - 1;
+        self.set_dynamic_input_target(
+            slot_index,
+            target_node_id,
+            target_slot,
+            proxy_data_type,
+            proxy_label,
+        );
+    }
+
+    /// Synchronise dynamic input proxy outputs with external edge counts.
+    ///
+    /// For each dynamic input slot, counts the actual number of connected
+    /// edges and grows/shrinks the internal proxy outputs and edges to match.
+    ///
+    /// Uses `insert_output_slot_at` to insert proxy outputs at the correct
+    /// position (proxy_start) so that existing edges to higher-indexed slots
+    /// remain valid after index shifting.
+    ///
+    /// Must be called before `inject_inputs`.
+    fn sync_dynamic_inputs(
+        &mut self,
+        parent_node_id: &NodeId,
+        parent_node_states: &SharedNodeStates,
+    ) -> Result<(), String> {
+        // Fast path: skip entirely when no dynamic inputs are registered.
+        if self.dynamic_input_targets.iter().all(Option::is_none) {
+            return Ok(());
+        }
+
+        let parent_ns = parent_node_states.read().map_err(|e| e.to_string())?;
+
+        for (slot_idx, target) in self.dynamic_input_targets.iter().enumerate() {
+            let Some(target) = target else { continue };
+            let current_count = self.input_proxy_counts.get(slot_idx).copied().unwrap_or(0);
+
+            // Count edges connected to this external input slot
+            let edge_count = parent_ns
+                .input_slot(parent_node_id, slot_idx)
+                .map(|slot_state| parent_ns.edges_for_input(&slot_state.id).len())
+                .unwrap_or(0);
+
+            if edge_count == current_count {
+                continue;
+            }
+
+            // Calculate the proxy output start index for this slot
+            let proxy_start: usize = self.input_proxy_counts[..slot_idx].iter().sum();
+
+            let mut internal_ns = self
+                .internal_graph
+                .node_states()
+                .write()
+                .map_err(|e| e.to_string())?;
+
+            if edge_count > current_count {
+                // Grow: insert proxy outputs at the correct position and create internal edges.
+                // Inserting shifts existing higher-indexed slots up, keeping their edges valid
+                // because edges store slot IDs (not indices).
+                for i in current_count..edge_count {
+                    let insert_idx = proxy_start + i;
+                    let new_slot_id = internal_ns.insert_output_slot_at(
+                        &self.input_proxy_id,
+                        insert_idx,
+                        target.proxy_label,
+                        target.proxy_data_type,
+                    );
+                    // Create internal edge: new proxy output → target node's multi-input slot
+                    if let Some(to_slot) = internal_ns
+                        .input_slot(&target.internal_node_id, target.internal_slot)
+                    {
+                        let edge_id = EdgeId::new();
+                        let edge = Edge {
+                            from_node_id: self.input_proxy_id,
+                            from_output_slot_index: insert_idx,
+                            from_output_slot_id: new_slot_id,
+                            to_node_id: target.internal_node_id,
+                            to_input_slot_index: target.internal_slot,
+                            to_input_slot_id: to_slot.id,
+                        };
+                        internal_ns.add_edge(edge_id, edge);
+                    }
+                }
+            } else {
+                // Shrink: remove excess proxy outputs and their internal edges
+                for _ in edge_count..current_count {
+                    let remove_idx = proxy_start + edge_count;
+                    // Remove internal edges from this proxy output
+                    if let Some(out_slot) =
+                        internal_ns.output_slot(&self.input_proxy_id, remove_idx)
+                    {
+                        let slot_id = out_slot.id;
+                        let outgoing = internal_ns
+                            .outgoing_edges_for_node(&self.input_proxy_id)
+                            .to_vec();
+                        for eid in outgoing {
+                            if internal_ns
+                                .get_edge(&eid)
+                                .is_some_and(|e| e.from_output_slot_id == slot_id)
+                            {
+                                internal_ns.remove_edge(&eid);
+                            }
+                        }
+                    }
+                    internal_ns.remove_output_slot(&self.input_proxy_id, remove_idx);
+                }
+            }
+
+            drop(internal_ns);
+            self.input_proxy_counts[slot_idx] = edge_count;
+        }
+
         Ok(())
     }
 
@@ -326,11 +507,12 @@ impl SubGraphNode {
     /// 2. Execute the internal graph
     /// 3. Collect outputs from the internal output proxy
     pub(crate) async fn execute_internal(
-        &self,
+        &mut self,
         parent_node_id: &NodeId,
         parent_cache: SharedExecutionCache,
         parent_node_states: SharedNodeStates,
     ) -> Result<(), String> {
+        self.sync_dynamic_inputs(parent_node_id, &parent_node_states)?;
         self.inject_inputs(parent_node_id, &parent_cache, &parent_node_states)?;
         // Mark all internal nodes dirty so they execute.
         // This is needed because the internal graph doesn't know that
