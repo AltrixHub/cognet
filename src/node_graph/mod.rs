@@ -269,6 +269,38 @@ impl NodeGraph {
             .unwrap_or_default()
     }
 
+    /// Get edges connected from a specific output slot (ordered).
+    pub fn edges_for_output_slot(&self, node_id: &NodeId, slot: usize) -> Vec<EdgeId> {
+        self.node_states
+            .read()
+            .ok()
+            .and_then(|ns| {
+                let slot_state = ns.output_slot(node_id, slot)?;
+                Some(ns.edges_for_output(&slot_state.id).to_vec())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Reorder an edge within its output slot's connection list.
+    pub fn reorder_output_edge(&self, edge_id: &EdgeId, new_index: usize) -> bool {
+        self.node_states
+            .write()
+            .ok()
+            .is_some_and(|mut ns| ns.reorder_output_edge(edge_id, new_index))
+    }
+
+    /// Reorder an edge within its input slot's connection list.
+    ///
+    /// Changes the position of the edge to `new_index`, affecting the order
+    /// in which multi-input values are received during execution.
+    /// Returns `true` if the reorder was successful.
+    pub fn reorder_input_edge(&self, edge_id: &EdgeId, new_index: usize) -> bool {
+        self.node_states
+            .write()
+            .ok()
+            .is_some_and(|mut ns| ns.reorder_input_edge(edge_id, new_index))
+    }
+
     /// Get outgoing edge IDs from a node.
     pub fn outgoing_edges(&self, node_id: &NodeId) -> Vec<EdgeId> {
         self.node_states

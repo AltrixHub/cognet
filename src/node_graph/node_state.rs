@@ -54,8 +54,10 @@ pub(crate) struct NodeStates {
     output_slots: HashMap<(NodeId, usize), OutputSlotState>,
     /// All edges in the graph.
     edges: HashMap<EdgeId, Edge>,
-    /// Index: input slot → connected edge IDs.
+    /// Index: input slot → connected edge IDs (ordered).
     input_connections: HashMap<InputSlotId, Vec<EdgeId>>,
+    /// Index: output slot → connected edge IDs (ordered).
+    output_connections: HashMap<OutputSlotId, Vec<EdgeId>>,
     /// Index: source node → outgoing edge IDs.
     outgoing_edges: HashMap<NodeId, Vec<EdgeId>>,
     /// Nodes changed since last drain (for deferred dirty tracking).
@@ -281,6 +283,10 @@ impl NodeStates {
             .entry(edge.to_input_slot_id)
             .or_default()
             .push(edge_id);
+        self.output_connections
+            .entry(edge.from_output_slot_id)
+            .or_default()
+            .push(edge_id);
         self.outgoing_edges
             .entry(edge.from_node_id)
             .or_default()
@@ -293,6 +299,9 @@ impl NodeStates {
         if let Some(edge) = self.edges.remove(edge_id) {
             self.changed_nodes.insert(edge.to_node_id);
             if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
+                connections.retain(|id| id != edge_id);
+            }
+            if let Some(connections) = self.output_connections.get_mut(&edge.from_output_slot_id) {
                 connections.retain(|id| id != edge_id);
             }
             if let Some(outgoing) = self.outgoing_edges.get_mut(&edge.from_node_id) {
@@ -327,12 +336,71 @@ impl NodeStates {
         &self.edges
     }
 
-    /// Get edges connected to an input slot.
+    /// Get edges connected to an input slot (ordered).
     pub fn edges_for_input(&self, input_slot_id: &InputSlotId) -> &[EdgeId] {
         self.input_connections
             .get(input_slot_id)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Get edges connected from an output slot (ordered).
+    pub fn edges_for_output(&self, output_slot_id: &OutputSlotId) -> &[EdgeId] {
+        self.output_connections
+            .get(output_slot_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Reorder an edge within its output slot's connection list.
+    pub fn reorder_output_edge(&mut self, edge_id: &EdgeId, new_index: usize) -> bool {
+        let Some(edge) = self.edges.get(edge_id) else {
+            return false;
+        };
+        let slot_id = edge.from_output_slot_id;
+        let from_node_id = edge.from_node_id;
+
+        let Some(connections) = self.output_connections.get_mut(&slot_id) else {
+            return false;
+        };
+        let Some(old_index) = connections.iter().position(|id| id == edge_id) else {
+            return false;
+        };
+
+        let id = connections.remove(old_index);
+        let insert_at = new_index.min(connections.len());
+        connections.insert(insert_at, id);
+
+        self.changed_nodes.insert(from_node_id);
+        true
+    }
+
+    /// Reorder an edge within its input slot's connection list.
+    ///
+    /// Moves the edge from its current position to `new_index`.
+    /// Returns `true` if the reorder was successful.
+    pub fn reorder_input_edge(&mut self, edge_id: &EdgeId, new_index: usize) -> bool {
+        let Some(edge) = self.edges.get(edge_id) else {
+            return false;
+        };
+        let slot_id = edge.to_input_slot_id;
+        let to_node_id = edge.to_node_id;
+
+        let Some(connections) = self.input_connections.get_mut(&slot_id) else {
+            return false;
+        };
+        let Some(old_index) = connections.iter().position(|id| id == edge_id) else {
+            return false;
+        };
+
+        let id = connections.remove(old_index);
+        let insert_at = new_index.min(connections.len());
+        connections.insert(insert_at, id);
+
+
+        // Mark the target node as changed so the graph re-executes
+        self.changed_nodes.insert(to_node_id);
+        true
     }
 
     /// Get outgoing edge IDs from a node.
