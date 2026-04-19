@@ -19,6 +19,8 @@ pub struct NodeFactoryWithMeta {
     pub factory: NodeFactory,
     /// Default data for the node (if any).
     pub default_data: Option<Data>,
+    /// Rust TypeId for type-safe identification.
+    pub type_id: Option<TypeId>,
 }
 
 #[derive(Default, Debug)]
@@ -174,12 +176,14 @@ impl NodeManager {
         name: &'static str,
         factory: NodeFactory,
         default_data: Option<Data>,
+        type_id: Option<TypeId>,
     ) {
         self.name_registry.insert(
             name,
             NodeFactoryWithMeta {
                 factory,
                 default_data,
+                type_id,
             },
         );
     }
@@ -216,8 +220,11 @@ impl NodeManager {
 
     /// Create a node by name (runtime dispatch).
     ///
-    /// Returns the node ID and default data if successful.
-    pub fn create_node_by_name(&self, name: &str) -> Result<(NodeId, Option<Data>), String> {
+    /// Returns the node ID, default data, and TypeId if successful.
+    pub fn create_node_by_name(
+        &self,
+        name: &str,
+    ) -> Result<(NodeId, Option<Data>, Option<TypeId>), String> {
         let factory_meta = self
             .name_registry
             .get(name)
@@ -225,10 +232,11 @@ impl NodeManager {
 
         let node = (factory_meta.factory)()?;
         let default_data = factory_meta.default_data.as_ref().map(|d| d.share());
+        let type_id = factory_meta.type_id;
         let node_id = NodeId::new();
         self.node_insert(node_id, node);
 
-        Ok((node_id, default_data))
+        Ok((node_id, default_data, type_id))
     }
 
     /// Create a node by name with a pre-generated NodeId (runtime dispatch).
@@ -240,7 +248,7 @@ impl NodeManager {
         &self,
         id: NodeId,
         name: &str,
-    ) -> Result<(NodeId, Option<Data>), String> {
+    ) -> Result<(NodeId, Option<Data>, Option<TypeId>), String> {
         let factory_meta = self
             .name_registry
             .get(name)
@@ -248,9 +256,10 @@ impl NodeManager {
 
         let node = (factory_meta.factory)()?;
         let default_data = factory_meta.default_data.as_ref().map(|d| d.share());
+        let type_id = factory_meta.type_id;
         self.node_insert(id, node);
 
-        Ok((id, default_data))
+        Ok((id, default_data, type_id))
     }
 
     /// Check if a node type is registered by name.

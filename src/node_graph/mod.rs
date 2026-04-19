@@ -18,7 +18,9 @@ pub use subgraph_ops::*;
 
 use crate::{
     Data, DataType, DataValue, Edge, EdgeId, ErrorTarget, GraphError, InputSlotId, NodeId,
+    SubGraphNode,
 };
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -151,6 +153,51 @@ impl NodeGraph {
         ns.get(node_id).map(|s| s.type_name)
     }
 
+    /// Get the Rust TypeId of a node for type-safe identification.
+    ///
+    /// For SubGraphNodes with a template type, returns the template's TypeId
+    /// instead of the generic SubGraphNode TypeId. This enables callers to
+    /// identify what kind of subgraph this is (e.g., StairTemplate vs WallTemplate).
+    pub fn node_type_id(&self, node_id: &NodeId) -> Option<TypeId> {
+        // Check for SubGraph template TypeId first
+        if let Some(template_id) = self.subgraph_template_type_id(node_id) {
+            return Some(template_id);
+        }
+        let ns = self.node_states.read().ok()?;
+        let state = ns.get(node_id)?;
+        state.rust_type_id
+    }
+
+    /// Set the template TypeId for a SubGraphNode.
+    ///
+    /// This associates a template type with a SubGraphNode, allowing
+    /// `node_type_id()` to return the template's TypeId instead of
+    /// the generic SubGraphNode TypeId.
+    pub fn set_subgraph_template_type_id(
+        &self,
+        node_id: &NodeId,
+        type_id: TypeId,
+    ) -> Result<(), String> {
+        let entity = self
+            .get_node_by_id(node_id)
+            .ok_or_else(|| format!("Node {:?} not found", node_id))?;
+        let mut write = entity.write().map_err(|e| e.to_string())?;
+        let sg = write
+            .as_any_mut()
+            .downcast_mut::<SubGraphNode>()
+            .ok_or("Node is not a SubGraphNode")?;
+        sg.set_template_type_id(type_id);
+        Ok(())
+    }
+
+    /// Get the template TypeId of a SubGraphNode.
+    pub fn subgraph_template_type_id(&self, node_id: &NodeId) -> Option<TypeId> {
+        let entity = self.get_node_by_id(node_id)?;
+        let read = entity.read().ok()?;
+        let sg = read.as_any().downcast_ref::<SubGraphNode>()?;
+        sg.template_type_id()
+    }
+
     /// Get the data value of a node.
     pub fn node_data(&self, node_id: &NodeId) -> Option<Data> {
         let ns = self.node_states.read().ok()?;
@@ -267,6 +314,38 @@ impl NodeGraph {
                 Some(ns.edges_for_input(&slot_state.id).to_vec())
             })
             .unwrap_or_default()
+    }
+
+    /// Get edges connected from a specific output slot (ordered).
+    pub fn edges_for_output_slot(&self, node_id: &NodeId, slot: usize) -> Vec<EdgeId> {
+        self.node_states
+            .read()
+            .ok()
+            .and_then(|ns| {
+                let slot_state = ns.output_slot(node_id, slot)?;
+                Some(ns.edges_for_output(&slot_state.id).to_vec())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Reorder an edge within its output slot's connection list.
+    pub fn reorder_output_edge(&self, edge_id: &EdgeId, new_index: usize) -> bool {
+        self.node_states
+            .write()
+            .ok()
+            .is_some_and(|mut ns| ns.reorder_output_edge(edge_id, new_index))
+    }
+
+    /// Reorder an edge within its input slot's connection list.
+    ///
+    /// Changes the position of the edge to `new_index`, affecting the order
+    /// in which multi-input values are received during execution.
+    /// Returns `true` if the reorder was successful.
+    pub fn reorder_input_edge(&self, edge_id: &EdgeId, new_index: usize) -> bool {
+        self.node_states
+            .write()
+            .ok()
+            .is_some_and(|mut ns| ns.reorder_input_edge(edge_id, new_index))
     }
 
     /// Get outgoing edge IDs from a node.

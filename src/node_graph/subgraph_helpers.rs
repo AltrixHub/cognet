@@ -239,6 +239,56 @@ impl NodeGraph {
         Ok(())
     }
 
+    /// Add only the external (parent NodeStates) input port for a SubGraphNode.
+    ///
+    /// Used when the internal proxy setup is handled separately (e.g., dynamic inputs).
+    pub fn add_subgraph_input_external_only(
+        &self,
+        node_id: &NodeId,
+        label: &'static str,
+        data_type: DataType,
+    ) -> Result<(), String> {
+        if let Ok(mut ns) = self.node_states.write() {
+            ns.add_input_slot(node_id, label, data_type, None);
+        }
+        Ok(())
+    }
+
+    /// Add a dynamic multi-input port to a SubGraphNode.
+    ///
+    /// Unlike `add_subgraph_multi_input` (fixed proxy count), a dynamic input
+    /// starts with zero proxy outputs and automatically grows/shrinks at
+    /// execution time to match the number of connected edges.
+    ///
+    /// `target_node_id` and `target_slot` identify which internal node's
+    /// multi-connection input slot the proxy outputs should connect to.
+    pub fn add_subgraph_dynamic_input(
+        &self,
+        node_id: &NodeId,
+        label: &'static str,
+        data_type: DataType,
+        target_node_id: NodeId,
+        target_slot: usize,
+        proxy_data_type: DataType,
+        proxy_label: &'static str,
+    ) -> Result<(), String> {
+        let entity = self
+            .get_node_by_id(node_id)
+            .ok_or_else(|| format!("Node {:?} not found", node_id))?;
+        let mut guard = entity.write().map_err(|e| e.to_string())?;
+        let sg = guard
+            .as_any_mut()
+            .downcast_mut::<SubGraphNode>()
+            .ok_or("Node is not a SubGraphNode")?;
+        sg.add_dynamic_input(target_node_id, target_slot, proxy_data_type, proxy_label);
+        drop(guard);
+        // Sync parent NodeStates
+        if let Ok(mut ns) = self.node_states.write() {
+            ns.add_input_slot(node_id, label, data_type, None);
+        }
+        Ok(())
+    }
+
     /// Set the default value for a SubGraphNode input port.
     pub fn set_subgraph_input_default(
         &self,

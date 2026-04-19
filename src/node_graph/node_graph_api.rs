@@ -10,6 +10,8 @@ use std::{
     sync::Arc,
 };
 
+use std::any::TypeId;
+
 use crate::{
     node_graph_system::NodeGraphSystem, ColorValue, Data, DataType, DataValue, Edge, EdgeId,
     ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta,
@@ -300,6 +302,7 @@ impl NodeGraphWrite for NodeGraph {
             guard.add_node(
                 node_id,
                 T::NAME,
+                Some(TypeId::of::<T>()),
                 T::DEFAULT_VALUE.to_data(),
                 T::INPUTS,
                 T::OUTPUTS,
@@ -320,6 +323,7 @@ impl NodeGraphWrite for NodeGraph {
             guard.add_node(
                 node_id,
                 T::NAME,
+                Some(TypeId::of::<T>()),
                 T::DEFAULT_VALUE.to_data(),
                 T::INPUTS,
                 T::OUTPUTS,
@@ -331,7 +335,7 @@ impl NodeGraphWrite for NodeGraph {
 
     fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String> {
         // Create node and get default data from factory
-        let (node_id, default_data) = self.node_manager.create_node_by_name(name)?;
+        let (node_id, default_data, type_id) = self.node_manager.create_node_by_name(name)?;
 
         // Get type info for slot counts
         let type_info = crate::get_node_type_info(name)
@@ -343,6 +347,7 @@ impl NodeGraphWrite for NodeGraph {
             guard.add_node(
                 node_id,
                 type_info.name,
+                type_id,
                 default_data,
                 type_info.inputs,
                 type_info.outputs,
@@ -353,7 +358,8 @@ impl NodeGraphWrite for NodeGraph {
     }
 
     fn create_node_by_name_with_id(&mut self, id: NodeId, name: &str) -> Result<NodeId, String> {
-        let (_node_id, default_data) = self.node_manager.create_node_by_name_with_id(id, name)?;
+        let (_node_id, default_data, type_id) =
+            self.node_manager.create_node_by_name_with_id(id, name)?;
 
         let type_info = crate::get_node_type_info(name)
             .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
@@ -363,6 +369,7 @@ impl NodeGraphWrite for NodeGraph {
             guard.add_node(
                 id,
                 type_info.name,
+                type_id,
                 default_data,
                 type_info.inputs,
                 type_info.outputs,
@@ -623,15 +630,22 @@ impl NodeGraph {
                                 if let Some(node) = nodes_guard.get(&node_id) {
                                     let node_clone = Arc::clone(node);
                                     drop(nodes_guard);
+                                    // Read lock for regular nodes (allows concurrent UI reads).
+                                    // SubGraphNode upgrades to write lock (needs &mut self).
                                     let node_read = match node_clone.read() {
                                         Ok(r) => r,
-                                        Err(_) => {
-                                            return (node_id, Err("Node lock poisoned".to_string()))
-                                        }
+                                        Err(poisoned) => poisoned.into_inner(),
                                     };
-                                    if let Some(sg) =
-                                        node_read.as_any().downcast_ref::<SubGraphNode>()
-                                    {
+                                    if node_read.as_any().downcast_ref::<SubGraphNode>().is_some() {
+                                        drop(node_read);
+                                        let mut node_write = match node_clone.write() {
+                                            Ok(w) => w,
+                                            Err(poisoned) => poisoned.into_inner(),
+                                        };
+                                        let sg = node_write
+                                            .as_any_mut()
+                                            .downcast_mut::<SubGraphNode>()
+                                            .expect("downcast verified above");
                                         sg.execute_internal(
                                             &node_id,
                                             shared_cache.share(),
@@ -709,17 +723,27 @@ impl NodeGraph {
                                             std::panic::AssertUnwindSafe(|| {
                                                 #[allow(clippy::await_holding_lock)]
                                                 rt_clone.block_on(async {
-                                                    // Read lock held across await — intentional.
-                                                    // execute() takes &self, so the read guard
-                                                    // must live for the duration of the call.
+                                                    // Read lock for regular nodes; write for SubGraphNode.
                                                     let node_read = match node_clone.read() {
                                                         Ok(r) => r,
                                                         Err(poisoned) => poisoned.into_inner(),
                                                     };
-                                                    if let Some(sg) = node_read
+                                                    if node_read
                                                         .as_any()
                                                         .downcast_ref::<SubGraphNode>()
+                                                        .is_some()
                                                     {
+                                                        drop(node_read);
+                                                        let mut node_write = match node_clone
+                                                            .write()
+                                                        {
+                                                            Ok(w) => w,
+                                                            Err(poisoned) => poisoned.into_inner(),
+                                                        };
+                                                        let sg = node_write
+                                                            .as_any_mut()
+                                                            .downcast_mut::<SubGraphNode>()
+                                                            .expect("downcast verified above");
                                                         sg.execute_internal(
                                                             &node_id,
                                                             cache_clone,
