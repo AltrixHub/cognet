@@ -28,6 +28,15 @@ pub enum GraphExecutionError {
     /// kernel cannot run them. Re-run via `execute_async`. Dirty state
     /// is preserved so the async re-run sees the same plan.
     RequiresAsyncExecution { node_ids: Vec<NodeId> },
+    /// The dirty plan contains one or more `SubGraphNode`s whose
+    /// internal graph has `AsyncIo` nodes. Plan-14c phase 1 does not
+    /// yet implement async subgraph execution — that requires
+    /// refactoring `SubGraphNode` so the parent executor can drop its
+    /// write lock across the internal `.await`. Returned from BOTH
+    /// `execute_sync` and `execute_async` (the latter because we don't
+    /// want to silently block on the internal async graph). Dirty
+    /// state is preserved.
+    RequiresAsyncSubgraphSupport { subgraph_node_ids: Vec<NodeId> },
     /// The execution plan could not be built (e.g. lock poisoning,
     /// topological cycle, missing graph metadata).
     PlanningFailed(String),
@@ -44,6 +53,12 @@ impl fmt::Display for GraphExecutionError {
                 f,
                 "graph contains {} AsyncIo node(s); call `execute_async` instead",
                 node_ids.len()
+            ),
+            Self::RequiresAsyncSubgraphSupport { subgraph_node_ids } => write!(
+                f,
+                "graph contains {} SubGraphNode(s) with AsyncIo internal nodes; \
+                 async subgraph execution is not yet supported in plan-14c phase 1",
+                subgraph_node_ids.len()
             ),
             Self::PlanningFailed(msg) => write!(f, "graph planning failed: {msg}"),
             Self::ExecutionFailed(msg) => write!(f, "graph execution failed: {msg}"),
@@ -624,6 +639,68 @@ fn node_execution_kind(
     Some(read.execution_kind())
 }
 
+/// Walk the planned dirty set; if any `SubGraphNode` has `AsyncIo`
+/// nodes in its internal graph, return
+/// `RequiresAsyncSubgraphSupport` listing the parent subgraph IDs.
+/// Used by both sync + async validators.
+fn validate_async_subgraphs(
+    executed_ids: &[NodeId],
+    shared_nodes: &crate::SharedNodes,
+) -> Result<(), GraphExecutionError> {
+    let async_subgraphs: Vec<NodeId> = executed_ids
+        .iter()
+        .filter(|id| subgraph_internal_has_async(id, shared_nodes))
+        .copied()
+        .collect();
+    if async_subgraphs.is_empty() {
+        Ok(())
+    } else {
+        Err(GraphExecutionError::RequiresAsyncSubgraphSupport {
+            subgraph_node_ids: async_subgraphs,
+        })
+    }
+}
+
+/// Inspect a `SubGraphNode`'s internal graph for `AsyncIo` nodes.
+///
+/// Returns true iff the node at `sg_id` is a `SubGraphNode` and its
+/// internal graph contains at least one node with
+/// `NodeExecutionKind::AsyncIo`. Used by both validators (sync + async
+/// subgraph) to surface a typed error rather than silently blocking on
+/// the internal async graph.
+fn subgraph_internal_has_async(sg_id: &NodeId, shared_nodes: &crate::SharedNodes) -> bool {
+    let entity = {
+        let Ok(guard) = shared_nodes.lock() else {
+            return false;
+        };
+        let Some(e) = guard.get(sg_id) else {
+            return false;
+        };
+        Arc::clone(e)
+    };
+    let read = match entity.read() {
+        Ok(r) => r,
+        Err(p) => p.into_inner(),
+    };
+    let Some(sg) = read.as_any().downcast_ref::<SubGraphNode>() else {
+        return false;
+    };
+    let internal_nodes = sg.internal_graph().node_manager.nodes();
+    let Ok(internal_guard) = internal_nodes.lock() else {
+        return false;
+    };
+    for inner in internal_guard.values() {
+        let inner_read = match inner.read() {
+            Ok(r) => r,
+            Err(p) => p.into_inner(),
+        };
+        if inner_read.execution_kind() == NodeExecutionKind::AsyncIo {
+            return true;
+        }
+    }
+    false
+}
+
 /// Execute a single node synchronously.
 ///
 /// Locks the nodes map only long enough to clone out the node entity, then
@@ -890,11 +967,22 @@ impl NodeGraph {
 
     /// Validate that the plan can run on the synchronous kernel.
     ///
-    /// Returns `RequiresAsyncExecution { node_ids }` listing every dirty
-    /// node whose `execution_kind` is `AsyncIo`. The dirty set is
-    /// preserved so a subsequent `execute_async` call sees the same plan.
+    /// Two failure modes, each returning a typed error WITHOUT draining
+    /// the dirty set so the caller can re-plan:
+    ///
+    /// - `RequiresAsyncSubgraphSupport` — a dirty `SubGraphNode` has
+    ///   `AsyncIo` nodes inside its internal graph. Plan-14c phase 1
+    ///   does not yet drive the internal graph through
+    ///   `execute_async`, so neither sync NOR async kernels can run
+    ///   the plan. Reported with priority over plain
+    ///   `RequiresAsyncExecution` because the caller cannot recover
+    ///   simply by switching to `execute_async`.
+    /// - `RequiresAsyncExecution` — direct dirty `AsyncIo` nodes.
+    ///   Caller can switch to `execute_async`.
     fn validate_for_sync(&self, plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
         let shared_nodes = self.node_manager.nodes();
+        validate_async_subgraphs(&plan.executed_node_ids, &shared_nodes)?;
+
         let async_nodes: Vec<NodeId> = plan
             .executed_node_ids
             .iter()
@@ -912,6 +1000,18 @@ impl NodeGraph {
                 node_ids: async_nodes,
             })
         }
+    }
+
+    /// Validate that the plan can run on the asynchronous kernel.
+    ///
+    /// `execute_async` handles direct `AsyncIo` nodes natively, but
+    /// plan-14c phase 1 does not yet drive `SubGraphNode`'s internal
+    /// graph through `execute_async`. Reject early with a typed error
+    /// rather than silently propagating an internal
+    /// `RequiresAsyncExecution` as a per-node string failure.
+    fn validate_for_async(&self, plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
+        let shared_nodes = self.node_manager.nodes();
+        validate_async_subgraphs(&plan.executed_node_ids, &shared_nodes)
     }
 
     /// Drain the changed-nodes set after planning + validation succeeded.
@@ -1063,6 +1163,7 @@ impl NodeGraph {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
 
+        let mut failed_ids: HashSet<NodeId> = HashSet::new();
         for level_nodes in &plan.levels {
             let level_vec: Vec<NodeId> = level_nodes.clone();
             let level_results: Vec<(NodeId, Result<(), String>)> = match mode {
@@ -1094,12 +1195,38 @@ impl NodeGraph {
 
             for (node_id, res) in level_results {
                 if let Err(msg) = res {
+                    failed_ids.insert(node_id);
                     self.add_error(GraphError::execution(node_id, msg));
                 }
             }
         }
 
+        // Per plan-14c §Dirty-State Rule, failures must preserve enough
+        // dirty state for a later retry. Re-mark every failed node as
+        // changed so the next `execute_*` call replans from the same
+        // failure point. Successful nodes stay clean.
+        self.restore_dirty_for_failed(failed_ids);
+
         Ok(self.collect_outputs(&plan))
+    }
+
+    /// Re-mark `failed_ids` as changed in `NodeStates`. Idempotent if
+    /// the set is empty. Logs but does not propagate a poisoned-lock
+    /// error — the executor has already finished, so the worst case is
+    /// that a future caller sees a slightly stale dirty set.
+    fn restore_dirty_for_failed(&self, failed_ids: HashSet<NodeId>) {
+        if failed_ids.is_empty() {
+            return;
+        }
+        match self.node_states.write() {
+            Ok(mut ns) => ns.restore_changed_nodes(failed_ids),
+            Err(e) => tracing::warn!(
+                target: "graph",
+                err = %e,
+                "[cognet] could not restore dirty state for failed nodes; \
+                 NodeStates lock poisoned",
+            ),
+        }
     }
 
     // === Internal async executor ==========================================
@@ -1127,6 +1254,11 @@ impl NodeGraph {
             });
         }
 
+        // Validate BEFORE draining dirty so async-subgraph rejection
+        // preserves the dirty set for a later retry once async
+        // subgraph support lands.
+        self.validate_for_async(&plan)?;
+
         self.commit_plan_drain()?;
         self.clear_execution_errors();
 
@@ -1134,6 +1266,7 @@ impl NodeGraph {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
 
+        let mut failed_ids: HashSet<NodeId> = HashSet::new();
         for level_nodes in &plan.levels {
             // Partition dirty level into Sync/Async by execution_kind.
             let mut sync_ids: Vec<NodeId> = Vec::new();
@@ -1181,6 +1314,7 @@ impl NodeGraph {
 
             for (node_id, res) in &sync_results {
                 if let Err(msg) = res {
+                    failed_ids.insert(*node_id);
                     self.add_error(GraphError::execution(*node_id, msg.clone()));
                 }
             }
@@ -1245,11 +1379,16 @@ impl NodeGraph {
                     Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
                     Err(msg) => {
                         on_progress(ExecutionEvent::Failed(node_id, msg.clone()));
+                        failed_ids.insert(node_id);
                         self.add_error(GraphError::execution(node_id, msg));
                     }
                 }
             }
         }
+
+        // Per plan-14c §Dirty-State Rule: AsyncIo failures (transient
+        // remote errors etc.) must leave the dirty plan re-runnable.
+        self.restore_dirty_for_failed(failed_ids);
 
         Ok(self.collect_outputs(&plan))
     }
@@ -1577,6 +1716,242 @@ mod sync_executor_tests {
         graph.execute_async().await.expect("async run");
         assert_eq!(PREPARE_CALLS.load(Ordering::SeqCst), 1);
     }
+
+    // ============================================================
+    // Plan-14c finding 1: async subgraph typed error
+    // ============================================================
+
+    #[test]
+    fn execute_sync_returns_async_subgraph_support_for_inner_async_node() {
+        // Build a SubGraphNode whose internal graph contains an async
+        // node. execute_sync must reject with the specific
+        // RequiresAsyncSubgraphSupport variant — NOT a per-node string
+        // error from execute_internal_sync's inner failure path.
+        let mut graph = NodeGraph::new().unwrap();
+        let sub_id = graph.create_node::<SubGraphNode>().unwrap();
+        graph
+            .add_subgraph_output(&sub_id, "Out", DataType::Number)
+            .unwrap();
+        let (_in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sub_id).unwrap();
+        graph
+            .with_subgraph_mut(&sub_id, |internal| {
+                let echo = internal.create_node::<AsyncEchoNode>().unwrap();
+                internal.connect_nodes(&echo, 0, &out_proxy, 0).unwrap();
+            })
+            .unwrap();
+
+        let err = graph
+            .execute_sync()
+            .expect_err("inner async should reject sync");
+        match err {
+            GraphExecutionError::RequiresAsyncSubgraphSupport { subgraph_node_ids } => {
+                assert!(subgraph_node_ids.contains(&sub_id));
+            }
+            other => panic!("expected RequiresAsyncSubgraphSupport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_async_returns_async_subgraph_support_for_inner_async_node() {
+        // Plan-14c phase 1 explicitly does NOT yet implement async
+        // subgraph execution. The async kernel must surface that as a
+        // typed error rather than silently falling through to
+        // execute_internal_sync (which would block on the inner async
+        // graph or string-error per-node).
+        let mut graph = NodeGraph::new().unwrap();
+        let sub_id = graph.create_node::<SubGraphNode>().unwrap();
+        graph
+            .add_subgraph_output(&sub_id, "Out", DataType::Number)
+            .unwrap();
+        let (_in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sub_id).unwrap();
+        graph
+            .with_subgraph_mut(&sub_id, |internal| {
+                let echo = internal.create_node::<AsyncEchoNode>().unwrap();
+                internal.connect_nodes(&echo, 0, &out_proxy, 0).unwrap();
+            })
+            .unwrap();
+
+        let err = graph
+            .execute_async()
+            .await
+            .expect_err("inner async should reject async too in phase 1");
+        assert!(matches!(
+            err,
+            GraphExecutionError::RequiresAsyncSubgraphSupport { .. }
+        ));
+    }
+
+    #[test]
+    fn execute_sync_async_subgraph_rejection_preserves_dirty_state() {
+        // The validation rejects BEFORE drain, so a follow-up
+        // execute_sync still sees the dirty plan (and still errors).
+        let mut graph = NodeGraph::new().unwrap();
+        let sub_id = graph.create_node::<SubGraphNode>().unwrap();
+        graph
+            .add_subgraph_output(&sub_id, "Out", DataType::Number)
+            .unwrap();
+        let (_in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sub_id).unwrap();
+        graph
+            .with_subgraph_mut(&sub_id, |internal| {
+                let echo = internal.create_node::<AsyncEchoNode>().unwrap();
+                internal.connect_nodes(&echo, 0, &out_proxy, 0).unwrap();
+            })
+            .unwrap();
+
+        // First call rejects.
+        let _ = graph.execute_sync().expect_err("first reject");
+        // Dirty preserved → second call sees the same plan and rejects
+        // with the same variant.
+        let err2 = graph.execute_sync().expect_err("second reject");
+        assert!(matches!(
+            err2,
+            GraphExecutionError::RequiresAsyncSubgraphSupport { .. }
+        ));
+    }
+
+    // ============================================================
+    // Plan-14c finding 2: dirty preservation on per-node failure
+    // ============================================================
+
+    /// Test-only `AsyncIo` node that fails on a configurable counter.
+    /// Allows simulating a transient remote-API error and verifying
+    /// the dirty set is restored for retry.
+    #[derive(Debug)]
+    pub struct FlakyAsyncNode;
+
+    /// Number of remaining failures FlakyAsyncNode should produce
+    /// before succeeding. Decremented on each call.
+    static FLAKY_FAIL_REMAINING: AtomicUsize = AtomicUsize::new(0);
+
+    impl crate::NodeMeta for FlakyAsyncNode {
+        const NAME: &'static str = "FlakyAsync";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Primitive;
+        const INPUTS: &'static [crate::SlotDef] = &[];
+        const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "Out",
+            data_type: crate::DataType::Number,
+            max_connections: None,
+        }];
+        const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::Number(0.0);
+    }
+
+    impl NodeImpl for FlakyAsyncNode {
+        fn execution_kind(&self) -> NodeExecutionKind {
+            NodeExecutionKind::AsyncIo
+        }
+
+        fn prepare_async(&self, ctx: ExecutionContext) -> Result<BoxNodeFuture, String> {
+            let writer = ctx.output_writer;
+            let data = ctx.node_data;
+            Ok(Box::pin(async move {
+                // Simulate a transient failure pattern: fail the first
+                // N attempts, succeed afterwards.
+                let prev = FLAKY_FAIL_REMAINING.fetch_sub(1, Ordering::SeqCst);
+                if prev > 0 {
+                    return Err("transient FlakyAsync failure (test fixture)".to_string());
+                }
+                let value = data.unwrap_or(Data::new(0.0_f64).unwrap());
+                writer.set(0, value)?;
+                Ok(())
+            }))
+        }
+    }
+
+    crate::register_nodes!(FlakyAsyncNode);
+
+    #[tokio::test]
+    async fn async_failure_preserves_dirty_for_retry() {
+        // Configure FlakyAsync to fail once. First execute_async
+        // returns Ok with a per-node error in the result; the failed
+        // node is re-marked dirty. A retry succeeds without manual
+        // re-marking.
+        FLAKY_FAIL_REMAINING.store(1, Ordering::SeqCst);
+
+        let mut graph = NodeGraph::new().unwrap();
+        let flaky_id = graph.create_node::<FlakyAsyncNode>().unwrap();
+        graph
+            .update_node_data(&flaky_id, Data::new(123.0_f64).unwrap())
+            .unwrap();
+
+        // First call: per-node error. Successful caller path.
+        let r1 = graph
+            .execute_async()
+            .await
+            .expect("execute_async itself does not fail on per-node errors");
+        assert!(
+            r1.errors.contains_key(&flaky_id),
+            "first run records per-node failure"
+        );
+        // Output absent because the node didn't write its value.
+        assert!(r1
+            .node_outputs
+            .get(&flaky_id)
+            .and_then(|s| s.first().cloned().flatten())
+            .is_none());
+
+        // Retry without re-mark: dirty preservation guarantees the
+        // failed node is in the dirty plan again.
+        let r2 = graph.execute_async().await.expect("retry succeeds");
+        assert!(
+            !r2.errors.contains_key(&flaky_id),
+            "retry produces no error"
+        );
+        assert_eq!(output_for(&r2, flaky_id), 123.0);
+    }
+
+    #[test]
+    fn sync_failure_preserves_dirty_for_retry() {
+        // Same dirty-preservation rule for sync nodes. Use a
+        // counter-driven sync node so the first execute_sync errors
+        // and the second succeeds.
+        SYNC_FAIL_REMAINING.store(1, Ordering::SeqCst);
+
+        let mut graph = NodeGraph::new().unwrap();
+        let id = graph.create_node::<FlakySyncNode>().unwrap();
+        graph
+            .update_node_data(&id, Data::new(7.0_f64).unwrap())
+            .unwrap();
+
+        let r1 = graph
+            .execute_sync()
+            .expect("graph-level Ok despite per-node err");
+        assert!(r1.errors.contains_key(&id));
+
+        let r2 = graph.execute_sync().expect("retry succeeds");
+        assert!(!r2.errors.contains_key(&id));
+        assert_eq!(output_for(&r2, id), 7.0);
+    }
+
+    #[derive(Debug)]
+    pub struct FlakySyncNode;
+
+    static SYNC_FAIL_REMAINING: AtomicUsize = AtomicUsize::new(0);
+
+    impl crate::NodeMeta for FlakySyncNode {
+        const NAME: &'static str = "FlakySync";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Primitive;
+        const INPUTS: &'static [crate::SlotDef] = &[];
+        const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "Out",
+            data_type: crate::DataType::Number,
+            max_connections: None,
+        }];
+        const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::Number(0.0);
+    }
+
+    impl NodeImpl for FlakySyncNode {
+        fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
+            let prev = SYNC_FAIL_REMAINING.fetch_sub(1, Ordering::SeqCst);
+            if prev > 0 {
+                return Err("transient FlakySync failure (test fixture)".to_string());
+            }
+            let data = ctx.node_data.ok_or("missing data")?;
+            ctx.output_writer.set(0, data)?;
+            Ok(())
+        }
+    }
+
+    crate::register_nodes!(FlakySyncNode);
 
     #[test]
     fn subgraph_executes_recursively_through_sync_kernel() {
