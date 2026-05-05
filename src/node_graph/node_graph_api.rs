@@ -1,16 +1,83 @@
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt,
     sync::Arc,
 };
 
 use std::any::TypeId;
 
 use crate::{
-    node_graph_system::NodeGraphSystem, ColorValue, Data, DataType, DataValue, Edge, EdgeId,
-    ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeGraph, NodeId, NodeImpl, NodeMeta,
-    OutputWriter, SharedExecutionCache, SharedNodeStates, SubGraphNode, Vector3,
+    node_graph_system::NodeGraphSystem, BoxNodeFuture, ColorValue, Data, DataType, DataValue, Edge,
+    EdgeId, ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeExecutionKind, NodeGraph,
+    NodeId, NodeImpl, NodeMeta, OutputWriter, SharedExecutionCache, SharedNodeStates, SubGraphNode,
+    Vector3,
 };
+
+/// Typed error returned by `NodeGraph::execute_sync` and `execute_async`.
+///
+/// `RequiresAsyncExecution` is the load-bearing variant: it lets a sync
+/// caller distinguish "this graph contains async I/O nodes — call
+/// `execute_async`" from genuine planning or execution failure. Per
+/// plan-14c the dirty-state contract requires that returning this error
+/// must NOT clear the changed-node set, so a follow-up `execute_async`
+/// can run the same plan.
+#[derive(Debug, Clone)]
+pub enum GraphExecutionError {
+    /// The dirty plan contains one or more `AsyncIo` nodes; the sync
+    /// kernel cannot run them. Re-run via `execute_async`. Dirty state
+    /// is preserved so the async re-run sees the same plan.
+    RequiresAsyncExecution { node_ids: Vec<NodeId> },
+    /// The execution plan could not be built (e.g. lock poisoning,
+    /// topological cycle, missing graph metadata).
+    PlanningFailed(String),
+    /// One of the node executions failed in a way the planner cannot
+    /// retry from. Per-node execution failures are recorded separately
+    /// inside `ExecutionResult` and do NOT raise this variant.
+    ExecutionFailed(String),
+}
+
+impl fmt::Display for GraphExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequiresAsyncExecution { node_ids } => write!(
+                f,
+                "graph contains {} AsyncIo node(s); call `execute_async` instead",
+                node_ids.len()
+            ),
+            Self::PlanningFailed(msg) => write!(f, "graph planning failed: {msg}"),
+            Self::ExecutionFailed(msg) => write!(f, "graph execution failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for GraphExecutionError {}
+
+/// Topologically sorted execution plan plus the dirty set it was built
+/// from. The planner snapshots the changed-node set without draining
+/// it, so a `RequiresAsyncExecution` rejection leaves the graph
+/// re-executable from the same dirty state.
+struct ExecutionPlan {
+    /// Snapshot of nodes that were dirty when the plan was built. The
+    /// executor drains the underlying `NodeStates::changed_nodes` only
+    /// after API validation succeeds.
+    dirty_nodes: HashSet<NodeId>,
+    /// Topologically grouped node levels — same-level nodes have no
+    /// data dependencies on each other and may run in parallel.
+    levels: Vec<Vec<NodeId>>,
+    /// Flattened executed-node list in topological order, for output
+    /// collection.
+    executed_node_ids: Vec<NodeId>,
+    /// Removed nodes drained from bookkeeping at plan time (they don't
+    /// participate in execution but are reported in `ExecutionResult`).
+    removed_nodes: Vec<NodeId>,
+}
+
+impl ExecutionPlan {
+    fn is_empty(&self) -> bool {
+        self.executed_node_ids.is_empty()
+    }
+}
 
 /// Execution event for progress tracking during graph execution.
 #[derive(Debug, Clone)]
@@ -536,6 +603,27 @@ impl NodeGraphWrite for NodeGraph {
     }
 }
 
+/// Look up a node's execution kind (`SyncCpu` / `AsyncIo`) by `NodeId`.
+///
+/// Used by the planner to decide whether the dirty plan can run on the
+/// sync kernel or requires `execute_async`. Locks the nodes map briefly,
+/// then holds a read lock on the node entity only long enough to call
+/// `execution_kind()` (a cheap method that does not touch I/O).
+fn node_execution_kind(
+    node_id: &NodeId,
+    shared_nodes: &crate::SharedNodes,
+) -> Option<NodeExecutionKind> {
+    let entity = {
+        let guard = shared_nodes.lock().ok()?;
+        guard.get(node_id).map(Arc::clone)?
+    };
+    let read = match entity.read() {
+        Ok(r) => r,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Some(read.execution_kind())
+}
+
 /// Execute a single node synchronously.
 ///
 /// Locks the nodes map only long enough to clone out the node entity, then
@@ -599,9 +687,11 @@ fn execute_node_sync(
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 match build_execution_context(&node_id, shared_node_states, shared_cache) {
-                    Ok(ctx) => node_read.execute(ctx),
+                    Ok(ctx) => node_read.execute_sync(ctx),
                     Err(e) => Err(e),
                 }
+                // node_read drops at end of branch — locks released
+                // before the next level starts.
             }
         }));
 
@@ -629,31 +719,37 @@ fn execute_node_sync(
 }
 
 impl NodeGraph {
-    /// Execute the graph synchronously with the default mode (`Parallel`).
+    // === Public synchronous API ===========================================
+
+    /// Execute the dirty graph synchronously with the default scheduling
+    /// mode (`Parallel`).
     ///
-    /// This is the canonical execution kernel. It does not depend on any
-    /// async runtime — callers may invoke it from event handlers, reactive
-    /// effects, or async test contexts without nested executor coordination.
+    /// Returns `RequiresAsyncExecution` (without losing dirty state) if
+    /// the planned graph contains any `NodeExecutionKind::AsyncIo` nodes.
+    /// In that case, call [`execute_async`](Self::execute_async).
     ///
-    /// Returns `ExecutionResult` containing outputs from computed nodes,
-    /// edge values, execution errors, and IDs of removed nodes.
-    pub fn execute_sync(&self) -> Result<ExecutionResult, String> {
+    /// Per plan-14c the synchronous kernel never enters an async runtime
+    /// and never calls `block_on`. It is safe to invoke from a UI event
+    /// handler, a reactive effect, a Tokio task, or a sync test.
+    pub fn execute_sync(&self) -> Result<ExecutionResult, GraphExecutionError> {
         self.execute_sync_with_progress(ExecutionMode::default(), |_| {})
     }
 
-    /// Execute the graph synchronously with the requested scheduling mode.
-    pub fn execute_sync_with_mode(&self, mode: ExecutionMode) -> Result<ExecutionResult, String> {
+    /// Execute the dirty graph synchronously with the requested mode.
+    pub fn execute_sync_with_mode(
+        &self,
+        mode: ExecutionMode,
+    ) -> Result<ExecutionResult, GraphExecutionError> {
         self.execute_sync_with_progress(mode, |_| {})
     }
 
-    /// Execute the graph synchronously with the requested scheduling mode
-    /// and a progress callback that fires per node as it starts, completes,
-    /// or fails.
+    /// Execute the dirty graph synchronously with the requested mode and
+    /// a per-node progress callback.
     pub fn execute_sync_with_progress<F>(
         &self,
         mode: ExecutionMode,
         on_progress: F,
-    ) -> Result<ExecutionResult, String>
+    ) -> Result<ExecutionResult, GraphExecutionError>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static,
     {
@@ -661,64 +757,104 @@ impl NodeGraph {
         self.execute_sync_inner(mode, on_progress)
     }
 
-    /// Backward-compatible async facade. Returns the same value as
-    /// [`execute_sync`]; the future is immediately ready and is not bound
-    /// to any async runtime.
-    pub async fn execute(&self) -> Result<ExecutionResult, String> {
-        self.execute_sync()
+    // === Public asynchronous API ==========================================
+
+    /// Execute the dirty graph asynchronously with the default scheduling
+    /// mode (`Parallel`).
+    ///
+    /// Supports mixed `SyncCpu` + `AsyncIo` graphs. Sync nodes run on a
+    /// CPU executor (rayon in `Parallel`, the calling thread in
+    /// `Sequential`); async nodes return a `'static` future from
+    /// `prepare_async` and are awaited concurrently within each
+    /// topological level. Locks are dropped before any `.await`.
+    pub async fn execute_async(&self) -> Result<ExecutionResult, GraphExecutionError> {
+        self.execute_async_with_progress(ExecutionMode::default(), |_| {})
+            .await
     }
 
-    /// Backward-compatible async facade for [`execute_sync_with_progress`]
-    /// with `ExecutionMode::Parallel`.
-    pub async fn execute_with_progress<F>(&self, on_progress: F) -> Result<ExecutionResult, String>
+    /// Async variant of [`execute_sync_with_mode`].
+    pub async fn execute_async_with_mode(
+        &self,
+        mode: ExecutionMode,
+    ) -> Result<ExecutionResult, GraphExecutionError> {
+        self.execute_async_with_progress(mode, |_| {}).await
+    }
+
+    /// Async variant of [`execute_sync_with_progress`].
+    pub async fn execute_async_with_progress<F>(
+        &self,
+        mode: ExecutionMode,
+        on_progress: F,
+    ) -> Result<ExecutionResult, GraphExecutionError>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static,
     {
-        self.execute_sync_with_progress(ExecutionMode::default(), on_progress)
+        let on_progress: Arc<dyn Fn(ExecutionEvent) + Send + Sync> = Arc::new(on_progress);
+        self.execute_async_inner(mode, on_progress).await
     }
 
-    fn execute_sync_inner(
+    // === Backward-compatible async API ====================================
+
+    /// Backward-compatible async entry point. Routes to the real async
+    /// executor (not a sync wrapper). Existing call sites that write
+    /// `graph.execute().await` continue to work.
+    pub async fn execute(&self) -> Result<ExecutionResult, GraphExecutionError> {
+        self.execute_async_with_mode(ExecutionMode::default()).await
+    }
+
+    /// Backward-compatible progress variant.
+    pub async fn execute_with_progress<F>(
         &self,
-        mode: ExecutionMode,
-        on_progress: Arc<dyn Fn(ExecutionEvent) + Send + Sync>,
-    ) -> Result<ExecutionResult, String> {
-        // Drain removed list from bookkeeping
+        on_progress: F,
+    ) -> Result<ExecutionResult, GraphExecutionError>
+    where
+        F: Fn(ExecutionEvent) + Send + Sync + 'static,
+    {
+        self.execute_async_with_progress(ExecutionMode::default(), on_progress)
+            .await
+    }
+
+    // === Planning =========================================================
+
+    /// Build the dirty execution plan WITHOUT clearing the changed-node
+    /// set.
+    ///
+    /// Snapshots `NodeStates::changed_nodes` via peek (not drain), runs a
+    /// BFS to collect downstream-affected nodes, and topologically sorts
+    /// the result. Removed nodes are drained from bookkeeping at plan
+    /// time — they don't participate in execution and are merely reported
+    /// in `ExecutionResult`, so eager drainage is safe.
+    fn build_execution_plan(&self) -> Result<ExecutionPlan, GraphExecutionError> {
         let removed = {
-            let mut b = self.bookkeeping.lock().map_err(|e| e.to_string())?;
+            let mut b = self
+                .bookkeeping
+                .lock()
+                .map_err(|e| GraphExecutionError::PlanningFailed(e.to_string()))?;
             std::mem::take(&mut b.removed_since_last_execute)
         };
 
-        // Drain changed nodes from NodeStates
         let changed = {
-            let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-            ns.drain_changed_nodes()
-        }; // write lock dropped
-
-        tracing::debug!(
-            target: "graph",
-            "[cognet] execute_sync: changed={} removed={} mode={:?}",
-            changed.len(),
-            removed.len(),
-            mode,
-        );
-
-        if changed.is_empty() && removed.is_empty() {
-            return Ok(ExecutionResult::empty());
-        }
+            let ns = self
+                .node_states
+                .read()
+                .map_err(|e| GraphExecutionError::PlanningFailed(e.to_string()))?;
+            ns.peek_changed_nodes()
+        };
 
         if changed.is_empty() {
-            return Ok(ExecutionResult {
+            return Ok(ExecutionPlan {
+                dirty_nodes: HashSet::new(),
+                levels: Vec::new(),
+                executed_node_ids: Vec::new(),
                 removed_nodes: removed,
-                ..Default::default()
             });
         }
 
-        // Clear previous execution errors before running
-        self.clear_execution_errors();
-
-        // BFS: changed nodes → all downstream nodes
         let dirty_nodes: HashSet<NodeId> = {
-            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+            let ns = self
+                .node_states
+                .read()
+                .map_err(|e| GraphExecutionError::PlanningFailed(e.to_string()))?;
             let mut affected = HashSet::new();
             let mut queue: VecDeque<NodeId> = changed.into_iter().collect();
             while let Some(node_id) = queue.pop_front() {
@@ -735,61 +871,84 @@ impl NodeGraph {
             affected
         };
 
-        let sorted_node_levels = self.topological_sort(&dirty_nodes)?;
+        let levels = self
+            .topological_sort(&dirty_nodes)
+            .map_err(GraphExecutionError::PlanningFailed)?;
 
-        // Collect all node IDs that will be executed (for output collection)
-        let executed_node_ids: Vec<NodeId> = sorted_node_levels
+        let executed_node_ids: Vec<NodeId> = levels
             .iter()
             .flat_map(|level| level.iter().copied())
             .collect();
 
+        Ok(ExecutionPlan {
+            dirty_nodes,
+            levels,
+            executed_node_ids,
+            removed_nodes: removed,
+        })
+    }
+
+    /// Validate that the plan can run on the synchronous kernel.
+    ///
+    /// Returns `RequiresAsyncExecution { node_ids }` listing every dirty
+    /// node whose `execution_kind` is `AsyncIo`. The dirty set is
+    /// preserved so a subsequent `execute_async` call sees the same plan.
+    fn validate_for_sync(&self, plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
         let shared_nodes = self.node_manager.nodes();
+        let async_nodes: Vec<NodeId> = plan
+            .executed_node_ids
+            .iter()
+            .filter(|id| {
+                node_execution_kind(id, &shared_nodes)
+                    .map(|k| k == NodeExecutionKind::AsyncIo)
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect();
+        if async_nodes.is_empty() {
+            Ok(())
+        } else {
+            Err(GraphExecutionError::RequiresAsyncExecution {
+                node_ids: async_nodes,
+            })
+        }
+    }
+
+    /// Drain the changed-nodes set after planning + validation succeeded.
+    ///
+    /// This is the moment the plan transitions from "tentative" to
+    /// "in-flight": failures after this point are recorded as per-node
+    /// execution errors inside the returned `ExecutionResult`, not as a
+    /// graph-level `GraphExecutionError`.
+    fn commit_plan_drain(&self) -> Result<(), GraphExecutionError> {
+        let mut ns = self
+            .node_states
+            .write()
+            .map_err(|e| GraphExecutionError::ExecutionFailed(e.to_string()))?;
+        let _ = ns.drain_changed_nodes();
+        Ok(())
+    }
+
+    fn empty_result_with_removed(plan: &ExecutionPlan) -> ExecutionResult {
+        ExecutionResult {
+            removed_nodes: plan.removed_nodes.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Collect outputs/edge_values/errors for the executed plan.
+    fn collect_outputs(&self, plan: &ExecutionPlan) -> ExecutionResult {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
+        let executed_node_ids = &plan.executed_node_ids;
 
-        for level_nodes in sorted_node_levels {
-            let level_results: Vec<(NodeId, Result<(), String>)> = match mode {
-                ExecutionMode::Sequential => level_nodes
-                    .into_iter()
-                    .map(|node_id| {
-                        execute_node_sync(
-                            node_id,
-                            &shared_nodes,
-                            &shared_cache,
-                            &shared_node_states,
-                            on_progress.as_ref(),
-                        )
-                    })
-                    .collect(),
-                ExecutionMode::Parallel => level_nodes
-                    .into_par_iter()
-                    .map(|node_id| {
-                        execute_node_sync(
-                            node_id,
-                            &shared_nodes,
-                            &shared_cache,
-                            &shared_node_states,
-                            on_progress.as_ref(),
-                        )
-                    })
-                    .collect(),
-            };
-
-            for (node_id, res) in level_results {
-                if let Err(msg) = res {
-                    self.add_error(GraphError::execution(node_id, msg));
-                }
-            }
-        }
-
-        // Collect outputs from executed nodes (Arc-shared for zero-copy)
         let mut outputs = Vec::new();
         let mut node_outputs: HashMap<NodeId, Vec<Option<Data>>> = HashMap::new();
         let mut edge_values: HashMap<EdgeId, EdgeValue> = HashMap::new();
 
         if let Ok(ns) = shared_node_states.read() {
             if let Ok(cache) = shared_cache.read() {
-                for node_id in &executed_node_ids {
+                for node_id in executed_node_ids {
                     let output_count = ns.output_slot_count(node_id);
                     let mut slot_outputs = vec![None; output_count];
                     for (idx, slot_out) in slot_outputs.iter_mut().enumerate() {
@@ -805,8 +964,6 @@ impl NodeGraph {
                         }
                     }
 
-                    // For sink nodes (0 outputs), resolve input values via edges
-                    // so display/output nodes can show their received values.
                     if output_count == 0 {
                         let input_count = ns.input_slot_count(node_id);
                         let mut slot_inputs = vec![None; input_count];
@@ -825,7 +982,6 @@ impl NodeGraph {
                     }
                 }
 
-                // Build edge values from all edges involving executed nodes
                 for (edge_id, edge) in ns.edges() {
                     if executed_node_ids.contains(&edge.from_node_id) {
                         let data = cache
@@ -847,7 +1003,6 @@ impl NodeGraph {
             }
         }
 
-        // Extract execution errors for nodes
         let mut errors: HashMap<NodeId, NodeError> = HashMap::new();
         let all_errors = self.errors();
         for (target, err) in &all_errors {
@@ -863,13 +1018,240 @@ impl NodeGraph {
             }
         }
 
-        Ok(ExecutionResult {
+        ExecutionResult {
             node_outputs,
             edge_values,
             errors,
-            removed_nodes: removed,
+            removed_nodes: plan.removed_nodes.clone(),
             outputs,
-        })
+        }
+    }
+
+    // === Internal sync executor ===========================================
+
+    fn execute_sync_inner(
+        &self,
+        mode: ExecutionMode,
+        on_progress: Arc<dyn Fn(ExecutionEvent) + Send + Sync>,
+    ) -> Result<ExecutionResult, GraphExecutionError> {
+        let plan = self.build_execution_plan()?;
+
+        tracing::debug!(
+            target: "graph",
+            "[cognet] execute_sync: dirty={} removed={} mode={:?}",
+            plan.dirty_nodes.len(),
+            plan.removed_nodes.len(),
+            mode,
+        );
+
+        if plan.is_empty() {
+            return Ok(if plan.removed_nodes.is_empty() {
+                ExecutionResult::empty()
+            } else {
+                Self::empty_result_with_removed(&plan)
+            });
+        }
+
+        // Validate BEFORE clearing dirty state. RequiresAsyncExecution
+        // returns the dirty set intact for a follow-up `execute_async`.
+        self.validate_for_sync(&plan)?;
+
+        self.commit_plan_drain()?;
+        self.clear_execution_errors();
+
+        let shared_nodes = self.node_manager.nodes();
+        let shared_cache = self.cache.share();
+        let shared_node_states = self.node_states.clone();
+
+        for level_nodes in &plan.levels {
+            let level_vec: Vec<NodeId> = level_nodes.clone();
+            let level_results: Vec<(NodeId, Result<(), String>)> = match mode {
+                ExecutionMode::Sequential => level_vec
+                    .into_iter()
+                    .map(|node_id| {
+                        execute_node_sync(
+                            node_id,
+                            &shared_nodes,
+                            &shared_cache,
+                            &shared_node_states,
+                            on_progress.as_ref(),
+                        )
+                    })
+                    .collect(),
+                ExecutionMode::Parallel => level_vec
+                    .into_par_iter()
+                    .map(|node_id| {
+                        execute_node_sync(
+                            node_id,
+                            &shared_nodes,
+                            &shared_cache,
+                            &shared_node_states,
+                            on_progress.as_ref(),
+                        )
+                    })
+                    .collect(),
+            };
+
+            for (node_id, res) in level_results {
+                if let Err(msg) = res {
+                    self.add_error(GraphError::execution(node_id, msg));
+                }
+            }
+        }
+
+        Ok(self.collect_outputs(&plan))
+    }
+
+    // === Internal async executor ==========================================
+
+    async fn execute_async_inner(
+        &self,
+        mode: ExecutionMode,
+        on_progress: Arc<dyn Fn(ExecutionEvent) + Send + Sync>,
+    ) -> Result<ExecutionResult, GraphExecutionError> {
+        let plan = self.build_execution_plan()?;
+
+        tracing::debug!(
+            target: "graph",
+            "[cognet] execute_async: dirty={} removed={} mode={:?}",
+            plan.dirty_nodes.len(),
+            plan.removed_nodes.len(),
+            mode,
+        );
+
+        if plan.is_empty() {
+            return Ok(if plan.removed_nodes.is_empty() {
+                ExecutionResult::empty()
+            } else {
+                Self::empty_result_with_removed(&plan)
+            });
+        }
+
+        self.commit_plan_drain()?;
+        self.clear_execution_errors();
+
+        let shared_nodes = self.node_manager.nodes();
+        let shared_cache = self.cache.share();
+        let shared_node_states = self.node_states.clone();
+
+        for level_nodes in &plan.levels {
+            // Partition dirty level into Sync/Async by execution_kind.
+            let mut sync_ids: Vec<NodeId> = Vec::new();
+            let mut async_ids: Vec<NodeId> = Vec::new();
+            for &id in level_nodes {
+                match node_execution_kind(&id, &shared_nodes) {
+                    Some(NodeExecutionKind::AsyncIo) => async_ids.push(id),
+                    // Missing entity falls through to the sync path —
+                    // execute_node_sync records a per-node error.
+                    _ => sync_ids.push(id),
+                }
+            }
+
+            // Sync CPU work: rayon in Parallel, sequential otherwise.
+            // Note: this is sync work running inside an async fn. The
+            // caller's runtime can offload via `spawn_blocking` if it
+            // dislikes that — the plan-14c invariant is only that the
+            // graph executor itself never calls `block_on`.
+            let sync_results: Vec<(NodeId, Result<(), String>)> = match mode {
+                ExecutionMode::Sequential => sync_ids
+                    .into_iter()
+                    .map(|node_id| {
+                        execute_node_sync(
+                            node_id,
+                            &shared_nodes,
+                            &shared_cache,
+                            &shared_node_states,
+                            on_progress.as_ref(),
+                        )
+                    })
+                    .collect(),
+                ExecutionMode::Parallel => sync_ids
+                    .into_par_iter()
+                    .map(|node_id| {
+                        execute_node_sync(
+                            node_id,
+                            &shared_nodes,
+                            &shared_cache,
+                            &shared_node_states,
+                            on_progress.as_ref(),
+                        )
+                    })
+                    .collect(),
+            };
+
+            for (node_id, res) in &sync_results {
+                if let Err(msg) = res {
+                    self.add_error(GraphError::execution(*node_id, msg.clone()));
+                }
+            }
+
+            // Async I/O work: prepare each future under a short read
+            // lock, drop the lock, then await all futures concurrently.
+            // The lock-across-await invariant from plan-14c §Locking
+            // Rule lives here.
+            let mut async_futs = Vec::with_capacity(async_ids.len());
+            for node_id in async_ids {
+                on_progress(ExecutionEvent::Started(node_id));
+
+                let prep_result: Result<BoxNodeFuture, String> = {
+                    let entity = {
+                        let guard = match shared_nodes.lock() {
+                            Ok(g) => g,
+                            Err(_) => {
+                                self.add_error(GraphError::execution(
+                                    node_id,
+                                    "Lock poisoned".to_string(),
+                                ));
+                                continue;
+                            }
+                        };
+                        guard.get(&node_id).map(Arc::clone)
+                    };
+                    match entity {
+                        None => Err("node entity missing".to_string()),
+                        Some(node_entity) => {
+                            let read = match node_entity.read() {
+                                Ok(r) => r,
+                                Err(p) => p.into_inner(),
+                            };
+                            // `read` (the RwLockReadGuard) is dropped at
+                            // the end of this match arm — strictly BEFORE
+                            // we await the prepared future, which is the
+                            // plan-14c lock-across-await invariant.
+                            match build_execution_context(
+                                &node_id,
+                                &shared_node_states,
+                                &shared_cache,
+                            ) {
+                                Ok(ctx) => read.prepare_async(ctx),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    }
+                };
+
+                async_futs.push(async move {
+                    match prep_result {
+                        Ok(fut) => (node_id, fut.await),
+                        Err(e) => (node_id, Err(e)),
+                    }
+                });
+            }
+
+            let async_results = futures::future::join_all(async_futs).await;
+
+            for (node_id, res) in async_results {
+                match res {
+                    Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
+                    Err(msg) => {
+                        on_progress(ExecutionEvent::Failed(node_id, msg.clone()));
+                        self.add_error(GraphError::execution(node_id, msg));
+                    }
+                }
+            }
+        }
+
+        Ok(self.collect_outputs(&plan))
     }
 }
 
@@ -877,6 +1259,8 @@ impl NodeGraph {
 mod sync_executor_tests {
     use super::*;
     use crate::{AddNode, NumberNode, SubGraphNode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
 
     /// Build a small `(a + b)` graph and return its three node ids.
     fn build_add_graph(a: f64, b: f64) -> (NodeGraph, NodeId, NodeId, NodeId) {
@@ -986,6 +1370,212 @@ mod sync_executor_tests {
             Poll::Pending => panic!("compat facade must be immediately ready"),
         };
         assert_eq!(output_for(&result, add_id), 6.0);
+    }
+
+    // ============================================================
+    // Plan-14c: hybrid sync/async execution tests
+    // ============================================================
+
+    /// Test-only `AsyncIo` node. Captures `node_data` under the short
+    /// read lock that `prepare_async` holds, returns a `'static` future
+    /// that yields once (proving the executor actually `.awaits` it),
+    /// then forwards the value to its output. No node entity guard is
+    /// held across `.await` — that is the plan-14c lock invariant.
+    #[derive(Debug)]
+    pub struct AsyncEchoNode;
+
+    impl crate::NodeMeta for AsyncEchoNode {
+        const NAME: &'static str = "AsyncEcho";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Primitive;
+        const INPUTS: &'static [crate::SlotDef] = &[];
+        const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "Out",
+            data_type: crate::DataType::Number,
+            max_connections: None,
+        }];
+        const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::Number(42.0);
+    }
+
+    impl NodeImpl for AsyncEchoNode {
+        fn execution_kind(&self) -> NodeExecutionKind {
+            NodeExecutionKind::AsyncIo
+        }
+
+        fn prepare_async(&self, ctx: ExecutionContext) -> Result<BoxNodeFuture, String> {
+            // Move the value out of the (lock-bound) ctx into the
+            // 'static future. The executor drops the read lock before
+            // awaiting this future.
+            let data = ctx.node_data;
+            let writer = ctx.output_writer;
+            Ok(Box::pin(async move {
+                tokio::task::yield_now().await;
+                let value = data.ok_or_else(|| "AsyncEcho: missing node_data".to_string())?;
+                writer.set(0, value)?;
+                Ok(())
+            }))
+        }
+    }
+
+    crate::register_nodes!(AsyncEchoNode);
+
+    #[test]
+    fn execute_sync_returns_requires_async_for_async_node() {
+        // Graph: sync NumberNode (0) -> async AsyncEchoNode (downstream).
+        // The async node sits in the dirty plan, so execute_sync must
+        // refuse with RequiresAsyncExecution and PRESERVE the dirty set.
+        let mut graph = NodeGraph::new().unwrap();
+        let echo_id = graph.create_node::<AsyncEchoNode>().unwrap();
+
+        let err = graph.execute_sync().expect_err("sync rejects async plan");
+        match err {
+            GraphExecutionError::RequiresAsyncExecution { node_ids } => {
+                assert!(
+                    node_ids.contains(&echo_id),
+                    "error must list the async node"
+                );
+            }
+            other => panic!("expected RequiresAsyncExecution, got {other:?}"),
+        }
+
+        // Dirty preservation: the failed sync call must NOT have
+        // drained `changed_nodes`. A second `execute_sync` returns the
+        // same error and (more importantly) the same dirty set.
+        let err2 = graph
+            .execute_sync()
+            .expect_err("dirty plan still rejects on second call");
+        assert!(matches!(
+            err2,
+            GraphExecutionError::RequiresAsyncExecution { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_async_runs_async_node_value_propagates() {
+        let mut graph = NodeGraph::new().unwrap();
+        let echo_id = graph.create_node::<AsyncEchoNode>().unwrap();
+        graph
+            .update_node_data(&echo_id, Data::new(7.5_f64).unwrap())
+            .unwrap();
+
+        let result = graph
+            .execute_async()
+            .await
+            .expect("async executor handles async nodes");
+        assert_eq!(output_for(&result, echo_id), 7.5);
+    }
+
+    #[tokio::test]
+    async fn execute_async_handles_mixed_sync_async_levels() {
+        // Two sync sources feed an async sink (AsyncEcho doesn't read
+        // upstream — but we sequence dirty so both kinds appear).
+        let mut graph = NodeGraph::new().unwrap();
+        let n1 = graph.create_node::<NumberNode>().unwrap();
+        let n2 = graph.create_node::<NumberNode>().unwrap();
+        let add_id = graph.create_node::<AddNode>().unwrap();
+        let echo_id = graph.create_node::<AsyncEchoNode>().unwrap();
+
+        graph
+            .update_node_data(&n1, Data::new(2.0_f64).unwrap())
+            .unwrap();
+        graph
+            .update_node_data(&n2, Data::new(5.0_f64).unwrap())
+            .unwrap();
+        graph
+            .update_node_data(&echo_id, Data::new(11.0_f64).unwrap())
+            .unwrap();
+        graph.connect_nodes(&n1, 0, &add_id, 0).unwrap();
+        graph.connect_nodes(&n2, 0, &add_id, 1).unwrap();
+
+        let result = graph.execute_async().await.expect("mixed graph runs");
+        assert_eq!(output_for(&result, add_id), 7.0);
+        assert_eq!(output_for(&result, echo_id), 11.0);
+    }
+
+    #[tokio::test]
+    async fn async_executor_drops_locks_before_awaiting_node_future() {
+        // While the AsyncEcho future is suspended (yield_now), other
+        // threads/tasks must be able to acquire READ locks on the graph.
+        // We exercise this by reading `get_output_value` from another
+        // task while the async execution is in flight.
+        //
+        // The test would deadlock if execute_async held a graph or node
+        // lock across `.await` — that's the plan-14c lock-invariant
+        // canary.
+        let mut graph = NodeGraph::new().unwrap();
+        let echo_id = graph.create_node::<AsyncEchoNode>().unwrap();
+        graph
+            .update_node_data(&echo_id, Data::new(99.0_f64).unwrap())
+            .unwrap();
+
+        let arc_graph = StdArc::new(graph);
+        let g_for_reader = StdArc::clone(&arc_graph);
+        let probe = tokio::spawn(async move {
+            // Ten attempts to read while execution is running. Each
+            // call hits the node-states / cache locks that the
+            // executor would otherwise be holding.
+            let mut got_some = false;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+                if g_for_reader.get_output_value(&echo_id, 0).is_some() {
+                    got_some = true;
+                }
+            }
+            got_some
+        });
+
+        let result = arc_graph
+            .execute_async()
+            .await
+            .expect("async executor completes despite concurrent reads");
+        assert_eq!(output_for(&result, echo_id), 99.0);
+        let _ = probe.await;
+    }
+
+    #[tokio::test]
+    async fn async_executor_ran_async_node_count() {
+        // Also confirm that prepare_async was invoked exactly once per
+        // dirty async node. We use a process-global counter because the
+        // node struct itself is unit-sized.
+        static PREPARE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Debug)]
+        struct CountingAsyncNode;
+
+        impl crate::NodeMeta for CountingAsyncNode {
+            const NAME: &'static str = "CountingAsync";
+            const CATEGORY: crate::NodeCategory = crate::NodeCategory::Primitive;
+            const INPUTS: &'static [crate::SlotDef] = &[];
+            const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+                label: "Out",
+                data_type: crate::DataType::Number,
+                max_connections: None,
+            }];
+            const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::Number(0.0);
+        }
+
+        impl NodeImpl for CountingAsyncNode {
+            fn execution_kind(&self) -> NodeExecutionKind {
+                NodeExecutionKind::AsyncIo
+            }
+            fn prepare_async(&self, ctx: ExecutionContext) -> Result<BoxNodeFuture, String> {
+                PREPARE_CALLS.fetch_add(1, Ordering::SeqCst);
+                let writer = ctx.output_writer;
+                let data = ctx.node_data;
+                Ok(Box::pin(async move {
+                    let value = data.unwrap_or(Data::new(0.0_f64).unwrap());
+                    writer.set(0, value)?;
+                    Ok(())
+                }))
+            }
+        }
+
+        crate::register_nodes!(CountingAsyncNode);
+
+        let mut graph = NodeGraph::new().unwrap();
+        let _id = graph.create_node::<CountingAsyncNode>().unwrap();
+        PREPARE_CALLS.store(0, Ordering::SeqCst);
+        graph.execute_async().await.expect("async run");
+        assert_eq!(PREPARE_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
