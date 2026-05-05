@@ -13,7 +13,7 @@ pub use subgraph::*;
 pub use type_info::*;
 
 use crate::{impl_entity_id, AsAny, NodeManager};
-use std::{any::Any, fmt::Debug};
+use std::{any::Any, fmt::Debug, future::Future, pin::Pin};
 
 impl_entity_id!(NodeId);
 
@@ -28,11 +28,85 @@ pub trait NodeInit: NodeMeta + Sized {
     fn initialize() -> Result<Self, String>;
 }
 
+/// Capability metadata describing how a node should be executed.
+///
+/// The graph executor inspects this to dispatch CPU-bound work synchronously
+/// (potentially in parallel via rayon) and I/O-bound work asynchronously.
+/// `SyncCpu` nodes implement [`NodeImpl::execute_sync`]; `AsyncIo` nodes
+/// implement [`NodeImpl::prepare_async`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeExecutionKind {
+    /// CPU-bound, deterministic, runs to completion without yielding to an
+    /// async runtime. Default for all primitive and operator nodes.
+    #[default]
+    SyncCpu,
+    /// I/O-bound. Must yield to an async runtime via the future returned
+    /// from `prepare_async`.
+    AsyncIo,
+}
+
+/// `'static` boxed future returned by [`NodeImpl::prepare_async`].
+///
+/// The future must own (or `Arc`-clone) every input it needs — the graph
+/// executor drops all node and graph locks before awaiting it. This is the
+/// invariant that prevents nested `block_on` and lock-across-`await`
+/// deadlocks.
+pub type BoxNodeFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+
 /// The core node implementation trait.
-/// Only requires `execute()` - initialization is handled by `NodeInit`.
-#[async_trait::async_trait]
+///
+/// Nodes split into two camps via [`NodeExecutionKind`]:
+///
+/// - **`SyncCpu`** (default) — implement [`NodeImpl::execute_sync`]. The
+///   executor runs them on the current thread (or a rayon worker) inside
+///   `NodeGraph::execute_sync`. They never enter an async runtime.
+/// - **`AsyncIo`** — implement [`NodeImpl::prepare_async`]. The executor
+///   calls `prepare_async` under a short read lock to obtain a `'static`
+///   future, drops the lock, then awaits the future. Use for remote API
+///   calls, asset loading, database access — anything that yields.
+///
+/// `NodeGraph::execute_sync` returns
+/// [`crate::GraphExecutionError::RequiresAsyncExecution`] if the dirty
+/// plan reaches an `AsyncIo` node. Use `NodeGraph::execute_async` for
+/// mixed graphs.
 pub trait NodeImpl: Debug + Send + Sync + AsAny {
-    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String>;
+    /// How the executor should dispatch this node.
+    ///
+    /// Default is [`NodeExecutionKind::SyncCpu`]. Override and implement
+    /// [`NodeImpl::prepare_async`] for I/O-bound nodes.
+    fn execution_kind(&self) -> NodeExecutionKind {
+        NodeExecutionKind::SyncCpu
+    }
+
+    /// Synchronous execution entry point for `SyncCpu` nodes.
+    ///
+    /// Default implementation returns an error so a forgotten override
+    /// surfaces as a runtime failure rather than silently doing nothing.
+    fn execute_sync(&self, _ctx: ExecutionContext) -> Result<(), String> {
+        Err(format!(
+            "node `{}` does not implement synchronous execution; \
+             override `NodeImpl::execute_sync` or set \
+             `execution_kind() == NodeExecutionKind::AsyncIo` and implement `prepare_async`",
+            std::any::type_name::<Self>()
+        ))
+    }
+
+    /// Async preparation entry point for `AsyncIo` nodes.
+    ///
+    /// The implementation is called by the executor under a short read
+    /// lock on the node entity. It must extract every input it needs from
+    /// `ctx`, then return a `'static` future that owns its captured data.
+    /// The executor drops all locks before awaiting that future, which is
+    /// the invariant that keeps the executor free of nested `block_on`
+    /// and `RwLock` guards across `.await`.
+    fn prepare_async(&self, _ctx: ExecutionContext) -> Result<BoxNodeFuture, String> {
+        Err(format!(
+            "node `{}` does not implement asynchronous execution; \
+             override `NodeImpl::prepare_async` or set \
+             `execution_kind() == NodeExecutionKind::SyncCpu` and implement `execute_sync`",
+            std::any::type_name::<Self>()
+        ))
+    }
 }
 
 impl dyn NodeImpl {

@@ -32,9 +32,8 @@ impl NodeMeta for DivideNode {
     }];
 }
 
-#[async_trait::async_trait]
 impl NodeImpl for DivideNode {
-    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+    fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
         let a: f64 = ctx
             .input_values
             .first()

@@ -262,6 +262,7 @@ impl NodeGraph {
     ///
     /// `target_node_id` and `target_slot` identify which internal node's
     /// multi-connection input slot the proxy outputs should connect to.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_subgraph_dynamic_input(
         &self,
         node_id: &NodeId,
@@ -313,8 +314,8 @@ impl NodeGraph {
 mod tests {
     use crate::NodeGraphWrite;
 
-    #[tokio::test]
-    async fn test_is_subgraph_node() {
+    #[test]
+    fn test_is_subgraph_node() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let num = graph
             .create_node::<crate::NumberNode>()
@@ -327,8 +328,8 @@ mod tests {
         assert!(graph.is_subgraph_node(&sg));
     }
 
-    #[tokio::test]
-    async fn test_subgraph_label() {
+    #[test]
+    fn test_subgraph_label() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()
@@ -339,8 +340,8 @@ mod tests {
         assert_eq!(graph.subgraph_label(&sg), Some("Custom".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_subgraph_proxy_ids() {
+    #[test]
+    fn test_subgraph_proxy_ids() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()
@@ -353,8 +354,8 @@ mod tests {
         assert!(internal_ids.contains(&output_id));
     }
 
-    #[tokio::test]
-    async fn test_add_remove_subgraph_ports() {
+    #[test]
+    fn test_add_remove_subgraph_ports() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()
@@ -388,8 +389,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_with_subgraph() {
+    #[test]
+    fn test_with_subgraph() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()

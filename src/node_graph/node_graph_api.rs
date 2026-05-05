@@ -1,9 +1,3 @@
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::{runtime::Handle, task};
-
-#[cfg(target_arch = "wasm32")]
-use futures::future::join_all;
-
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -27,6 +21,24 @@ pub enum ExecutionEvent {
     Completed(NodeId),
     /// Node execution failed with an error.
     Failed(NodeId, String),
+}
+
+/// Execution scheduling mode for `NodeGraph::execute_sync_with_mode`.
+///
+/// All variants are synchronous — the difference is only in how nodes within
+/// the same topological level are scheduled.
+///
+/// `Parallel` is the recommended default on native targets. On targets where
+/// rayon's worker pool is not initialised (notably wasm without
+/// `wasm-bindgen-rayon` setup), rayon transparently falls back to sequential
+/// execution, so `Parallel` is safe everywhere.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Execute nodes one at a time in stable topological order.
+    Sequential,
+    /// Execute same-level nodes in parallel via rayon (best-effort).
+    #[default]
+    Parallel,
 }
 
 /// Output from a single node execution.
@@ -524,26 +536,152 @@ impl NodeGraphWrite for NodeGraph {
     }
 }
 
-impl NodeGraph {
-    /// Execute the graph asynchronously.
-    ///
-    /// Returns `ExecutionResult` containing outputs from computed nodes,
-    /// edge values, execution errors, and IDs of removed nodes.
-    pub async fn execute(&self) -> Result<ExecutionResult, String> {
-        self.execute_with_progress(|_| {}).await
+/// Execute a single node synchronously.
+///
+/// Locks the nodes map only long enough to clone out the node entity, then
+/// holds a read lock on the entity for regular nodes (allowing concurrent
+/// reads from UI) and upgrades to a write lock for `SubGraphNode` (which
+/// needs `&mut self` to drive its internal graph).
+///
+/// Wraps execution in `catch_unwind` so a single node panic does not abort
+/// the surrounding rayon level.
+fn execute_node_sync(
+    node_id: NodeId,
+    shared_nodes: &crate::SharedNodes,
+    shared_cache: &SharedExecutionCache,
+    shared_node_states: &SharedNodeStates,
+    on_progress: &(dyn Fn(ExecutionEvent) + Send + Sync),
+) -> (NodeId, Result<(), String>) {
+    on_progress(ExecutionEvent::Started(node_id));
+
+    let result: Result<(), String> = {
+        let entity = {
+            let nodes_guard = match shared_nodes.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    on_progress(ExecutionEvent::Failed(node_id, "Lock poisoned".to_string()));
+                    return (node_id, Err("Lock poisoned".to_string()));
+                }
+            };
+            nodes_guard.get(&node_id).map(Arc::clone)
+        };
+
+        let Some(node_entity) = entity else {
+            on_progress(ExecutionEvent::Completed(node_id));
+            return (node_id, Ok(()));
+        };
+
+        // Identify SubGraphNode under a read lock first to decide whether we
+        // need the write lock. Most nodes are regular and never need it.
+        let is_subgraph = match node_entity.read() {
+            Ok(r) => r.as_any().downcast_ref::<SubGraphNode>().is_some(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .as_any()
+                .downcast_ref::<SubGraphNode>()
+                .is_some(),
+        };
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if is_subgraph {
+                let mut node_write = match node_entity.write() {
+                    Ok(w) => w,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let sg = node_write
+                    .as_any_mut()
+                    .downcast_mut::<SubGraphNode>()
+                    .expect("downcast verified above");
+                sg.execute_internal_sync(&node_id, shared_cache.share(), shared_node_states.clone())
+            } else {
+                let node_read = match node_entity.read() {
+                    Ok(r) => r,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                match build_execution_context(&node_id, shared_node_states, shared_cache) {
+                    Ok(ctx) => node_read.execute(ctx),
+                    Err(e) => Err(e),
+                }
+            }
+        }));
+
+        match panic_result {
+            Ok(res) => res,
+            Err(panic_payload) => {
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    format!("Node panicked: {s}")
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    format!("Node panicked: {s}")
+                } else {
+                    "Node panicked".to_string()
+                };
+                Err(msg)
+            }
+        }
+    };
+
+    match &result {
+        Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
+        Err(msg) => on_progress(ExecutionEvent::Failed(node_id, msg.clone())),
     }
 
-    /// Execute the graph with progress callback.
+    (node_id, result)
+}
+
+impl NodeGraph {
+    /// Execute the graph synchronously with the default mode (`Parallel`).
     ///
-    /// The callback is called for each node as it starts executing,
-    /// completes, or fails. This enables real-time UI updates.
+    /// This is the canonical execution kernel. It does not depend on any
+    /// async runtime — callers may invoke it from event handlers, reactive
+    /// effects, or async test contexts without nested executor coordination.
     ///
     /// Returns `ExecutionResult` containing outputs from computed nodes,
     /// edge values, execution errors, and IDs of removed nodes.
+    pub fn execute_sync(&self) -> Result<ExecutionResult, String> {
+        self.execute_sync_with_progress(ExecutionMode::default(), |_| {})
+    }
+
+    /// Execute the graph synchronously with the requested scheduling mode.
+    pub fn execute_sync_with_mode(&self, mode: ExecutionMode) -> Result<ExecutionResult, String> {
+        self.execute_sync_with_progress(mode, |_| {})
+    }
+
+    /// Execute the graph synchronously with the requested scheduling mode
+    /// and a progress callback that fires per node as it starts, completes,
+    /// or fails.
+    pub fn execute_sync_with_progress<F>(
+        &self,
+        mode: ExecutionMode,
+        on_progress: F,
+    ) -> Result<ExecutionResult, String>
+    where
+        F: Fn(ExecutionEvent) + Send + Sync + 'static,
+    {
+        let on_progress: Arc<dyn Fn(ExecutionEvent) + Send + Sync> = Arc::new(on_progress);
+        self.execute_sync_inner(mode, on_progress)
+    }
+
+    /// Backward-compatible async facade. Returns the same value as
+    /// [`execute_sync`]; the future is immediately ready and is not bound
+    /// to any async runtime.
+    pub async fn execute(&self) -> Result<ExecutionResult, String> {
+        self.execute_sync()
+    }
+
+    /// Backward-compatible async facade for [`execute_sync_with_progress`]
+    /// with `ExecutionMode::Parallel`.
     pub async fn execute_with_progress<F>(&self, on_progress: F) -> Result<ExecutionResult, String>
     where
         F: Fn(ExecutionEvent) + Send + Sync + 'static,
     {
+        self.execute_sync_with_progress(ExecutionMode::default(), on_progress)
+    }
+
+    fn execute_sync_inner(
+        &self,
+        mode: ExecutionMode,
+        on_progress: Arc<dyn Fn(ExecutionEvent) + Send + Sync>,
+    ) -> Result<ExecutionResult, String> {
         // Drain removed list from bookkeeping
         let removed = {
             let mut b = self.bookkeeping.lock().map_err(|e| e.to_string())?;
@@ -558,9 +696,10 @@ impl NodeGraph {
 
         tracing::debug!(
             target: "graph",
-            "[cognet] execute: changed={} removed={}",
+            "[cognet] execute_sync: changed={} removed={} mode={:?}",
             changed.len(),
             removed.len(),
+            mode,
         );
 
         if changed.is_empty() && removed.is_empty() {
@@ -607,202 +746,38 @@ impl NodeGraph {
         let shared_nodes = self.node_manager.nodes();
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
-        let on_progress = Arc::new(on_progress);
 
-        #[cfg(target_arch = "wasm32")]
-        {
-            for level_nodes in sorted_node_levels {
-                let futures: Vec<_> = level_nodes
+        for level_nodes in sorted_node_levels {
+            let level_results: Vec<(NodeId, Result<(), String>)> = match mode {
+                ExecutionMode::Sequential => level_nodes
                     .into_iter()
                     .map(|node_id| {
-                        let shared_nodes = shared_nodes.share();
-                        let shared_cache = shared_cache.share();
-                        let shared_node_states = shared_node_states.clone();
-                        let on_progress = Arc::clone(&on_progress);
-                        async move {
-                            on_progress(ExecutionEvent::Started(node_id));
-
-                            let result = {
-                                let nodes_guard = match shared_nodes.lock() {
-                                    Ok(g) => g,
-                                    Err(_) => return (node_id, Err("Lock poisoned".to_string())),
-                                };
-                                if let Some(node) = nodes_guard.get(&node_id) {
-                                    let node_clone = Arc::clone(node);
-                                    drop(nodes_guard);
-                                    // Read lock for regular nodes (allows concurrent UI reads).
-                                    // SubGraphNode upgrades to write lock (needs &mut self).
-                                    let node_read = match node_clone.read() {
-                                        Ok(r) => r,
-                                        Err(poisoned) => poisoned.into_inner(),
-                                    };
-                                    if node_read.as_any().downcast_ref::<SubGraphNode>().is_some() {
-                                        drop(node_read);
-                                        let mut node_write = match node_clone.write() {
-                                            Ok(w) => w,
-                                            Err(poisoned) => poisoned.into_inner(),
-                                        };
-                                        let sg = node_write
-                                            .as_any_mut()
-                                            .downcast_mut::<SubGraphNode>()
-                                            .expect("downcast verified above");
-                                        sg.execute_internal(
-                                            &node_id,
-                                            shared_cache.share(),
-                                            shared_node_states.clone(),
-                                        )
-                                        .await
-                                    } else {
-                                        match build_execution_context(
-                                            &node_id,
-                                            &shared_node_states,
-                                            &shared_cache,
-                                        ) {
-                                            Ok(ctx) => node_read.execute(ctx).await,
-                                            Err(e) => Err(e),
-                                        }
-                                    }
-                                } else {
-                                    Ok(())
-                                }
-                            };
-
-                            match &result {
-                                Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
-                                Err(msg) => {
-                                    on_progress(ExecutionEvent::Failed(node_id, msg.clone()))
-                                }
-                            }
-
-                            (node_id, result)
-                        }
+                        execute_node_sync(
+                            node_id,
+                            &shared_nodes,
+                            &shared_cache,
+                            &shared_node_states,
+                            on_progress.as_ref(),
+                        )
                     })
-                    .collect();
+                    .collect(),
+                ExecutionMode::Parallel => level_nodes
+                    .into_par_iter()
+                    .map(|node_id| {
+                        execute_node_sync(
+                            node_id,
+                            &shared_nodes,
+                            &shared_cache,
+                            &shared_node_states,
+                            on_progress.as_ref(),
+                        )
+                    })
+                    .collect(),
+            };
 
-                let results = join_all(futures).await;
-                for (node_id, res) in results {
-                    if let Err(msg) = res {
-                        self.add_error(GraphError::execution(node_id, msg));
-                    }
-                }
-            }
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let rt_handle = Arc::new(Handle::current());
-            for level_nodes in sorted_node_levels {
-                let results: Vec<(NodeId, Result<(), String>)> = task::spawn_blocking({
-                    let shared_nodes = shared_nodes.share();
-                    let shared_cache = shared_cache.share();
-                    let shared_node_states = shared_node_states.clone();
-                    let rt_handle = Arc::clone(&rt_handle);
-                    let on_progress = Arc::clone(&on_progress);
-                    move || {
-                        level_nodes
-                            .into_par_iter()
-                            .map(|node_id| {
-                                on_progress(ExecutionEvent::Started(node_id));
-
-                                let result = {
-                                    let nodes_guard = match shared_nodes.lock() {
-                                        Ok(g) => g,
-                                        Err(_) => {
-                                            return (node_id, Err("Lock poisoned".to_string()))
-                                        }
-                                    };
-                                    if let Some(node) = nodes_guard.get(&node_id) {
-                                        let node_clone = Arc::clone(node);
-                                        let cache_clone = shared_cache.share();
-                                        let ns_clone = shared_node_states.clone();
-                                        let rt_clone = Arc::clone(&rt_handle);
-                                        drop(nodes_guard);
-                                        // Catch panics so a single node failure
-                                        // doesn't abort the entire execution level.
-                                        match std::panic::catch_unwind(
-                                            std::panic::AssertUnwindSafe(|| {
-                                                #[allow(clippy::await_holding_lock)]
-                                                rt_clone.block_on(async {
-                                                    // Read lock for regular nodes; write for SubGraphNode.
-                                                    let node_read = match node_clone.read() {
-                                                        Ok(r) => r,
-                                                        Err(poisoned) => poisoned.into_inner(),
-                                                    };
-                                                    if node_read
-                                                        .as_any()
-                                                        .downcast_ref::<SubGraphNode>()
-                                                        .is_some()
-                                                    {
-                                                        drop(node_read);
-                                                        let mut node_write = match node_clone
-                                                            .write()
-                                                        {
-                                                            Ok(w) => w,
-                                                            Err(poisoned) => poisoned.into_inner(),
-                                                        };
-                                                        let sg = node_write
-                                                            .as_any_mut()
-                                                            .downcast_mut::<SubGraphNode>()
-                                                            .expect("downcast verified above");
-                                                        sg.execute_internal(
-                                                            &node_id,
-                                                            cache_clone,
-                                                            ns_clone,
-                                                        )
-                                                        .await
-                                                    } else {
-                                                        match build_execution_context(
-                                                            &node_id,
-                                                            &ns_clone,
-                                                            &cache_clone,
-                                                        ) {
-                                                            Ok(ctx) => node_read.execute(ctx).await,
-                                                            Err(e) => Err(e),
-                                                        }
-                                                    }
-                                                })
-                                            }),
-                                        ) {
-                                            Ok(result) => result,
-                                            Err(panic_payload) => {
-                                                let msg = if let Some(s) =
-                                                    panic_payload.downcast_ref::<&str>()
-                                                {
-                                                    format!("Node panicked: {}", s)
-                                                } else if let Some(s) =
-                                                    panic_payload.downcast_ref::<String>()
-                                                {
-                                                    format!("Node panicked: {}", s)
-                                                } else {
-                                                    "Node panicked".to_string()
-                                                };
-                                                Err(msg)
-                                            }
-                                        }
-                                    } else {
-                                        Ok(())
-                                    }
-                                };
-
-                                match &result {
-                                    Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
-                                    Err(msg) => {
-                                        on_progress(ExecutionEvent::Failed(node_id, msg.clone()))
-                                    }
-                                }
-
-                                (node_id, result)
-                            })
-                            .collect()
-                    }
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-
-                for (node_id, res) in results {
-                    if let Err(msg) = res {
-                        self.add_error(GraphError::execution(node_id, msg));
-                    }
+            for (node_id, res) in level_results {
+                if let Err(msg) = res {
+                    self.add_error(GraphError::execution(node_id, msg));
                 }
             }
         }
@@ -895,5 +870,166 @@ impl NodeGraph {
             removed_nodes: removed,
             outputs,
         })
+    }
+}
+
+#[cfg(test)]
+mod sync_executor_tests {
+    use super::*;
+    use crate::{AddNode, NumberNode, SubGraphNode};
+
+    /// Build a small `(a + b)` graph and return its three node ids.
+    fn build_add_graph(a: f64, b: f64) -> (NodeGraph, NodeId, NodeId, NodeId) {
+        let mut graph = NodeGraph::new().unwrap();
+        let a_id = graph.create_node::<NumberNode>().unwrap();
+        let b_id = graph.create_node::<NumberNode>().unwrap();
+        let add_id = graph.create_node::<AddNode>().unwrap();
+
+        graph
+            .update_node_data(&a_id, Data::new(a).unwrap())
+            .unwrap();
+        graph
+            .update_node_data(&b_id, Data::new(b).unwrap())
+            .unwrap();
+        graph.connect_nodes(&a_id, 0, &add_id, 0).unwrap();
+        graph.connect_nodes(&b_id, 0, &add_id, 1).unwrap();
+
+        (graph, a_id, b_id, add_id)
+    }
+
+    fn output_for(result: &ExecutionResult, node_id: NodeId) -> f64 {
+        result
+            .node_outputs
+            .get(&node_id)
+            .and_then(|slots| slots.first().cloned().flatten())
+            .and_then(|d| d.value::<f64>().ok().copied())
+            .expect("node output present")
+    }
+
+    #[test]
+    fn sequential_matches_parallel_on_independent_levels() {
+        // Two parallel sub-additions feed into a final add.
+        let mut graph = NodeGraph::new().unwrap();
+        let n1 = graph.create_node::<NumberNode>().unwrap();
+        let n2 = graph.create_node::<NumberNode>().unwrap();
+        let n3 = graph.create_node::<NumberNode>().unwrap();
+        let n4 = graph.create_node::<NumberNode>().unwrap();
+        let add_left = graph.create_node::<AddNode>().unwrap();
+        let add_right = graph.create_node::<AddNode>().unwrap();
+        let add_top = graph.create_node::<AddNode>().unwrap();
+
+        graph
+            .update_node_data(&n1, Data::new(1.0_f64).unwrap())
+            .unwrap();
+        graph
+            .update_node_data(&n2, Data::new(2.0_f64).unwrap())
+            .unwrap();
+        graph
+            .update_node_data(&n3, Data::new(3.0_f64).unwrap())
+            .unwrap();
+        graph
+            .update_node_data(&n4, Data::new(4.0_f64).unwrap())
+            .unwrap();
+        graph.connect_nodes(&n1, 0, &add_left, 0).unwrap();
+        graph.connect_nodes(&n2, 0, &add_left, 1).unwrap();
+        graph.connect_nodes(&n3, 0, &add_right, 0).unwrap();
+        graph.connect_nodes(&n4, 0, &add_right, 1).unwrap();
+        graph.connect_nodes(&add_left, 0, &add_top, 0).unwrap();
+        graph.connect_nodes(&add_right, 0, &add_top, 1).unwrap();
+
+        let seq = graph
+            .execute_sync_with_mode(ExecutionMode::Sequential)
+            .unwrap();
+        let seq_top = output_for(&seq, add_top);
+
+        // Mark all dirty so a second execute recomputes the same nodes.
+        graph.mark_all_nodes_dirty();
+        let par = graph
+            .execute_sync_with_mode(ExecutionMode::Parallel)
+            .unwrap();
+        let par_top = output_for(&par, add_top);
+
+        assert_eq!(seq_top, 10.0);
+        assert_eq!(par_top, 10.0);
+    }
+
+    #[test]
+    fn execute_sync_produces_expected_value() {
+        let (graph, _, _, add_id) = build_add_graph(7.0, 8.0);
+        let result = graph.execute_sync().unwrap();
+        assert_eq!(output_for(&result, add_id), 15.0);
+    }
+
+    #[test]
+    fn async_execute_facade_returns_same_value() {
+        // The async execute() is a thin wrapper that does not require any
+        // runtime — `block_on` from `pollster` would also work, but since the
+        // future is immediately ready we can poll it inline with a noop waker.
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(std::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        let raw = RawWaker::new(std::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw) };
+        let mut cx = Context::from_waker(&waker);
+
+        let (graph, _, _, add_id) = build_add_graph(2.5, 3.5);
+        let mut fut = Box::pin(graph.execute());
+        let result = match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Ready(r) => r.unwrap(),
+            Poll::Pending => panic!("compat facade must be immediately ready"),
+        };
+        assert_eq!(output_for(&result, add_id), 6.0);
+    }
+
+    #[test]
+    fn subgraph_executes_recursively_through_sync_kernel() {
+        let mut graph = NodeGraph::new().unwrap();
+        let outer_a = graph.create_node::<NumberNode>().unwrap();
+        let outer_b = graph.create_node::<NumberNode>().unwrap();
+        graph
+            .update_node_data(&outer_a, Data::new(11.0_f64).unwrap())
+            .unwrap();
+        graph
+            .update_node_data(&outer_b, Data::new(31.0_f64).unwrap())
+            .unwrap();
+
+        // Build a subgraph that sums two inputs.
+        let sub_id = graph.create_node::<SubGraphNode>().unwrap();
+        graph
+            .add_subgraph_input(&sub_id, "A", DataType::Number)
+            .unwrap();
+        graph
+            .add_subgraph_input(&sub_id, "B", DataType::Number)
+            .unwrap();
+        graph
+            .add_subgraph_output(&sub_id, "Sum", DataType::Number)
+            .unwrap();
+
+        let (in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sub_id).unwrap();
+        let inner_add = graph
+            .with_subgraph_mut(&sub_id, |internal| {
+                let inner_add = internal.create_node::<AddNode>().unwrap();
+                internal.connect_nodes(&in_proxy, 0, &inner_add, 0).unwrap();
+                internal.connect_nodes(&in_proxy, 1, &inner_add, 1).unwrap();
+                internal
+                    .connect_nodes(&inner_add, 0, &out_proxy, 0)
+                    .unwrap();
+                inner_add
+            })
+            .unwrap();
+        let _ = inner_add; // value unused after construction; only for clarity
+
+        graph.connect_nodes(&outer_a, 0, &sub_id, 0).unwrap();
+        graph.connect_nodes(&outer_b, 0, &sub_id, 1).unwrap();
+
+        let result = graph.execute_sync().unwrap();
+        assert_eq!(output_for(&result, sub_id), 42.0);
     }
 }

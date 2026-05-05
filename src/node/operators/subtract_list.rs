@@ -21,9 +21,8 @@ impl NodeMeta for SubtractListNode {
     }];
 }
 
-#[async_trait::async_trait]
 impl NodeImpl for SubtractListNode {
-    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+    fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
         let data_list = ctx.input_values.first().cloned().unwrap_or_default();
         let mut result: Option<f64> = None;
         for data in &data_list {

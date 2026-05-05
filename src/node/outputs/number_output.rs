@@ -16,9 +16,8 @@ impl NodeMeta for NumberOutput {
     const OUTPUTS: &'static [SlotDef] = &[];
 }
 
-#[async_trait::async_trait]
 impl NodeImpl for NumberOutput {
-    async fn execute(&self, _ctx: ExecutionContext) -> Result<(), String> {
+    fn execute_sync(&self, _ctx: ExecutionContext) -> Result<(), String> {
         // Output node just reads its input - the value is read from cache for UI display
         Ok(())
     }

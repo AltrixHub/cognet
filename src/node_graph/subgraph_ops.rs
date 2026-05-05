@@ -672,8 +672,8 @@ mod tests {
     use super::*;
     use crate::{NodeGraphRead, NodeGraphWrite};
 
-    #[tokio::test]
-    async fn test_group_and_ungroup() {
+    #[test]
+    fn test_group_and_ungroup() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
 
         // Create a simple chain: Number → Add → NumberOutput
@@ -726,8 +726,8 @@ mod tests {
         assert!(graph.get_node_by_id(&result.subgraph_node_id).is_none());
     }
 
-    #[tokio::test]
-    async fn test_group_empty_fails() {
+    #[test]
+    fn test_group_empty_fails() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
         let selected: HashSet<NodeId> = HashSet::new();
         assert!(graph.group_nodes(&selected, "Empty").is_err());
@@ -735,8 +735,8 @@ mod tests {
 
     /// Test that intermediate outputs (source slot also feeds internal nodes)
     /// are filtered out and not exposed as SubGraphNode ports.
-    #[tokio::test]
-    async fn test_group_filters_intermediate_outputs() {
+    #[test]
+    fn test_group_filters_intermediate_outputs() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
 
         // Graph: num1 → add → multiply → output
@@ -776,8 +776,8 @@ mod tests {
 
     /// Test terminal output detection: a node with no downstream consumers
     /// should automatically get an output port on the SubGraphNode.
-    #[tokio::test]
-    async fn test_group_terminal_output() {
+    #[test]
+    fn test_group_terminal_output() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
 
         // Graph: num1 → add (no downstream from add)
@@ -809,8 +809,8 @@ mod tests {
 
     /// Test source-based dedup: same source feeding multiple internal targets
     /// should produce only one input port with fan-out inside the subgraph.
-    #[tokio::test]
-    async fn test_group_source_dedup() {
+    #[test]
+    fn test_group_source_dedup() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
 
         // Graph: source → A.input0, source → B.input0
