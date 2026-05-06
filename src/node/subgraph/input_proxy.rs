@@ -21,9 +21,8 @@ impl NodeMeta for SubGraphInputNode {
     const DEFAULT_VALUE: DefaultValue = DefaultValue::None;
 }
 
-#[async_trait::async_trait]
 impl NodeImpl for SubGraphInputNode {
-    async fn execute(&self, _ctx: ExecutionContext) -> Result<(), String> {
+    fn execute_sync(&self, _ctx: ExecutionContext) -> Result<(), String> {
         // Data is injected directly into outputs by SubGraphNode before execution.
         // This node's execute is a no-op.
         Ok(())

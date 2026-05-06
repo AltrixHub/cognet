@@ -21,9 +21,8 @@ impl NodeMeta for MultiplyListNode {
     }];
 }
 
-#[async_trait::async_trait]
 impl NodeImpl for MultiplyListNode {
-    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+    fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
         let data_list = ctx.input_values.first().cloned().unwrap_or_default();
         let mut result = 1.0_f64;
         for data in &data_list {

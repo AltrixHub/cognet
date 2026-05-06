@@ -1,7 +1,6 @@
 use cognet::{AddNode, Data, NodeGraph, NodeGraphRead, NodeGraphWrite, NumberNode};
 
-#[tokio::main]
-async fn main() -> Result<(), String> {
+fn main() -> Result<(), String> {
     let mut graph = NodeGraph::new()?;
 
     let node1_id = graph.create_node::<NumberNode>()?;
@@ -13,7 +12,7 @@ async fn main() -> Result<(), String> {
     graph.connect_nodes(&node1_id, 0, &node3_id, 0)?;
     graph.connect_nodes(&node2_id, 0, &node3_id, 0)?;
 
-    graph.execute().await?;
+    graph.execute_sync().map_err(|e| e.to_string())?;
 
     let data = graph.get_output_value(&node3_id, 0).unwrap();
     let output = data.value::<f64>()?;

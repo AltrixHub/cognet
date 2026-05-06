@@ -433,4 +433,24 @@ impl NodeStates {
     pub fn drain_changed_nodes(&mut self) -> HashSet<NodeId> {
         std::mem::take(&mut self.changed_nodes)
     }
+
+    /// Snapshot the current changed-node set without clearing it.
+    ///
+    /// The plan-14c executor calls this during planning to validate the
+    /// dirty plan against the selected execution API. If validation
+    /// fails (e.g. sync execute on an async-required graph), the dirty
+    /// set must remain intact so a follow-up async run can re-plan.
+    pub fn peek_changed_nodes(&self) -> HashSet<NodeId> {
+        self.changed_nodes.clone()
+    }
+
+    /// Re-mark a set of nodes as changed.
+    ///
+    /// The plan-14c executor calls this after execution to restore
+    /// dirty state for nodes that failed (e.g. transient AsyncIo
+    /// errors), so a follow-up `execute_async` retry can re-run those
+    /// nodes against the same plan without losing the change record.
+    pub fn restore_changed_nodes(&mut self, ids: HashSet<NodeId>) {
+        self.changed_nodes.extend(ids);
+    }
 }

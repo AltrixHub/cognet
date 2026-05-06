@@ -56,8 +56,8 @@ impl NodeGraph {
 mod tests {
     use crate::NodeGraphWrite;
 
-    #[tokio::test]
-    async fn test_node_ids() {
+    #[test]
+    fn test_node_ids() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         assert!(graph.node_ids().is_empty());
 
@@ -74,8 +74,8 @@ mod tests {
         assert!(ids.contains(&id2));
     }
 
-    #[tokio::test]
-    async fn test_edges_info() {
+    #[test]
+    fn test_edges_info() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let num = graph
             .create_node::<crate::NumberNode>()
@@ -95,8 +95,8 @@ mod tests {
         assert_eq!(edges[0].to_input, 0);
     }
 
-    #[tokio::test]
-    async fn test_edge_info() {
+    #[test]
+    fn test_edge_info() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let num = graph
             .create_node::<crate::NumberNode>()

@@ -131,8 +131,8 @@ where
 mod tests {
     use crate::NodeGraphWrite;
 
-    #[tokio::test]
-    async fn test_with_graph_at_path_empty() {
+    #[test]
+    fn test_with_graph_at_path_empty() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let num = graph
             .create_node::<crate::NumberNode>()
@@ -145,8 +145,8 @@ mod tests {
         assert!(ids.contains(&num));
     }
 
-    #[tokio::test]
-    async fn test_with_graph_at_path_single() {
+    #[test]
+    fn test_with_graph_at_path_single() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()
@@ -165,8 +165,8 @@ mod tests {
         assert!(ids.contains(&internal_id));
     }
 
-    #[tokio::test]
-    async fn test_with_graph_at_path_mut() {
+    #[test]
+    fn test_with_graph_at_path_mut() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()
@@ -185,8 +185,8 @@ mod tests {
         assert!(ids.contains(&id));
     }
 
-    #[tokio::test]
-    async fn test_node_ids_at_path() {
+    #[test]
+    fn test_node_ids_at_path() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()
@@ -197,8 +197,8 @@ mod tests {
         assert!(ids.len() >= 2);
     }
 
-    #[tokio::test]
-    async fn test_edges_at_path() {
+    #[test]
+    fn test_edges_at_path() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()
@@ -209,8 +209,8 @@ mod tests {
         assert!(edges.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_is_subgraph_node_at_path() {
+    #[test]
+    fn test_is_subgraph_node_at_path() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
         let sg = graph
             .create_node::<crate::SubGraphNode>()

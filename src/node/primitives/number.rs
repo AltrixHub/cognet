@@ -18,9 +18,8 @@ impl NodeMeta for NumberNode {
     const DEFAULT_VALUE: DefaultValue = DefaultValue::Number(10.0);
 }
 
-#[async_trait::async_trait]
 impl NodeImpl for NumberNode {
-    async fn execute(&self, ctx: ExecutionContext) -> Result<(), String> {
+    fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
         let node_data = ctx.node_data.ok_or("Failed to get node data")?;
         ctx.output_writer.set(0, node_data)?;
         Ok(())

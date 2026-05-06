@@ -510,17 +510,18 @@ impl SubGraphNode {
         Ok(())
     }
 
-    /// Execute the SubGraphNode with mutable access.
+    /// Execute the SubGraphNode synchronously with mutable access.
     ///
-    /// Called by the parent graph's execution engine, which holds a write lock
-    /// on the node entity. This allows mutable access to the internal graph
-    /// for execution, which is not possible from `NodeImpl::execute(&self)`.
+    /// Called by the parent graph's sync execution engine, which holds a
+    /// write lock on the node entity. This allows mutable access to the
+    /// internal graph for recursive execution, which is not possible from
+    /// `NodeImpl::execute(&self)`.
     ///
     /// Performs the full execution cycle:
     /// 1. Inject external inputs into the internal input proxy
-    /// 2. Execute the internal graph
+    /// 2. Execute the internal graph synchronously
     /// 3. Collect outputs from the internal output proxy
-    pub(crate) async fn execute_internal(
+    pub(crate) fn execute_internal_sync(
         &mut self,
         parent_node_id: &NodeId,
         parent_cache: SharedExecutionCache,
@@ -532,7 +533,15 @@ impl SubGraphNode {
         // This is needed because the internal graph doesn't know that
         // its proxy inputs changed.
         self.internal_graph.mark_all_nodes_dirty();
-        let _changes = self.internal_graph.execute().await?;
+        // Sync subgraph path requires a sync-only internal graph
+        // (plan-14c §SubGraphNode Policy phase 1). If the internal plan
+        // contains async nodes, surface that as a string error so the
+        // parent records it as a per-node execution failure rather than
+        // blocking on the internal async graph.
+        let _changes = self
+            .internal_graph
+            .execute_sync()
+            .map_err(|e| e.to_string())?;
         self.collect_outputs(parent_node_id, &parent_cache, &parent_node_states)?;
         Ok(())
     }
@@ -593,11 +602,10 @@ impl NodeMeta for SubGraphNode {
     const OUTPUTS: &'static [SlotDef] = &[];
 }
 
-#[async_trait::async_trait]
 impl NodeImpl for SubGraphNode {
-    async fn execute(&self, _ctx: ExecutionContext) -> Result<(), String> {
-        // SubGraphNode execution is handled by execute_internal() which is called
-        // directly by the execution engine with the parent cache.
+    fn execute_sync(&self, _ctx: ExecutionContext) -> Result<(), String> {
+        // SubGraphNode execution is handled by execute_internal_sync() which is
+        // called directly by the sync execution engine with the parent cache.
         // This NodeImpl::execute() is not called for SubGraphNode.
         Ok(())
     }
@@ -647,8 +655,8 @@ mod tests {
     use super::*;
     use crate::{NodeGraphRead, NodeGraphWrite};
 
-    #[tokio::test]
-    async fn test_subgraph_creation() {
+    #[test]
+    fn test_subgraph_creation() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
         let subgraph_id = graph
             .create_node::<SubGraphNode>()
@@ -664,8 +672,8 @@ mod tests {
         assert_eq!(ns.output_slot_count(&subgraph_id), 0);
     }
 
-    #[tokio::test]
-    async fn test_subgraph_has_proxies() {
+    #[test]
+    fn test_subgraph_has_proxies() {
         let subgraph = SubGraphNode::new("Test").expect("Failed to create subgraph");
         assert!(subgraph
             .internal_graph
