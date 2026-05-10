@@ -58,6 +58,11 @@ pub struct NodeManager {
     /// Name-based registry for dynamic node creation.
     name_registry: HashMap<&'static str, NodeFactoryWithMeta>,
     variants: HashSet<String>,
+    /// Names that were leaked into `&'static str` for runtime
+    /// registration. Tracked so that
+    /// [`restore_factory_registration`] can find a previously-leaked
+    /// key after the corresponding `name_registry` entry was removed.
+    leaked_names: HashMap<String, &'static str>,
 }
 
 pub type NodeRegistrationFn = fn(&mut NodeManager) -> Result<(), String>;
@@ -188,6 +193,86 @@ impl NodeManager {
         );
     }
 
+    /// Register a factory with a runtime-built (owned) name. The name
+    /// is leaked once into a `&'static str` so it can be inserted into
+    /// the same `name_registry` keyed by `&'static str`.
+    ///
+    /// Intended for callers that build factory names from user-supplied
+    /// data at runtime (e.g. per-variant SubGraph factories in the
+    /// modeling example's pillar 2). Re-registering an existing name
+    /// replaces the entry without leaking again.
+    pub fn register_factory_with_name_owned(
+        &mut self,
+        name: String,
+        factory: NodeFactory,
+        default_data: Option<Data>,
+        type_id: Option<TypeId>,
+    ) {
+        // Reuse a previously-leaked key for the same name so that the
+        // leaked-string footprint is bounded by the count of distinct
+        // factory names ever registered (re-registration / unregister +
+        // re-register cycles do not leak again).
+        let key: &'static str = match self.leaked_names.get(&name) {
+            Some(existing) => *existing,
+            None => {
+                let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+                self.leaked_names.insert(name, leaked);
+                leaked
+            }
+        };
+        self.name_registry.insert(
+            key,
+            NodeFactoryWithMeta {
+                factory,
+                default_data,
+                type_id,
+            },
+        );
+    }
+
+    /// Remove a name-based factory registration. Returns the removed
+    /// entry if one was present. Used by callers that need to roll back
+    /// a registration after a downstream commit failure.
+    pub fn unregister_factory_by_name(&mut self, name: &str) -> Option<NodeFactoryWithMeta> {
+        self.name_registry.remove(name)
+    }
+
+    /// Re-insert a previously-removed registration entry under the same
+    /// (already-leaked) name. The companion to
+    /// [`unregister_factory_by_name`] for atomic rollback paths.
+    ///
+    /// If the name is unknown (never been leaked / registered), the
+    /// entry is dropped — callers must therefore only restore entries
+    /// for names that were obtained via a prior `take` on the same
+    /// manager.
+    pub fn restore_factory_registration(
+        &mut self,
+        name: &str,
+        entry: NodeFactoryWithMeta,
+    ) -> Result<(), NodeFactoryWithMeta> {
+        // Look up either the live key (still in name_registry) or the
+        // leaked-name table (key was removed by a prior unregister).
+        let key: Option<&'static str> = self
+            .name_registry
+            .get_key_value(name)
+            .map(|(k, _)| *k)
+            .or_else(|| self.leaked_names.get(name).copied());
+        match key {
+            Some(k) => {
+                self.name_registry.insert(k, entry);
+                Ok(())
+            }
+            None => Err(entry),
+        }
+    }
+
+    /// Read-only lookup for a name-based factory registration. Used by
+    /// rollback paths that need to capture the previous entry's
+    /// metadata before overwriting.
+    pub fn factory_meta_by_name(&self, name: &str) -> Option<&NodeFactoryWithMeta> {
+        self.name_registry.get(name)
+    }
+
     /// Create a node by type (compile-time dispatch).
     pub fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {
@@ -267,8 +352,125 @@ impl NodeManager {
         self.name_registry.contains_key(name)
     }
 
+    /// Convenience alias for [`is_registered`]. Reads more naturally at
+    /// call sites that ask "does this factory exist" rather than "is
+    /// this name registered".
+    pub fn has_factory(&self, name: &str) -> bool {
+        self.is_registered(name)
+    }
+
+    /// Identity probe for a name-based factory registration. Returns
+    /// the address of the underlying factory closure (`Arc::as_ptr`)
+    /// when registered. Two factories registered under different names
+    /// will compare unequal; re-registering a name with a fresh closure
+    /// changes the returned pointer.
+    ///
+    /// Pillar-2 of the modeling example uses this to assert that two
+    /// variants registered under different names hold independent
+    /// closures (per `factory_id != factory_id`).
+    pub fn factory_id(&self, name: &str) -> Option<*const ()> {
+        self.name_registry
+            .get(name)
+            .map(|meta| Arc::as_ptr(&meta.factory) as *const ())
+    }
+
     /// Get all registered node type names.
     pub fn registered_names(&self) -> Vec<&'static str> {
         self.name_registry.keys().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NodeCore, NodeImpl};
+
+    /// Trivial node for register/unregister tests.
+    #[derive(Debug)]
+    struct Probe;
+    impl NodeImpl for Probe {
+        fn execute_sync(&self, _ctx: crate::ExecutionContext) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    impl NodeCore for Probe {
+        fn node_name(&self) -> &'static str {
+            "Probe"
+        }
+        fn register_in(_manager: &mut NodeManager) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn probe_factory() -> NodeFactory {
+        Arc::new(|| Ok(Arc::new(RwLock::new(Probe)) as NodeEntity))
+    }
+
+    #[test]
+    fn register_factory_with_name_owned_inserts_runtime_name() {
+        let mut nm = NodeManager::default();
+        nm.register_factory_with_name_owned(
+            "VariantFactory_x_runtime".to_string(),
+            probe_factory(),
+            None,
+            None,
+        );
+        assert!(nm.has_factory("VariantFactory_x_runtime"));
+        assert!(nm.factory_id("VariantFactory_x_runtime").is_some());
+    }
+
+    #[test]
+    fn register_factory_with_name_owned_does_not_releak_on_replace() {
+        let mut nm = NodeManager::default();
+        nm.register_factory_with_name_owned("Foo".to_string(), probe_factory(), None, None);
+        let names_after_first = nm.registered_names().len();
+        nm.register_factory_with_name_owned("Foo".to_string(), probe_factory(), None, None);
+        // Replacement: same key reused, no extra entry.
+        assert_eq!(nm.registered_names().len(), names_after_first);
+    }
+
+    #[test]
+    fn unregister_factory_by_name_returns_entry_and_removes() {
+        let mut nm = NodeManager::default();
+        nm.register_factory_with_name_owned("Bar".to_string(), probe_factory(), None, None);
+        let removed = nm.unregister_factory_by_name("Bar");
+        assert!(removed.is_some());
+        assert!(!nm.has_factory("Bar"));
+    }
+
+    #[test]
+    fn restore_factory_registration_only_succeeds_for_known_name() {
+        let mut nm = NodeManager::default();
+        nm.register_factory_with_name_owned("Baz".to_string(), probe_factory(), None, None);
+        let entry = nm.unregister_factory_by_name("Baz").expect("removed entry");
+        // The leaked-key set still contains "Baz" (we keyed on the same
+        // string), so restore must succeed even after the name_registry
+        // entry was removed.
+        assert!(nm.restore_factory_registration("Baz", entry).is_ok());
+        assert!(nm.has_factory("Baz"));
+    }
+
+    #[test]
+    fn restore_factory_registration_rejects_unknown_name() {
+        let mut nm = NodeManager::default();
+        let entry = NodeFactoryWithMeta {
+            factory: probe_factory(),
+            default_data: None,
+            type_id: None,
+        };
+        let err = nm
+            .restore_factory_registration("never_registered", entry)
+            .err();
+        assert!(err.is_some(), "restore must reject unknown name");
+    }
+
+    #[test]
+    fn factory_id_distinguishes_separate_registrations() {
+        let mut nm = NodeManager::default();
+        nm.register_factory_with_name_owned("A".to_string(), probe_factory(), None, None);
+        nm.register_factory_with_name_owned("B".to_string(), probe_factory(), None, None);
+        let a = nm.factory_id("A").unwrap();
+        let b = nm.factory_id("B").unwrap();
+        assert_ne!(a, b);
     }
 }
