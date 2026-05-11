@@ -191,7 +191,45 @@ impl NodeStates {
         id
     }
 
+    /// Rewrite the label of an input slot in place. Slot index and id
+    /// are preserved so existing edges remain valid.
+    pub fn set_input_slot_label(
+        &mut self,
+        node_id: &NodeId,
+        index: usize,
+        label: &'static str,
+    ) -> bool {
+        if let Some(slot) = self.input_slots.get_mut(&(*node_id, index)) {
+            slot.label = label;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rewrite the label of an output slot in place. Slot index and id
+    /// are preserved so existing edges remain valid.
+    pub fn set_output_slot_label(
+        &mut self,
+        node_id: &NodeId,
+        index: usize,
+        label: &'static str,
+    ) -> bool {
+        if let Some(slot) = self.output_slots.get_mut(&(*node_id, index)) {
+            slot.label = label;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Remove a dynamic input slot by index and shift higher-indexed slots down.
+    ///
+    /// Edges referencing this node's input slot have their
+    /// `to_input_slot_index` decremented when greater than `index`.
+    /// Callers must drop edges that touch the removed slot before
+    /// calling this — surviving edges keep their `to_input_slot_id`,
+    /// only the index is adjusted.
     pub fn remove_input_slot(&mut self, node_id: &NodeId, index: usize) {
         let count = self.input_slot_count(node_id);
         if index >= count {
@@ -205,9 +243,22 @@ impl NodeStates {
                 self.input_slots.insert((*node_id, i - 1), slot);
             }
         }
+        // Decrement to_input_slot_index on edges that reference this
+        // node's higher-indexed input slots so indices stay aligned.
+        for edge in self.edges.values_mut() {
+            if edge.to_node_id == *node_id && edge.to_input_slot_index > index {
+                edge.to_input_slot_index -= 1;
+            }
+        }
     }
 
     /// Remove a dynamic output slot by index and shift higher-indexed slots down.
+    ///
+    /// Edges referencing this node's output slot have their
+    /// `from_output_slot_index` decremented when greater than `index`.
+    /// Callers must drop edges that touch the removed slot before
+    /// calling this — surviving edges keep their `from_output_slot_id`,
+    /// only the index is adjusted.
     pub fn remove_output_slot(&mut self, node_id: &NodeId, index: usize) {
         let count = self.output_slot_count(node_id);
         if index >= count {
@@ -219,6 +270,13 @@ impl NodeStates {
         for i in (index + 1)..count {
             if let Some(slot) = self.output_slots.remove(&(*node_id, i)) {
                 self.output_slots.insert((*node_id, i - 1), slot);
+            }
+        }
+        // Decrement from_output_slot_index on edges that reference this
+        // node's higher-indexed output slots so indices stay aligned.
+        for edge in self.edges.values_mut() {
+            if edge.from_node_id == *node_id && edge.from_output_slot_index > index {
+                edge.from_output_slot_index -= 1;
             }
         }
     }

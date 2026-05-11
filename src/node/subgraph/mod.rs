@@ -352,8 +352,128 @@ impl SubGraphNode {
         Ok(())
     }
 
+    /// Find the slot index of an input proxy output (i.e. an external
+    /// input slot on this SubGraphNode) by label.
+    ///
+    /// Labels are compared on the internal input proxy's output slots
+    /// because that's the canonical storage. For multi-input slots the
+    /// first matching proxy output's external slot index is returned.
+    pub fn input_slot_index_by_label(&self, label: &str) -> Option<usize> {
+        let ns = self.internal_graph.node_states().read().ok()?;
+        let proxy_count = ns.output_slot_count(&self.input_proxy_id);
+        // input_proxy_counts tracks how many proxy outputs each external
+        // input maps to. Walk the proxy outputs in order; the slot
+        // index in the external view is the input_proxy_counts cursor.
+        let mut proxy_cursor: usize = 0;
+        for (external_idx, &count) in self.input_proxy_counts.iter().enumerate() {
+            for offset in 0..count {
+                let proxy_idx = proxy_cursor + offset;
+                if proxy_idx >= proxy_count {
+                    return None;
+                }
+                if let Some(slot) = ns.output_slot(&self.input_proxy_id, proxy_idx) {
+                    if slot.label == label {
+                        return Some(external_idx);
+                    }
+                }
+            }
+            proxy_cursor += count;
+        }
+        None
+    }
+
+    /// Find the slot index of an output (i.e. an external output slot
+    /// on this SubGraphNode) by label. Labels are compared on the
+    /// internal output proxy's input slots.
+    pub fn output_slot_index_by_label(&self, label: &str) -> Option<usize> {
+        let ns = self.internal_graph.node_states().read().ok()?;
+        let count = ns.input_slot_count(&self.output_proxy_id);
+        for i in 0..count {
+            if let Some(slot) = ns.input_slot(&self.output_proxy_id, i) {
+                if slot.label == label {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check whether an external input label is already in use.
+    pub fn has_input_label(&self, label: &str) -> bool {
+        self.input_slot_index_by_label(label).is_some()
+    }
+
+    /// Check whether an external output label is already in use.
+    pub fn has_output_label(&self, label: &str) -> bool {
+        self.output_slot_index_by_label(label).is_some()
+    }
+
+    /// Rename an input slot in place. Internal edges keep their slot
+    /// IDs so they remain valid.
+    ///
+    /// Returns `Err` if `old_label` is not found or `new_label` is
+    /// already in use on the same side.
+    pub fn rename_input(
+        &mut self,
+        old_label: &str,
+        new_label: &'static str,
+    ) -> Result<usize, String> {
+        let external_idx = self
+            .input_slot_index_by_label(old_label)
+            .ok_or_else(|| format!("Input label {:?} not found", old_label))?;
+        if old_label != new_label && self.has_input_label(new_label) {
+            return Err(format!(
+                "Input label {:?} already exists (uniqueness)",
+                new_label
+            ));
+        }
+        let proxy_start: usize = self.input_proxy_counts[..external_idx].iter().sum();
+        let proxy_count = self.input_proxy_counts[external_idx];
+
+        let mut ns = self
+            .internal_graph
+            .node_states()
+            .write()
+            .map_err(|e| e.to_string())?;
+        for offset in 0..proxy_count {
+            ns.set_output_slot_label(&self.input_proxy_id, proxy_start + offset, new_label);
+        }
+        Ok(external_idx)
+    }
+
+    /// Rename an output slot in place. Mirror output is renamed too.
+    /// Internal edges keep their slot IDs so they remain valid.
+    ///
+    /// Returns `Err` if `old_label` is not found or `new_label` is
+    /// already in use on the same side.
+    pub fn rename_output(
+        &mut self,
+        old_label: &str,
+        new_label: &'static str,
+    ) -> Result<usize, String> {
+        let idx = self
+            .output_slot_index_by_label(old_label)
+            .ok_or_else(|| format!("Output label {:?} not found", old_label))?;
+        if old_label != new_label && self.has_output_label(new_label) {
+            return Err(format!(
+                "Output label {:?} already exists (uniqueness)",
+                new_label
+            ));
+        }
+        let mut ns = self
+            .internal_graph
+            .node_states()
+            .write()
+            .map_err(|e| e.to_string())?;
+        ns.set_input_slot_label(&self.output_proxy_id, idx, new_label);
+        ns.set_output_slot_label(&self.output_proxy_id, idx, new_label);
+        Ok(idx)
+    }
+
     /// Remove an input slot from this subgraph node and the
     /// corresponding output slot(s) from the internal SubGraphInputNode.
+    /// Also tears down any internal edges that consumed those proxy
+    /// outputs.
     ///
     /// Returns an error if there are no inputs to remove.
     pub fn remove_input(&mut self, index: usize) -> Result<(), String> {
@@ -376,17 +496,37 @@ impl SubGraphNode {
             .write()
             .map_err(|e| e.to_string())?;
         for _ in 0..proxy_count {
+            // Drop edges that consume the proxy output at proxy_start
+            // before removing the slot itself.
+            let mut edges_to_remove: Vec<EdgeId> = Vec::new();
+            if let Some(slot) = ns.output_slot(&self.input_proxy_id, proxy_start) {
+                let slot_id = slot.id;
+                for (eid, edge) in ns.edges() {
+                    if edge.from_output_slot_id == slot_id {
+                        edges_to_remove.push(*eid);
+                    }
+                }
+            }
+            for eid in edges_to_remove {
+                ns.remove_edge(&eid);
+            }
             ns.remove_output_slot(&self.input_proxy_id, proxy_start);
         }
         drop(ns);
 
         self.input_proxy_counts.remove(index);
+        // Keep dynamic_input_targets in sync with input_proxy_counts.
+        if index < self.dynamic_input_targets.len() {
+            self.dynamic_input_targets.remove(index);
+        }
 
         Ok(())
     }
 
     /// Remove an output slot from this subgraph node and the
     /// corresponding input slot from the internal SubGraphOutputNode.
+    /// Also removes the matching mirror output slot at the same index
+    /// and tears down any internal edges that touched it.
     ///
     /// Returns an error if the index is out of range.
     pub fn remove_output(&mut self, index: usize) -> Result<(), String> {
@@ -398,19 +538,52 @@ impl SubGraphNode {
             ));
         }
 
-        // Remove from internal NodeStates
+        // Remove from internal NodeStates: drop edges that fed this
+        // output's external input slot AND edges that consumed the
+        // mirror output slot, then remove both slots.
         let mut ns = self
             .internal_graph
             .node_states()
             .write()
             .map_err(|e| e.to_string())?;
+
+        // Collect edges to remove: any edge whose to_input_slot_id is
+        // the output proxy's input slot at `index`, or whose
+        // from_output_slot_id is the output proxy's mirror output slot
+        // at `index`.
+        let mut edges_to_remove: Vec<EdgeId> = Vec::new();
+        if let Some(in_slot) = ns.input_slot(&self.output_proxy_id, index) {
+            let in_slot_id = in_slot.id;
+            for (eid, edge) in ns.edges() {
+                if edge.to_input_slot_id == in_slot_id {
+                    edges_to_remove.push(*eid);
+                }
+            }
+        }
+        if let Some(out_slot) = ns.output_slot(&self.output_proxy_id, index) {
+            let out_slot_id = out_slot.id;
+            for (eid, edge) in ns.edges() {
+                if edge.from_output_slot_id == out_slot_id {
+                    edges_to_remove.push(*eid);
+                }
+            }
+        }
+        for eid in edges_to_remove {
+            ns.remove_edge(&eid);
+        }
+
         ns.remove_input_slot(&self.output_proxy_id, index);
+        ns.remove_output_slot(&self.output_proxy_id, index);
 
         Ok(())
     }
 
     /// Add an output slot to this subgraph node and a corresponding
     /// input slot on the internal SubGraphOutputNode (via NodeStates).
+    ///
+    /// Also adds a mirror output slot at the same index on the output
+    /// proxy so internal nodes can read the values flowing out of the
+    /// SubGraph. Input slot i ↔ mirror output slot i.
     pub fn add_output(&mut self, label: &'static str, data_type: DataType) -> Result<(), String> {
         // Add corresponding input on the output proxy via NodeStates
         let mut ns = self
@@ -419,6 +592,8 @@ impl SubGraphNode {
             .write()
             .map_err(|e| e.to_string())?;
         ns.add_input_slot(&self.output_proxy_id, label, data_type, None);
+        // Add the matching mirror output slot at the same index.
+        ns.add_output_slot(&self.output_proxy_id, label, data_type);
         Ok(())
     }
 

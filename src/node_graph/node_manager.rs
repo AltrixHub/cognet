@@ -213,7 +213,7 @@ impl NodeManager {
         // factory names ever registered (re-registration / unregister +
         // re-register cycles do not leak again).
         let key: &'static str = match self.leaked_names.get(&name) {
-            Some(existing) => *existing,
+            Some(existing) => existing,
             None => {
                 let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
                 self.leaked_names.insert(name, leaked);
