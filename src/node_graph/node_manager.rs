@@ -273,6 +273,30 @@ impl NodeManager {
         self.name_registry.get(name)
     }
 
+    /// Return the leaked-`&'static str` form of a runtime-registered
+    /// factory name. Used by `NodeGraph::create_node_by_name(_with_id)`
+    /// to obtain a `'static` name pointer for `NodeStates::add_node`
+    /// when the inventory `NodeTypeInfo` lookup misses.
+    ///
+    /// Returns `Err` when the name has never been registered via
+    /// `register_factory_with_name(_owned)` — the caller should
+    /// surface this as the same "NodeTypeInfo not found" error it
+    /// would emit for a missing inventory entry.
+    pub fn leaked_factory_name(&self, name: &str) -> Result<&'static str, String> {
+        // First try the name_registry (covers `register_factory_with_name`
+        // entries which receive `&'static str` keys directly).
+        if let Some((k, _)) = self.name_registry.get_key_value(name) {
+            return Ok(*k);
+        }
+        // Fall back to the leaked-name table for owned-name registrations
+        // whose `name_registry` entry might have been temporarily removed
+        // by `unregister_factory_by_name`.
+        self.leaked_names
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))
+    }
+
     /// Create a node by type (compile-time dispatch).
     pub fn create_node<T: NodeImpl + 'static>(&mut self) -> Result<NodeId, String> {
         if let Some(factory) = self.node_registry.get(&TypeId::of::<T>()) {

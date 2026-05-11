@@ -10,8 +10,8 @@ use std::any::TypeId;
 use crate::{
     node_graph_system::NodeGraphSystem, BoxNodeFuture, ColorValue, Data, DataType, DataValue, Edge,
     EdgeId, ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeExecutionKind, NodeGraph,
-    NodeId, NodeImpl, NodeMeta, OutputWriter, SharedExecutionCache, SharedNodeStates, SubGraphNode,
-    Vector3,
+    NodeId, NodeImpl, NodeMeta, OutputWriter, SharedExecutionCache, SharedNodeStates, SlotDef,
+    SubGraphNode, Vector3,
 };
 
 /// Typed error returned by `NodeGraph::execute_sync` and `execute_async`.
@@ -431,22 +431,35 @@ impl NodeGraphWrite for NodeGraph {
         // Create node and get default data from factory
         let (node_id, default_data, type_id) = self.node_manager.create_node_by_name(name)?;
 
-        // Get type info for slot counts
-        let type_info = crate::get_node_type_info(name)
-            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
+        // Static slot defs from inventory (when present); fall back to
+        // empty slots for runtime-registered factories. Runtime
+        // factories whose nodes are SubGraphNodes get their external
+        // proxy slots mirrored into NodeStates by
+        // `mirror_subgraph_external_slots` below.
+        let (resolved_name, inputs, outputs): (&'static str, &[SlotDef], &[SlotDef]) =
+            match crate::get_node_type_info(name) {
+                Some(info) => (info.name, info.inputs, info.outputs),
+                None => (self.node_manager.leaked_factory_name(name)?, &[], &[]),
+            };
 
         // Register in NodeStates
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             guard.add_node(
                 node_id,
-                type_info.name,
+                resolved_name,
                 type_id,
                 default_data,
-                type_info.inputs,
-                type_info.outputs,
+                inputs,
+                outputs,
             );
         }
+
+        // Mirror SubGraph external slots into the parent NodeStates so
+        // recook / runtime-factory paths see the same slot count as
+        // the node's internal proxies expose. No-op for non-SubGraph
+        // nodes.
+        self.mirror_subgraph_external_slots(&node_id);
 
         Ok(node_id)
     }
@@ -455,20 +468,18 @@ impl NodeGraphWrite for NodeGraph {
         let (_node_id, default_data, type_id) =
             self.node_manager.create_node_by_name_with_id(id, name)?;
 
-        let type_info = crate::get_node_type_info(name)
-            .ok_or_else(|| format!("NodeTypeInfo not found for '{}'", name))?;
+        let (resolved_name, inputs, outputs): (&'static str, &[SlotDef], &[SlotDef]) =
+            match crate::get_node_type_info(name) {
+                Some(info) => (info.name, info.inputs, info.outputs),
+                None => (self.node_manager.leaked_factory_name(name)?, &[], &[]),
+            };
 
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            guard.add_node(
-                id,
-                type_info.name,
-                type_id,
-                default_data,
-                type_info.inputs,
-                type_info.outputs,
-            );
+            guard.add_node(id, resolved_name, type_id, default_data, inputs, outputs);
         }
+
+        self.mirror_subgraph_external_slots(&id);
 
         Ok(id)
     }
@@ -796,6 +807,114 @@ fn execute_node_sync(
 }
 
 impl NodeGraph {
+    // === Runtime factory passthroughs (pillar-2 BIM templates) ===========
+
+    /// Register a runtime-named factory on this graph's NodeManager so
+    /// nodes of that name can be created via `create_node_by_name` /
+    /// `create_node_by_name_with_id`. Mirrors
+    /// [`NodeManager::register_factory_with_name_owned`] so callers
+    /// that only have access to a `NodeGraph` (not the wrapped
+    /// `NodeManager`) can install per-instance factories.
+    pub fn register_factory_with_name_owned(
+        &mut self,
+        name: String,
+        factory: Arc<dyn Fn() -> Result<NodeEntity, String> + Send + Sync>,
+        default_data: Option<Data>,
+        type_id: Option<TypeId>,
+    ) {
+        self.node_manager
+            .register_factory_with_name_owned(name, factory, default_data, type_id);
+    }
+
+    /// Remove a runtime-named factory registration. Returns the
+    /// previous entry if any. Pass-through to
+    /// [`NodeManager::unregister_factory_by_name`].
+    pub fn unregister_factory_by_name(&mut self, name: &str) -> Option<crate::NodeFactoryWithMeta> {
+        self.node_manager.unregister_factory_by_name(name)
+    }
+
+    /// Re-insert a previously-removed factory registration under the
+    /// same (already-leaked) name. Pass-through to
+    /// [`NodeManager::restore_factory_registration`].
+    pub fn restore_factory_registration(
+        &mut self,
+        name: &str,
+        entry: crate::NodeFactoryWithMeta,
+    ) -> Result<(), crate::NodeFactoryWithMeta> {
+        self.node_manager.restore_factory_registration(name, entry)
+    }
+
+    /// Mirror a SubGraphNode's external proxy slots into the parent
+    /// `NodeStates`. No-op when the node is not a SubGraphNode.
+    ///
+    /// Reads:
+    ///   * the SubGraphNode's input proxy's OUTPUT slots → mirrored
+    ///     as the parent's external INPUT slots.
+    ///   * the SubGraphNode's output proxy's INPUT slots → mirrored
+    ///     as the parent's external OUTPUT slots.
+    ///
+    /// Idempotent: existing slots with the same (label, data_type)
+    /// are left intact; only the *count* extends. Used by
+    /// runtime-registered factories whose closures fully populate
+    /// the SubGraph internal proxies and need the parent NodeStates
+    /// to see the same external schema.
+    pub fn mirror_subgraph_external_slots(&self, node_id: &NodeId) {
+        let entity = match self.get_node_by_id(node_id) {
+            Some(e) => e,
+            None => return,
+        };
+        let read = match entity.read() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let sg = match read.as_any().downcast_ref::<SubGraphNode>() {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Read the SubGraphNode's internal proxy slot vocabularies.
+        let input_proxy_id = sg.input_proxy_id();
+        let output_proxy_id = sg.output_proxy_id();
+        let internal_ns = match sg.internal_graph().node_states.read() {
+            Ok(ns) => ns,
+            Err(_) => return,
+        };
+
+        let input_count = internal_ns.output_slot_count(&input_proxy_id);
+        let mut external_inputs: Vec<(&'static str, DataType)> = Vec::with_capacity(input_count);
+        for i in 0..input_count {
+            if let Some(slot) = internal_ns.output_slot(&input_proxy_id, i) {
+                external_inputs.push((slot.label, slot.data_type));
+            }
+        }
+        let output_count = internal_ns.input_slot_count(&output_proxy_id);
+        let mut external_outputs: Vec<(&'static str, DataType)> = Vec::with_capacity(output_count);
+        for i in 0..output_count {
+            if let Some(slot) = internal_ns.input_slot(&output_proxy_id, i) {
+                external_outputs.push((slot.label, slot.data_type));
+            }
+        }
+        drop(internal_ns);
+        drop(read);
+
+        let mut parent_ns = match self.node_states.write() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let existing_inputs = parent_ns.input_slot_count(node_id);
+        for (i, (label, dt)) in external_inputs.into_iter().enumerate() {
+            if i >= existing_inputs {
+                parent_ns.add_input_slot(node_id, label, dt, None);
+            }
+        }
+        let existing_outputs = parent_ns.output_slot_count(node_id);
+        for (i, (label, dt)) in external_outputs.into_iter().enumerate() {
+            if i >= existing_outputs {
+                parent_ns.add_output_slot(node_id, label, dt);
+            }
+        }
+    }
+
     // === Public synchronous API ===========================================
 
     /// Execute the dirty graph synchronously with the default scheduling
