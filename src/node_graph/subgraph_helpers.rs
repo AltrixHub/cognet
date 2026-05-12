@@ -3,7 +3,10 @@
 //! These methods provide direct access to SubGraphNode operations
 //! without requiring callers to perform entity lookup + downcast manually.
 
-use crate::{Data, DataType, EdgeId, NodeGraph, NodeGraphRead, NodeId, SubGraphNode};
+use crate::{
+    Data, DataType, EdgeId, INTERFACE_NODE_DATA_DOMAIN, InterfaceNodeData, NodeGraph,
+    NodeGraphRead, NodeId, SubGraphNode,
+};
 
 use super::EdgeInfo;
 
@@ -206,6 +209,46 @@ impl NodeGraph {
             ns.remove_output_slot(node_id, index);
         }
         Ok(())
+    }
+
+    /// Add a **locked** input port to a SubGraphNode.
+    ///
+    /// Same effect as [`Self::add_subgraph_input`], plus appends
+    /// `label` to the inner Input-direction `InterfaceNode`'s
+    /// `NodeData.locked` set so subsequent
+    /// `remove_subgraph_input_by_label` / `rename_subgraph_input` are
+    /// rejected for this label.
+    ///
+    /// Plan-005 Task 5 — used by variant builders (e.g. Wall) to mark
+    /// the mandatory ports `base_polyline` / `currency` / `fx_rate` at
+    /// SubGraph construction time.
+    pub fn add_subgraph_input_locked(
+        &self,
+        node_id: &NodeId,
+        label: &'static str,
+        data_type: DataType,
+    ) -> Result<(), String> {
+        self.add_subgraph_input(node_id, label, data_type)?;
+        let proxies = self
+            .subgraph_proxy_ids(node_id)
+            .ok_or("Node is not a SubGraphNode")?;
+        append_locked_label(self, &proxies.0, label)
+    }
+
+    /// Add a **locked** output port to a SubGraphNode. Mirror of
+    /// [`Self::add_subgraph_input_locked`] targeting the inner
+    /// Output-direction `InterfaceNode`.
+    pub fn add_subgraph_output_locked(
+        &self,
+        node_id: &NodeId,
+        label: &'static str,
+        data_type: DataType,
+    ) -> Result<(), String> {
+        self.add_subgraph_output(node_id, label, data_type)?;
+        let proxies = self
+            .subgraph_proxy_ids(node_id)
+            .ok_or("Node is not a SubGraphNode")?;
+        append_locked_label(self, &proxies.1, label)
     }
 
     /// Remove an input port from a SubGraphNode by label.
@@ -454,6 +497,48 @@ impl NodeGraph {
         ns.mark_changed(*node_id);
         Ok(())
     }
+}
+
+/// Append `label` to the `NodeData.locked` set of an `InterfaceNode`.
+///
+/// Used by [`NodeGraph::add_subgraph_input_locked`] /
+/// [`NodeGraph::add_subgraph_output_locked`] to mark a freshly-added
+/// port as mandatory. If the node has no NodeData yet, a fresh
+/// [`InterfaceNodeData`] is inserted with this label as the only
+/// locked entry. If the node has NodeData of a wrong domain, returns
+/// `Err` (the slot was already added — caller may want to roll back).
+fn append_locked_label(
+    graph: &NodeGraph,
+    node_id: &NodeId,
+    label: &'static str,
+) -> Result<(), String> {
+    let existing = graph.node_data(node_id);
+    let mut data = match existing {
+        None => InterfaceNodeData::default(),
+        Some(d) => match d.get_type() {
+            DataType::Domain(name) if name == INTERFACE_NODE_DATA_DOMAIN => d
+                .value::<InterfaceNodeData>()
+                .map_err(|e| format!("InterfaceNodeData downcast: {e}"))?
+                .clone(),
+            other => {
+                return Err(format!(
+                    "InterfaceNode {:?} has non-matching NodeData domain {:?}; expected Domain(\"{}\")",
+                    node_id, other, INTERFACE_NODE_DATA_DOMAIN
+                ));
+            }
+        },
+    };
+    data.locked.insert(label.to_string());
+    let mut ns = graph
+        .node_states
+        .write()
+        .map_err(|e| format!("NodeStates lock poisoned: {e}"))?;
+    let state = ns
+        .get_mut(node_id)
+        .ok_or_else(|| format!("Node {:?} disappeared mid-call", node_id))?;
+    state.data = Some(Data::from_domain(data, INTERFACE_NODE_DATA_DOMAIN));
+    ns.mark_changed(*node_id);
+    Ok(())
 }
 
 #[cfg(test)]
