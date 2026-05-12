@@ -1,6 +1,7 @@
 pub mod convenience;
 pub mod edge_info;
 pub mod execution_cache;
+pub mod interface_helpers;
 pub mod node_graph_api;
 pub mod node_graph_system;
 pub mod node_manager;
