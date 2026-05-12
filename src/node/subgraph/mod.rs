@@ -1,8 +1,11 @@
 //! SubGraph node system.
 //!
 //! A SubGraphNode contains a nested NodeGraph, allowing hierarchical
-//! graph composition. External inputs flow through SubGraphInputNode
-//! proxy, and internal results exit through SubGraphOutputNode proxy.
+//! graph composition. External inputs flow through one `InterfaceNode`
+//! (direction=Input) and internal results exit through another
+//! (direction=Output) — both auto-instantiated by [`SubGraphNode::new`].
+//! plan-005 Task 3 replaced the previous `SubGraphInputNode` /
+//! `SubGraphOutputNode` pair with the unified `InterfaceNode` primitive.
 
 pub mod input_proxy;
 pub mod output_proxy;
@@ -14,9 +17,10 @@ use std::any::TypeId;
 use std::sync::Arc;
 
 use crate::{
-    Data, DataType, Edge, EdgeId, ExecutionContext, NodeCategory, NodeCore, NodeGraph,
-    NodeGraphWrite, NodeId, NodeImpl, NodeManager, NodeMeta, SharedExecutionCache,
-    SharedNodeStates, SlotDef,
+    Data, DataType, Edge, EdgeId, ExecutionContext, InterfaceDirection, InterfaceNode,
+    InterfaceNodeData, NodeCategory, NodeCore, NodeGraph, NodeGraphWrite, NodeId, NodeImpl,
+    NodeManager, NodeMeta, SharedExecutionCache, SharedNodeStates, SlotDef,
+    INTERFACE_NODE_DATA_DOMAIN,
 };
 
 /// A node that contains a nested NodeGraph.
@@ -89,10 +93,28 @@ impl std::fmt::Debug for SubGraphNode {
 
 impl SubGraphNode {
     /// Create a new SubGraphNode with empty internal graph.
+    ///
+    /// Auto-instantiates two `InterfaceNode`s inside the internal
+    /// graph: one stamped `InterfaceDirection::Input` (the external
+    /// input surface) and one stamped `Output` (the external output
+    /// surface). plan-005 Task 3 replaced the previous
+    /// SubGraphInputNode / SubGraphOutputNode pair with this unified
+    /// primitive — the renamed `input_proxy_id` / `output_proxy_id`
+    /// fields still hold those NodeIds for downstream callers.
     pub fn new(label: impl Into<String>) -> Result<Self, String> {
         let mut internal_graph = NodeGraph::new()?;
-        let input_proxy_id = internal_graph.create_node::<SubGraphInputNode>()?;
-        let output_proxy_id = internal_graph.create_node::<SubGraphOutputNode>()?;
+        let input_proxy_id = internal_graph.create_node::<InterfaceNode>()?;
+        stamp_interface_direction(
+            &mut internal_graph,
+            &input_proxy_id,
+            InterfaceDirection::Input,
+        )?;
+        let output_proxy_id = internal_graph.create_node::<InterfaceNode>()?;
+        stamp_interface_direction(
+            &mut internal_graph,
+            &output_proxy_id,
+            InterfaceDirection::Output,
+        )?;
 
         Ok(Self {
             internal_graph,
@@ -767,6 +789,21 @@ impl SubGraphNode {
 
         Ok(())
     }
+}
+
+/// Stamp an [`InterfaceNode`] inside `graph` with the given
+/// [`InterfaceDirection`]. Used by [`SubGraphNode::new`] to label the
+/// auto-instantiated input vs output proxies.
+fn stamp_interface_direction(
+    graph: &mut NodeGraph,
+    node_id: &NodeId,
+    direction: InterfaceDirection,
+) -> Result<(), String> {
+    let data = InterfaceNodeData {
+        direction,
+        locked: std::collections::HashSet::new(),
+    };
+    graph.update_node_data(node_id, Data::from_domain(data, INTERFACE_NODE_DATA_DOMAIN))
 }
 
 impl NodeMeta for SubGraphNode {
