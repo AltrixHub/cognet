@@ -4,8 +4,8 @@
 //! without requiring callers to perform entity lookup + downcast manually.
 
 use crate::{
-    Data, DataType, EdgeId, INTERFACE_NODE_DATA_DOMAIN, InterfaceNodeData, NodeGraph,
-    NodeGraphRead, NodeId, SubGraphNode,
+    Data, DataType, EdgeId, InterfaceNodeData, NodeGraph, NodeGraphRead, NodeId, SubGraphNode,
+    INTERFACE_NODE_DATA_DOMAIN,
 };
 
 use super::EdgeInfo;
@@ -232,7 +232,10 @@ impl NodeGraph {
         let proxies = self
             .subgraph_proxy_ids(node_id)
             .ok_or("Node is not a SubGraphNode")?;
-        append_locked_label(self, &proxies.0, label)
+        self.with_subgraph_mut(node_id, |internal| {
+            append_locked_label(internal, &proxies.0, label)
+        })
+        .ok_or_else(|| "with_subgraph_mut returned None".to_string())?
     }
 
     /// Add a **locked** output port to a SubGraphNode. Mirror of
@@ -248,7 +251,10 @@ impl NodeGraph {
         let proxies = self
             .subgraph_proxy_ids(node_id)
             .ok_or("Node is not a SubGraphNode")?;
-        append_locked_label(self, &proxies.1, label)
+        self.with_subgraph_mut(node_id, |internal| {
+            append_locked_label(internal, &proxies.1, label)
+        })
+        .ok_or_else(|| "with_subgraph_mut returned None".to_string())?
     }
 
     /// Remove an input port from a SubGraphNode by label.
