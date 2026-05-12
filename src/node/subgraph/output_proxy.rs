@@ -23,7 +23,7 @@ pub struct SubGraphOutputNode;
 
 impl NodeMeta for SubGraphOutputNode {
     const NAME: &'static str = "SubGraphOutput";
-    const CATEGORY: NodeCategory = NodeCategory::Utility;
+    const CATEGORY: NodeCategory = NodeCategory::Interface;
     const INPUTS: &'static [SlotDef] = &[];
     const OUTPUTS: &'static [SlotDef] = &[];
     const DEFAULT_VALUE: DefaultValue = DefaultValue::None;

@@ -25,6 +25,11 @@ pub enum NodeCategory {
     IO,
     /// Utility nodes
     Utility,
+    /// Interface nodes — the SubGraph's externally-facing I/O surface
+    /// (input proxy / output proxy). These nodes have dynamic ports and
+    /// carry the SubGraph's interface contract. Used by template-based
+    /// SubGraphs in downstream apps (BIM variants, etc.).
+    Interface,
 }
 
 impl NodeCategory {
@@ -39,6 +44,7 @@ impl NodeCategory {
             NodeCategory::Control => "Control",
             NodeCategory::IO => "IO",
             NodeCategory::Utility => "Utility",
+            NodeCategory::Interface => "Interface",
         }
     }
 }

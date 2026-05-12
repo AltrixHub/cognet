@@ -15,7 +15,7 @@ pub struct SubGraphInputNode;
 
 impl NodeMeta for SubGraphInputNode {
     const NAME: &'static str = "SubGraphInput";
-    const CATEGORY: NodeCategory = NodeCategory::Utility;
+    const CATEGORY: NodeCategory = NodeCategory::Interface;
     const INPUTS: &'static [SlotDef] = &[];
     const OUTPUTS: &'static [SlotDef] = &[];
     const DEFAULT_VALUE: DefaultValue = DefaultValue::None;
