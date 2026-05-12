@@ -4,14 +4,9 @@
 //! graph composition. External inputs flow through one `InterfaceNode`
 //! (direction=Input) and internal results exit through another
 //! (direction=Output) — both auto-instantiated by [`SubGraphNode::new`].
-//! plan-005 Task 3 replaced the previous `SubGraphInputNode` /
-//! `SubGraphOutputNode` pair with the unified `InterfaceNode` primitive.
-
-pub mod input_proxy;
-pub mod output_proxy;
-
-pub use input_proxy::SubGraphInputNode;
-pub use output_proxy::SubGraphOutputNode;
+//! plan-005 Task 4 deleted the previous `SubGraphInputNode` /
+//! `SubGraphOutputNode` types; the unified `InterfaceNode` primitive
+//! subsumes their pass-through tee + dynamic-port behaviour.
 
 use std::any::TypeId;
 use std::sync::Arc;
