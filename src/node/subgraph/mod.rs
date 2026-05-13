@@ -171,17 +171,27 @@ impl SubGraphNode {
             .unwrap_or(0)
     }
 
-    /// Add an input slot to this subgraph node and a corresponding
-    /// output slot on the internal SubGraphInputNode (via NodeStates).
+    /// Add an input slot to this subgraph node and a matching pair of
+    /// input + output slots on the internal `InterfaceNode` proxy.
+    ///
+    /// The proxy keeps both sides in sync so it renders as a normal
+    /// pass-through node (input slot i ↔ output slot i with identical
+    /// label and data type). `inject_inputs` still writes external
+    /// values straight into the proxy's output cache; the new input
+    /// slot is purely a wiring surface for the authoring UI and for
+    /// `InterfaceNode::execute_sync`'s tee (which is a no-op for
+    /// unconnected inputs).
     pub fn add_input(&mut self, label: &'static str, data_type: DataType) -> Result<(), String> {
         self.input_proxy_counts.push(1);
 
-        // Add corresponding output on the input proxy via NodeStates
         let mut ns = self
             .internal_graph
             .node_states()
             .write()
             .map_err(|e| e.to_string())?;
+        // Bidirectional input proxy: 1 input + 1 output per single-port
+        // add. Mirrors `add_output`'s shape on the output proxy.
+        ns.add_input_slot(&self.input_proxy_id, label, data_type, Some(1));
         ns.add_output_slot(&self.input_proxy_id, label, data_type);
         Ok(())
     }
@@ -455,6 +465,12 @@ impl SubGraphNode {
         for offset in 0..proxy_count {
             ns.set_output_slot_label(&self.input_proxy_id, proxy_start + offset, new_label);
         }
+        // Bidirectional single-port adds also carry an input slot at
+        // `external_idx`; rename it too. Multi-input ports
+        // (`proxy_count > 1`) have no matching input slot.
+        if proxy_count == 1 {
+            ns.set_input_slot_label(&self.input_proxy_id, external_idx, new_label);
+        }
         Ok(external_idx)
     }
 
@@ -528,6 +544,28 @@ impl SubGraphNode {
                 ns.remove_edge(&eid);
             }
             ns.remove_output_slot(&self.input_proxy_id, proxy_start);
+        }
+        // Bidirectional single-port adds also carry an input slot on
+        // the proxy. Its index is the count of preceding single-port
+        // adds (multi-input entries skip the input slot).
+        if proxy_count == 1 {
+            let input_proxy_idx = self.input_proxy_counts[..index]
+                .iter()
+                .filter(|c| **c == 1)
+                .count();
+            let mut edges_to_remove: Vec<EdgeId> = Vec::new();
+            if let Some(slot) = ns.input_slot(&self.input_proxy_id, input_proxy_idx) {
+                let slot_id = slot.id;
+                for (eid, edge) in ns.edges() {
+                    if edge.to_input_slot_id == slot_id {
+                        edges_to_remove.push(*eid);
+                    }
+                }
+            }
+            for eid in edges_to_remove {
+                ns.remove_edge(&eid);
+            }
+            ns.remove_input_slot(&self.input_proxy_id, input_proxy_idx);
         }
         drop(ns);
 
