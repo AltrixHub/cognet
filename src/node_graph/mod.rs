@@ -5,7 +5,9 @@ pub mod interface_helpers;
 pub mod node_graph_api;
 pub mod node_graph_system;
 pub mod node_manager;
+pub mod node_path;
 pub(crate) mod node_state;
+mod path_index;
 pub mod path_navigation;
 pub mod subgraph_helpers;
 pub mod subgraph_ops;
@@ -14,6 +16,7 @@ pub use edge_info::*;
 pub use execution_cache::*;
 pub use node_graph_api::*;
 pub use node_manager::*;
+pub use node_path::NodePath;
 pub(crate) use node_state::*;
 pub use subgraph_ops::*;
 
