@@ -310,10 +310,14 @@ impl NodeStates {
         // Tear down the path_index entry.
         self.path_index.remove(path);
 
-        // Remove all edges involving this node (maintains indexes)
-        if let Some(node_id) = path.leaf() {
-            self.remove_edges_for_node(&node_id);
-        }
+        // Remove all edges involving this node (maintains indexes).
+        // `path.leaf()` cannot be None here: remove_node is never called
+        // on the root path. A non-leaf path would silently skip edge
+        // teardown, so make the contract explicit.
+        let node_id = path
+            .leaf()
+            .expect("remove_node requires a non-root NodePath");
+        self.remove_edges_for_node(&node_id);
 
         // Remove slot states
         self.input_slots.retain(|(p, _), _| p != path);
@@ -357,7 +361,12 @@ impl NodeStates {
     }
 
     /// Add an edge and update lookup indexes.
+    ///
+    /// P3b note: `Edge.from_node_id` / `to_node_id` are still bare `NodeId`,
+    /// so we root-wrap here. P3c migrates `Edge` to carry `NodePath` and
+    /// removes the `NodePath::root().child(_)` calls in this method.
     pub fn add_edge(&mut self, edge_id: EdgeId, edge: Edge) {
+        // P3b: Edge.to_node_id is NodeId; root-wrap until P3c.
         self.changed_nodes
             .insert(NodePath::root().child(edge.to_node_id));
         self.input_connections
@@ -368,6 +377,7 @@ impl NodeStates {
             .entry(edge.from_output_slot_id)
             .or_default()
             .push(edge_id);
+        // P3b: Edge.from_node_id is NodeId; root-wrap until P3c.
         self.outgoing_edges
             .entry(NodePath::root().child(edge.from_node_id))
             .or_default()
@@ -376,8 +386,11 @@ impl NodeStates {
     }
 
     /// Remove an edge and update lookup indexes.
+    ///
+    /// P3b note: Edge fields are still bare NodeIds; root-wrap removed in P3c.
     pub fn remove_edge(&mut self, edge_id: &EdgeId) -> Option<Edge> {
         if let Some(edge) = self.edges.remove(edge_id) {
+            // P3b: Edge.to_node_id is NodeId; root-wrap until P3c.
             self.changed_nodes
                 .insert(NodePath::root().child(edge.to_node_id));
             if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
@@ -386,6 +399,7 @@ impl NodeStates {
             if let Some(connections) = self.output_connections.get_mut(&edge.from_output_slot_id) {
                 connections.retain(|id| id != edge_id);
             }
+            // P3b: Edge.from_node_id is NodeId; root-wrap until P3c.
             let from_path = NodePath::root().child(edge.from_node_id);
             if let Some(outgoing) = self.outgoing_edges.get_mut(&from_path) {
                 outgoing.retain(|id| id != edge_id);
@@ -454,6 +468,7 @@ impl NodeStates {
         let insert_at = new_index.min(connections.len());
         connections.insert(insert_at, id);
 
+        // P3b: Edge.from_node_id is NodeId; root-wrap until P3c.
         self.changed_nodes
             .insert(NodePath::root().child(from_node_id));
         true
@@ -481,7 +496,8 @@ impl NodeStates {
         let insert_at = new_index.min(connections.len());
         connections.insert(insert_at, id);
 
-        // Mark the target node as changed so the graph re-executes
+        // Mark the target node as changed so the graph re-executes.
+        // P3b: Edge.to_node_id is NodeId; root-wrap until P3c.
         self.changed_nodes
             .insert(NodePath::root().child(to_node_id));
         true
