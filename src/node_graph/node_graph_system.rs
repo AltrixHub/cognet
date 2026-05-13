@@ -27,7 +27,7 @@ impl NodeGraphSystem for NodeGraph {
 
         let ns = self.node_states.read().map_err(|e| e.to_string())?;
         for node_id in target_nodes {
-            for edge_id in ns.outgoing_edges_for_node(node_id) {
+            for edge_id in ns.outgoing_edges_at(&NodePath::root().child(*node_id)) {
                 if let Some(edge) = ns.get_edge(edge_id) {
                     if target_nodes.contains(&edge.to_node_id) {
                         in_degree

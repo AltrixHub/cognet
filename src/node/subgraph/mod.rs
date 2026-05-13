@@ -371,7 +371,7 @@ impl SubGraphNode {
                     {
                         let slot_id = out_slot.id;
                         let outgoing = internal_ns
-                            .outgoing_edges_for_node(&self.input_proxy_id)
+                            .outgoing_edges_at(&NodePath::root().child(self.input_proxy_id))
                             .to_vec();
                         for eid in outgoing {
                             if internal_ns

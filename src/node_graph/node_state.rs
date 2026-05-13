@@ -70,10 +70,10 @@ pub(crate) struct NodeStates {
     input_connections: HashMap<InputSlotId, Vec<EdgeId>>,
     /// Index: output slot → connected edge IDs (ordered).
     output_connections: HashMap<OutputSlotId, Vec<EdgeId>>,
-    /// Index: source node → outgoing edge IDs (NodeId-keyed for edge compatibility).
-    outgoing_edges: HashMap<NodeId, Vec<EdgeId>>,
-    /// Nodes changed since last drain (for deferred dirty tracking).
-    changed_nodes: HashSet<NodeId>,
+    /// Index: source node → outgoing edge IDs (NodePath-keyed).
+    outgoing_edges: HashMap<NodePath, Vec<EdgeId>>,
+    /// Nodes changed since last drain (NodePath-keyed for deferred dirty tracking).
+    changed_nodes: HashSet<NodePath>,
     /// Hierarchical index: parent NodePath → direct children NodeIds.
     path_index: PathIndex,
 }
@@ -127,10 +127,8 @@ impl NodeStates {
             );
         }
 
-        // Mark the node's leaf NodeId as changed.
-        if let Some(node_id) = path.leaf() {
-            self.changed_nodes.insert(node_id);
-        }
+        // Mark the node as changed.
+        self.changed_nodes.insert(path.clone());
     }
 
     /// Add a dynamic input slot (for SubGraphNode).
@@ -360,7 +358,8 @@ impl NodeStates {
 
     /// Add an edge and update lookup indexes.
     pub fn add_edge(&mut self, edge_id: EdgeId, edge: Edge) {
-        self.changed_nodes.insert(edge.to_node_id);
+        self.changed_nodes
+            .insert(NodePath::root().child(edge.to_node_id));
         self.input_connections
             .entry(edge.to_input_slot_id)
             .or_default()
@@ -370,7 +369,7 @@ impl NodeStates {
             .or_default()
             .push(edge_id);
         self.outgoing_edges
-            .entry(edge.from_node_id)
+            .entry(NodePath::root().child(edge.from_node_id))
             .or_default()
             .push(edge_id);
         self.edges.insert(edge_id, edge);
@@ -379,14 +378,16 @@ impl NodeStates {
     /// Remove an edge and update lookup indexes.
     pub fn remove_edge(&mut self, edge_id: &EdgeId) -> Option<Edge> {
         if let Some(edge) = self.edges.remove(edge_id) {
-            self.changed_nodes.insert(edge.to_node_id);
+            self.changed_nodes
+                .insert(NodePath::root().child(edge.to_node_id));
             if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
                 connections.retain(|id| id != edge_id);
             }
             if let Some(connections) = self.output_connections.get_mut(&edge.from_output_slot_id) {
                 connections.retain(|id| id != edge_id);
             }
-            if let Some(outgoing) = self.outgoing_edges.get_mut(&edge.from_node_id) {
+            let from_path = NodePath::root().child(edge.from_node_id);
+            if let Some(outgoing) = self.outgoing_edges.get_mut(&from_path) {
                 outgoing.retain(|id| id != edge_id);
             }
             Some(edge)
@@ -453,7 +454,8 @@ impl NodeStates {
         let insert_at = new_index.min(connections.len());
         connections.insert(insert_at, id);
 
-        self.changed_nodes.insert(from_node_id);
+        self.changed_nodes
+            .insert(NodePath::root().child(from_node_id));
         true
     }
 
@@ -480,21 +482,22 @@ impl NodeStates {
         connections.insert(insert_at, id);
 
         // Mark the target node as changed so the graph re-executes
-        self.changed_nodes.insert(to_node_id);
+        self.changed_nodes
+            .insert(NodePath::root().child(to_node_id));
         true
     }
 
     /// Get outgoing edge IDs from a node.
-    pub fn outgoing_edges_for_node(&self, node_id: &NodeId) -> &[EdgeId] {
+    pub fn outgoing_edges_at(&self, path: &NodePath) -> &[EdgeId] {
         self.outgoing_edges
-            .get(node_id)
+            .get(path)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
 
     /// Mark a node as changed (needs re-execution).
-    pub fn mark_changed(&mut self, node_id: NodeId) {
-        self.changed_nodes.insert(node_id);
+    pub fn mark_changed(&mut self, path: &NodePath) {
+        self.changed_nodes.insert(path.clone());
     }
 
     /// Mark all nodes under (and including) `root` as changed.
@@ -504,10 +507,8 @@ impl NodeStates {
     pub fn mark_all_changed_at(&mut self, root: &NodePath) {
         let mut stack: Vec<NodePath> = vec![root.clone()];
         while let Some(p) = stack.pop() {
-            if let Some(node_id) = p.leaf() {
-                if self.nodes.contains_key(&p) {
-                    self.changed_nodes.insert(node_id);
-                }
+            if self.nodes.contains_key(&p) {
+                self.changed_nodes.insert(p.clone());
             }
             for child in self.path_index.children_of(&p) {
                 stack.push(p.child(*child));
@@ -523,8 +524,8 @@ impl NodeStates {
         self.mark_all_changed_at(&NodePath::root());
     }
 
-    /// Drain and return all changed node IDs since last drain.
-    pub fn drain_changed_nodes(&mut self) -> HashSet<NodeId> {
+    /// Drain and return all changed node paths since last drain.
+    pub fn drain_changed_nodes(&mut self) -> HashSet<NodePath> {
         std::mem::take(&mut self.changed_nodes)
     }
 
@@ -534,7 +535,7 @@ impl NodeStates {
     /// dirty plan against the selected execution API. If validation
     /// fails (e.g. sync execute on an async-required graph), the dirty
     /// set must remain intact so a follow-up async run can re-plan.
-    pub fn peek_changed_nodes(&self) -> HashSet<NodeId> {
+    pub fn peek_changed_nodes(&self) -> HashSet<NodePath> {
         self.changed_nodes.clone()
     }
 
@@ -544,7 +545,7 @@ impl NodeStates {
     /// dirty state for nodes that failed (e.g. transient AsyncIo
     /// errors), so a follow-up `execute_async` retry can re-run those
     /// nodes against the same plan without losing the change record.
-    pub fn restore_changed_nodes(&mut self, ids: HashSet<NodeId>) {
-        self.changed_nodes.extend(ids);
+    pub fn restore_changed_nodes(&mut self, paths: HashSet<NodePath>) {
+        self.changed_nodes.extend(paths);
     }
 }

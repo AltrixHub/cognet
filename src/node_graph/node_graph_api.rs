@@ -511,7 +511,7 @@ impl NodeGraphWrite for NodeGraph {
             .get_mut(&NodePath::root().child(*node_id))
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
         node_state.data = Some(data);
-        guard.mark_changed(*node_id);
+        guard.mark_changed(&NodePath::root().child(*node_id));
         Ok(())
     }
 
@@ -526,7 +526,7 @@ impl NodeGraphWrite for NodeGraph {
             .input_slot_mut(&NodePath::root().child(*node_id), slot_index)
             .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
         slot.default_value = Some(data.into_value());
-        guard.mark_changed(*node_id);
+        guard.mark_changed(&NodePath::root().child(*node_id));
         Ok(())
     }
 
@@ -1065,10 +1065,13 @@ impl NodeGraph {
                 .read()
                 .map_err(|e| GraphExecutionError::PlanningFailed(e.to_string()))?;
             let mut affected = HashSet::new();
-            let mut queue: VecDeque<NodeId> = changed.into_iter().collect();
+            // Convert NodePaths from changed set to NodeIds for propagation.
+            let mut queue: VecDeque<NodeId> =
+                changed.into_iter().filter_map(|p| p.leaf()).collect();
             while let Some(node_id) = queue.pop_front() {
                 if affected.insert(node_id) {
-                    for edge_id in ns.outgoing_edges_for_node(&node_id) {
+                    let path = NodePath::root().child(node_id);
+                    for edge_id in ns.outgoing_edges_at(&path) {
                         if let Some(edge) = ns.get_edge(edge_id) {
                             if !affected.contains(&edge.to_node_id) {
                                 queue.push_back(edge.to_node_id);
@@ -1351,8 +1354,12 @@ impl NodeGraph {
         if failed_ids.is_empty() {
             return;
         }
+        let failed_paths: HashSet<NodePath> = failed_ids
+            .into_iter()
+            .map(|id| NodePath::root().child(id))
+            .collect();
         match self.node_states.write() {
-            Ok(mut ns) => ns.restore_changed_nodes(failed_ids),
+            Ok(mut ns) => ns.restore_changed_nodes(failed_paths),
             Err(e) => tracing::warn!(
                 target: "graph",
                 err = %e,

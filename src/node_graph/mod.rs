@@ -365,7 +365,10 @@ impl NodeGraph {
         self.node_states
             .read()
             .ok()
-            .map(|ns| ns.outgoing_edges_for_node(node_id).to_vec())
+            .map(|ns| {
+                ns.outgoing_edges_at(&NodePath::root().child(*node_id))
+                    .to_vec()
+            })
             .unwrap_or_default()
     }
 

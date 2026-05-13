@@ -502,7 +502,7 @@ impl NodeGraph {
                 )
             })?;
         slot.default_value = Some(data.into_value());
-        ns.mark_changed(*node_id);
+        ns.mark_changed(&NodePath::root().child(*node_id));
         Ok(())
     }
 }
@@ -545,7 +545,7 @@ fn append_locked_label(
         .get_mut(&NodePath::root().child(*node_id))
         .ok_or_else(|| format!("Node {:?} disappeared mid-call", node_id))?;
     state.data = Some(Data::from_domain(data, INTERFACE_NODE_DATA_DOMAIN));
-    ns.mark_changed(*node_id);
+    ns.mark_changed(&NodePath::root().child(*node_id));
     Ok(())
 }
 

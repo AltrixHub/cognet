@@ -92,7 +92,7 @@ impl NodeGraph {
                 .get_mut(&NodePath::root().child(*node_id))
                 .ok_or_else(|| format!("Node {:?} disappeared mid-call", node_id))?;
             state.data = Some(Data::from_domain(data, INTERFACE_NODE_DATA_DOMAIN));
-            guard.mark_changed(*node_id);
+            guard.mark_changed(&NodePath::root().child(*node_id));
         }
 
         Ok(index)
@@ -165,7 +165,7 @@ impl NodeGraph {
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
         ns.remove_input_slot(&node_path, index);
         ns.remove_output_slot(&node_path, index);
-        ns.mark_changed(*node_id);
+        ns.mark_changed(&NodePath::root().child(*node_id));
 
         Ok(())
     }
@@ -243,7 +243,7 @@ impl NodeGraph {
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
         ns.set_input_slot_label(&node_path, index, new);
         ns.set_output_slot_label(&node_path, index, new);
-        ns.mark_changed(*node_id);
+        ns.mark_changed(&NodePath::root().child(*node_id));
 
         Ok(())
     }
