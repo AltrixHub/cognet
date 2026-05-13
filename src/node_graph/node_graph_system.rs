@@ -1,4 +1,4 @@
-use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodeId};
+use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodeId, NodePath};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
@@ -97,12 +97,15 @@ impl NodeGraphSystem for NodeGraph {
             .map_err(|_| "Failed to read node states")?;
 
         let from_output_slot_id = ns
-            .output_slot(from_node_id, from_output_slot_index)
+            .output_slot(
+                &NodePath::root().child(*from_node_id),
+                from_output_slot_index,
+            )
             .ok_or("Invalid output slot index")?
             .id;
 
         let to_input_slot_id = ns
-            .input_slot(to_node_id, to_input_slot_index)
+            .input_slot(&NodePath::root().child(*to_node_id), to_input_slot_index)
             .ok_or("Invalid input slot index")?
             .id;
 
@@ -136,7 +139,7 @@ impl NodeGraphSystem for NodeGraph {
             let ns = self.node_states.read().map_err(|e| e.to_string())?;
 
             // Validate from node exists
-            if ns.get(&from_node_id).is_none() {
+            if ns.get(&NodePath::root().child(from_node_id)).is_none() {
                 let error = GraphError::node_not_found(from_node_id);
                 let msg = error.message();
                 self.add_error(error);
@@ -144,7 +147,7 @@ impl NodeGraphSystem for NodeGraph {
             }
 
             // Validate to node exists
-            if ns.get(&to_node_id).is_none() {
+            if ns.get(&NodePath::root().child(to_node_id)).is_none() {
                 let error = GraphError::node_not_found(to_node_id);
                 let msg = error.message();
                 self.add_error(error);
@@ -152,7 +155,10 @@ impl NodeGraphSystem for NodeGraph {
             }
 
             // Validate output slot
-            let from_slot = match ns.output_slot(&from_node_id, edge.from_output_slot_index) {
+            let from_slot = match ns.output_slot(
+                &NodePath::root().child(from_node_id),
+                edge.from_output_slot_index,
+            ) {
                 Some(slot) => slot,
                 None => {
                     let error = GraphError::output_slot_not_found(
@@ -166,7 +172,10 @@ impl NodeGraphSystem for NodeGraph {
             };
 
             // Validate input slot
-            let to_slot = match ns.input_slot(&to_node_id, edge.to_input_slot_index) {
+            let to_slot = match ns.input_slot(
+                &NodePath::root().child(to_node_id),
+                edge.to_input_slot_index,
+            ) {
                 Some(slot) => slot,
                 None => {
                     let error =

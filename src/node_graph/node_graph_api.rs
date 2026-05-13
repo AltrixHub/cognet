@@ -10,8 +10,8 @@ use std::any::TypeId;
 use crate::{
     node_graph_system::NodeGraphSystem, BoxNodeFuture, ColorValue, Data, DataType, DataValue, Edge,
     EdgeId, ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeExecutionKind, NodeGraph,
-    NodeId, NodeImpl, NodeMeta, OutputWriter, SharedExecutionCache, SharedNodeStates, SlotDef,
-    SubGraphNode, Vector3,
+    NodeId, NodeImpl, NodeMeta, NodePath, OutputWriter, SharedExecutionCache, SharedNodeStates,
+    SlotDef, SubGraphNode, Vector3,
 };
 
 /// Typed error returned by `NodeGraph::execute_sync` and `execute_async`.
@@ -197,11 +197,12 @@ fn build_execution_context(
     let cache_read = cache.read()?;
 
     // Resolve input values from NodeStates slot metadata
-    let input_count = ns.input_slot_count(node_id);
+    let path = NodePath::root().child(*node_id);
+    let input_count = ns.input_slot_count(&path);
     let input_values = (0..input_count)
         .map(|idx| {
             let mut values = Vec::new();
-            if let Some(slot_state) = ns.input_slot(node_id, idx) {
+            if let Some(slot_state) = ns.input_slot(&path, idx) {
                 for edge_id in ns.edges_for_input(&slot_state.id) {
                     if let Some(edge) = ns.get_edge(edge_id) {
                         if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
@@ -224,13 +225,13 @@ fn build_execution_context(
 
     // Capture node data from NodeStates
     let node_data = ns
-        .get(node_id)
+        .get(&path)
         .and_then(|state| state.data.as_ref().map(|d| d.share()));
 
     // Build output writer from NodeStates output slot metadata
-    let output_count = ns.output_slot_count(node_id);
+    let output_count = ns.output_slot_count(&path);
     let slots = (0..output_count)
-        .filter_map(|idx| ns.output_slot(node_id, idx).map(|s| (s.id, s.data_type)))
+        .filter_map(|idx| ns.output_slot(&path, idx).map(|s| (s.id, s.data_type)))
         .collect();
     let output_writer = OutputWriter::new(cache.share(), slots);
 
@@ -366,7 +367,7 @@ impl NodeGraphRead for NodeGraph {
 
     fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data> {
         let ns = self.node_states.read().ok()?;
-        let slot = ns.output_slot(node_id, output_slot_index)?;
+        let slot = ns.output_slot(&NodePath::root().child(*node_id), output_slot_index)?;
         let slot_id = slot.id;
         drop(ns);
 
@@ -394,7 +395,7 @@ impl NodeGraphWrite for NodeGraph {
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             guard.add_node(
-                node_id,
+                &NodePath::root().child(node_id),
                 T::NAME,
                 Some(TypeId::of::<T>()),
                 T::DEFAULT_VALUE.to_data(),
@@ -415,7 +416,7 @@ impl NodeGraphWrite for NodeGraph {
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             guard.add_node(
-                node_id,
+                &NodePath::root().child(node_id),
                 T::NAME,
                 Some(TypeId::of::<T>()),
                 T::DEFAULT_VALUE.to_data(),
@@ -446,7 +447,7 @@ impl NodeGraphWrite for NodeGraph {
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             guard.add_node(
-                node_id,
+                &NodePath::root().child(node_id),
                 resolved_name,
                 type_id,
                 default_data,
@@ -476,7 +477,14 @@ impl NodeGraphWrite for NodeGraph {
 
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            guard.add_node(id, resolved_name, type_id, default_data, inputs, outputs);
+            guard.add_node(
+                &NodePath::root().child(id),
+                resolved_name,
+                type_id,
+                default_data,
+                inputs,
+                outputs,
+            );
         }
 
         self.mirror_subgraph_external_slots(&id);
@@ -488,7 +496,7 @@ impl NodeGraphWrite for NodeGraph {
         if self.node_manager.node_remove(&node_id).is_some() {
             {
                 let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-                guard.remove_node(&node_id); // remove_edge auto-tracks downstream
+                guard.remove_node(&NodePath::root().child(node_id)); // remove_edge auto-tracks downstream
             }
             self.record_removal(node_id);
             Ok(())
@@ -500,7 +508,7 @@ impl NodeGraphWrite for NodeGraph {
     fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
         let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
         let node_state = guard
-            .get_mut(node_id)
+            .get_mut(&NodePath::root().child(*node_id))
             .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
         node_state.data = Some(data);
         guard.mark_changed(*node_id);
@@ -515,7 +523,7 @@ impl NodeGraphWrite for NodeGraph {
     ) -> Result<(), String> {
         let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
         let slot = guard
-            .input_slot_mut(node_id, slot_index)
+            .input_slot_mut(&NodePath::root().child(*node_id), slot_index)
             .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
         slot.default_value = Some(data.into_value());
         guard.mark_changed(*node_id);
@@ -533,7 +541,7 @@ impl NodeGraphWrite for NodeGraph {
         let current_fields: Vec<(&str, f64)> = {
             let ns = self.node_states.read().map_err(|e| e.to_string())?;
             let state = ns
-                .get(node_id)
+                .get(&NodePath::root().child(*node_id))
                 .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
             extract_fields_from_data(data_type, state.data.as_ref())
         };
@@ -571,9 +579,11 @@ impl NodeGraphWrite for NodeGraph {
         // Read current field values and data_type from existing slot default
         let (data_type, current_fields) = {
             let ns = self.node_states.read().map_err(|e| e.to_string())?;
-            let slot = ns.input_slot(node_id, slot_index).ok_or_else(|| {
-                format!("Input slot {} not found for node {:?}", slot_index, node_id)
-            })?;
+            let slot = ns
+                .input_slot(&NodePath::root().child(*node_id), slot_index)
+                .ok_or_else(|| {
+                    format!("Input slot {} not found for node {:?}", slot_index, node_id)
+                })?;
             let dt = slot.data_type;
             let fields = extract_fields_from_default_value(dt, slot.default_value.as_ref());
             (dt, fields)
@@ -880,17 +890,19 @@ impl NodeGraph {
             Err(_) => return,
         };
 
-        let input_count = internal_ns.output_slot_count(&input_proxy_id);
+        let input_proxy_path = NodePath::root().child(input_proxy_id);
+        let output_proxy_path = NodePath::root().child(output_proxy_id);
+        let input_count = internal_ns.output_slot_count(&input_proxy_path);
         let mut external_inputs: Vec<(&'static str, DataType)> = Vec::with_capacity(input_count);
         for i in 0..input_count {
-            if let Some(slot) = internal_ns.output_slot(&input_proxy_id, i) {
+            if let Some(slot) = internal_ns.output_slot(&input_proxy_path, i) {
                 external_inputs.push((slot.label, slot.data_type));
             }
         }
-        let output_count = internal_ns.input_slot_count(&output_proxy_id);
+        let output_count = internal_ns.input_slot_count(&output_proxy_path);
         let mut external_outputs: Vec<(&'static str, DataType)> = Vec::with_capacity(output_count);
         for i in 0..output_count {
-            if let Some(slot) = internal_ns.input_slot(&output_proxy_id, i) {
+            if let Some(slot) = internal_ns.input_slot(&output_proxy_path, i) {
                 external_outputs.push((slot.label, slot.data_type));
             }
         }
@@ -901,16 +913,17 @@ impl NodeGraph {
             Ok(g) => g,
             Err(_) => return,
         };
-        let existing_inputs = parent_ns.input_slot_count(node_id);
+        let node_path = NodePath::root().child(*node_id);
+        let existing_inputs = parent_ns.input_slot_count(&node_path);
         for (i, (label, dt)) in external_inputs.into_iter().enumerate() {
             if i >= existing_inputs {
-                parent_ns.add_input_slot(node_id, label, dt, None);
+                parent_ns.add_input_slot(&node_path, label, dt, None);
             }
         }
-        let existing_outputs = parent_ns.output_slot_count(node_id);
+        let existing_outputs = parent_ns.output_slot_count(&node_path);
         for (i, (label, dt)) in external_outputs.into_iter().enumerate() {
             if i >= existing_outputs {
-                parent_ns.add_output_slot(node_id, label, dt);
+                parent_ns.add_output_slot(&node_path, label, dt);
             }
         }
     }
@@ -1168,10 +1181,11 @@ impl NodeGraph {
         if let Ok(ns) = shared_node_states.read() {
             if let Ok(cache) = shared_cache.read() {
                 for node_id in executed_node_ids {
-                    let output_count = ns.output_slot_count(node_id);
+                    let node_path = NodePath::root().child(*node_id);
+                    let output_count = ns.output_slot_count(&node_path);
                     let mut slot_outputs = vec![None; output_count];
                     for (idx, slot_out) in slot_outputs.iter_mut().enumerate() {
-                        if let Some(slot) = ns.output_slot(node_id, idx) {
+                        if let Some(slot) = ns.output_slot(&node_path, idx) {
                             if let Some(data) = cache.outputs.get(&slot.id) {
                                 *slot_out = Some(data.share());
                                 outputs.push(NodeOutput {
@@ -1184,7 +1198,7 @@ impl NodeGraph {
                     }
 
                     if output_count == 0 {
-                        let input_count = ns.input_slot_count(node_id);
+                        let input_count = ns.input_slot_count(&node_path);
                         let mut slot_inputs = vec![None; input_count];
                         for edge in ns.edges().values() {
                             if edge.to_node_id == *node_id

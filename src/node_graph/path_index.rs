@@ -8,16 +8,11 @@ use std::collections::HashMap;
 
 use crate::{NodeId, NodePath};
 
-// PathIndex is wired into NodeStates in the next phase (P3b).
-// Until then, the struct and its methods have no non-test caller,
-// which is expected by design.
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PathIndex {
     by_parent: HashMap<NodePath, Vec<NodeId>>,
 }
 
-#[allow(dead_code)]
 impl PathIndex {
     pub fn insert(&mut self, path: &NodePath) {
         let Some(local) = path.leaf() else {

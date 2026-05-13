@@ -13,7 +13,7 @@
 //! a non-matching domain is `Err` and leaves slots untouched.
 
 use crate::{
-    Data, DataType, InterfaceNode, InterfaceNodeData, NodeGraph, NodeGraphRead, NodeId,
+    Data, DataType, InterfaceNode, InterfaceNodeData, NodeGraph, NodeGraphRead, NodeId, NodePath,
     INTERFACE_NODE_DATA_DOMAIN,
 };
 
@@ -69,8 +69,9 @@ impl NodeGraph {
         // 3. Add input + output slots at the same index.
         let index = {
             let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-            let in_idx = ns.add_input_slot(node_id, label, data_type, Some(1));
-            let out_idx = ns.add_output_slot(node_id, label, data_type);
+            let node_path = NodePath::root().child(*node_id);
+            let in_idx = ns.add_input_slot(&node_path, label, data_type, Some(1));
+            let out_idx = ns.add_output_slot(&node_path, label, data_type);
             // Invariant: input and output slot indices stay in lock-step.
             assert_eq!(
                 in_idx, out_idx,
@@ -88,7 +89,7 @@ impl NodeGraph {
             data.locked.insert(label.to_string());
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
             let state = guard
-                .get_mut(node_id)
+                .get_mut(&NodePath::root().child(*node_id))
                 .ok_or_else(|| format!("Node {:?} disappeared mid-call", node_id))?;
             state.data = Some(Data::from_domain(data, INTERFACE_NODE_DATA_DOMAIN));
             guard.mark_changed(*node_id);
@@ -144,10 +145,11 @@ impl NodeGraph {
 
         // 3. Find the slot index by label (input side; output side
         //    mirrors at the same index).
+        let node_path = NodePath::root().child(*node_id);
         let index = {
             let ns = self.node_states.read().map_err(|e| e.to_string())?;
-            (0..ns.input_slot_count(node_id))
-                .find(|i| ns.input_slot(node_id, *i).map(|s| s.label) == Some(label))
+            (0..ns.input_slot_count(&node_path))
+                .find(|i| ns.input_slot(&node_path, *i).map(|s| s.label) == Some(label))
                 .ok_or_else(|| {
                     format!(
                         "InterfaceNode {:?} has no port labelled '{}'",
@@ -161,8 +163,8 @@ impl NodeGraph {
         //    higher-indexed slot ids down so the input/output
         //    invariant survives.
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        ns.remove_input_slot(node_id, index);
-        ns.remove_output_slot(node_id, index);
+        ns.remove_input_slot(&node_path, index);
+        ns.remove_output_slot(&node_path, index);
         ns.mark_changed(*node_id);
 
         Ok(())
@@ -217,19 +219,20 @@ impl NodeGraph {
         }
 
         // 3. Locate the slot index by old label + check new label is unused.
+        let node_path = NodePath::root().child(*node_id);
         let index = {
             let ns = self.node_states.read().map_err(|e| e.to_string())?;
             // Reject if the new label already exists.
-            let has_new = (0..ns.input_slot_count(node_id))
-                .any(|i| ns.input_slot(node_id, i).map(|s| s.label) == Some(new));
+            let has_new = (0..ns.input_slot_count(&node_path))
+                .any(|i| ns.input_slot(&node_path, i).map(|s| s.label) == Some(new));
             if has_new {
                 return Err(format!(
                     "InterfaceNode {:?} already has a port labelled '{}'",
                     node_id, new
                 ));
             }
-            (0..ns.input_slot_count(node_id))
-                .find(|i| ns.input_slot(node_id, *i).map(|s| s.label) == Some(old))
+            (0..ns.input_slot_count(&node_path))
+                .find(|i| ns.input_slot(&node_path, *i).map(|s| s.label) == Some(old))
                 .ok_or_else(|| {
                     format!("InterfaceNode {:?} has no port labelled '{}'", node_id, old)
                 })?
@@ -238,8 +241,8 @@ impl NodeGraph {
         // 4. Set labels on both sides at the matching index. Slot ids
         //    are preserved so edges survive.
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        ns.set_input_slot_label(node_id, index, new);
-        ns.set_output_slot_label(node_id, index, new);
+        ns.set_input_slot_label(&node_path, index, new);
+        ns.set_output_slot_label(&node_path, index, new);
         ns.mark_changed(*node_id);
 
         Ok(())

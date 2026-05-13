@@ -4,8 +4,8 @@
 //! without requiring callers to perform entity lookup + downcast manually.
 
 use crate::{
-    Data, DataType, EdgeId, InterfaceNodeData, NodeGraph, NodeGraphRead, NodeId, SubGraphNode,
-    INTERFACE_NODE_DATA_DOMAIN,
+    Data, DataType, EdgeId, InterfaceNodeData, NodeGraph, NodeGraphRead, NodeId, NodePath,
+    SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
 };
 
 use super::EdgeInfo;
@@ -72,7 +72,7 @@ impl NodeGraph {
         let guard = entity.read().ok()?;
         let sg = guard.as_any().downcast_ref::<SubGraphNode>()?;
         let ns = sg.internal_graph().node_states().read().ok()?;
-        Some(ns.node_ids().copied().collect())
+        Some(ns.node_ids().collect())
     }
 
     /// Get all edges in a SubGraphNode's internal graph.
@@ -144,7 +144,7 @@ impl NodeGraph {
         drop(guard);
         // Sync parent NodeStates
         if let Ok(mut ns) = self.node_states.write() {
-            ns.add_input_slot(node_id, label, data_type, None);
+            ns.add_input_slot(&NodePath::root().child(*node_id), label, data_type, None);
         }
         Ok(())
     }
@@ -163,7 +163,7 @@ impl NodeGraph {
         drop(guard);
         // Sync parent NodeStates
         if let Ok(mut ns) = self.node_states.write() {
-            ns.remove_input_slot(node_id, index);
+            ns.remove_input_slot(&NodePath::root().child(*node_id), index);
         }
         Ok(())
     }
@@ -187,7 +187,7 @@ impl NodeGraph {
         drop(guard);
         // Sync parent NodeStates
         if let Ok(mut ns) = self.node_states.write() {
-            ns.add_output_slot(node_id, label, data_type);
+            ns.add_output_slot(&NodePath::root().child(*node_id), label, data_type);
         }
         Ok(())
     }
@@ -206,7 +206,7 @@ impl NodeGraph {
         drop(guard);
         // Sync parent NodeStates
         if let Ok(mut ns) = self.node_states.write() {
-            ns.remove_output_slot(node_id, index);
+            ns.remove_output_slot(&NodePath::root().child(*node_id), index);
         }
         Ok(())
     }
@@ -295,7 +295,7 @@ impl NodeGraph {
             for eid in edges_to_remove {
                 ns.remove_edge(&eid);
             }
-            ns.remove_input_slot(node_id, index);
+            ns.remove_input_slot(&NodePath::root().child(*node_id), index);
         }
         Ok(index)
     }
@@ -339,7 +339,7 @@ impl NodeGraph {
             for eid in edges_to_remove {
                 ns.remove_edge(&eid);
             }
-            ns.remove_output_slot(node_id, index);
+            ns.remove_output_slot(&NodePath::root().child(*node_id), index);
         }
         Ok(index)
     }
@@ -368,7 +368,7 @@ impl NodeGraph {
 
         // Sync parent NodeStates label.
         if let Ok(mut ns) = self.node_states.write() {
-            ns.set_input_slot_label(node_id, index, new_label);
+            ns.set_input_slot_label(&NodePath::root().child(*node_id), index, new_label);
         }
         Ok(index)
     }
@@ -398,7 +398,7 @@ impl NodeGraph {
 
         // Sync parent NodeStates label.
         if let Ok(mut ns) = self.node_states.write() {
-            ns.set_output_slot_label(node_id, index, new_label);
+            ns.set_output_slot_label(&NodePath::root().child(*node_id), index, new_label);
         }
         Ok(index)
     }
@@ -429,7 +429,7 @@ impl NodeGraph {
         drop(guard);
         // Sync parent NodeStates
         if let Ok(mut ns) = self.node_states.write() {
-            ns.add_input_slot(node_id, label, data_type, None);
+            ns.add_input_slot(&NodePath::root().child(*node_id), label, data_type, None);
         }
         Ok(())
     }
@@ -444,7 +444,7 @@ impl NodeGraph {
         data_type: DataType,
     ) -> Result<(), String> {
         if let Ok(mut ns) = self.node_states.write() {
-            ns.add_input_slot(node_id, label, data_type, None);
+            ns.add_input_slot(&NodePath::root().child(*node_id), label, data_type, None);
         }
         Ok(())
     }
@@ -480,7 +480,7 @@ impl NodeGraph {
         drop(guard);
         // Sync parent NodeStates
         if let Ok(mut ns) = self.node_states.write() {
-            ns.add_input_slot(node_id, label, data_type, None);
+            ns.add_input_slot(&NodePath::root().child(*node_id), label, data_type, None);
         }
         Ok(())
     }
@@ -493,12 +493,14 @@ impl NodeGraph {
         data: Data,
     ) -> Result<(), String> {
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        let slot = ns.input_slot_mut(node_id, input_index).ok_or_else(|| {
-            format!(
-                "Input slot {} not found for node {:?}",
-                input_index, node_id
-            )
-        })?;
+        let slot = ns
+            .input_slot_mut(&NodePath::root().child(*node_id), input_index)
+            .ok_or_else(|| {
+                format!(
+                    "Input slot {} not found for node {:?}",
+                    input_index, node_id
+                )
+            })?;
         slot.default_value = Some(data.into_value());
         ns.mark_changed(*node_id);
         Ok(())
@@ -540,7 +542,7 @@ fn append_locked_label(
         .write()
         .map_err(|e| format!("NodeStates lock poisoned: {e}"))?;
     let state = ns
-        .get_mut(node_id)
+        .get_mut(&NodePath::root().child(*node_id))
         .ok_or_else(|| format!("Node {:?} disappeared mid-call", node_id))?;
     state.data = Some(Data::from_domain(data, INTERFACE_NODE_DATA_DOMAIN));
     ns.mark_changed(*node_id);
@@ -611,8 +613,8 @@ mod tests {
         // Verify via NodeStates
         {
             let ns = graph.node_states().read().unwrap();
-            assert_eq!(ns.input_slot_count(&sg), 1);
-            assert_eq!(ns.output_slot_count(&sg), 1);
+            assert_eq!(ns.input_slot_count(&crate::NodePath::root().child(sg)), 1);
+            assert_eq!(ns.output_slot_count(&crate::NodePath::root().child(sg)), 1);
         }
 
         // Remove
@@ -621,8 +623,8 @@ mod tests {
 
         {
             let ns = graph.node_states().read().unwrap();
-            assert_eq!(ns.input_slot_count(&sg), 0);
-            assert_eq!(ns.output_slot_count(&sg), 0);
+            assert_eq!(ns.input_slot_count(&crate::NodePath::root().child(sg)), 0);
+            assert_eq!(ns.output_slot_count(&crate::NodePath::root().child(sg)), 0);
         }
     }
 
@@ -691,7 +693,7 @@ mod tests {
             .with_subgraph(&sg, |internal| {
                 let ns = internal.node_states().read().unwrap();
                 let slot = ns
-                    .output_slot(&out_proxy, 0)
+                    .output_slot(&crate::NodePath::root().child(out_proxy), 0)
                     .expect("mirror output slot exists");
                 let slot_id = slot.id;
                 drop(ns);
@@ -758,13 +760,19 @@ mod tests {
         // slots on the output proxy.
         {
             let ns = graph.node_states().read().unwrap();
-            assert_eq!(ns.output_slot_count(&sg), 3);
+            assert_eq!(ns.output_slot_count(&crate::NodePath::root().child(sg)), 3);
         }
         graph
             .with_subgraph(&sg, |internal| {
                 let ns = internal.node_states().read().unwrap();
-                assert_eq!(ns.input_slot_count(&out_proxy), 3);
-                assert_eq!(ns.output_slot_count(&out_proxy), 3);
+                assert_eq!(
+                    ns.input_slot_count(&crate::NodePath::root().child(out_proxy)),
+                    3
+                );
+                assert_eq!(
+                    ns.output_slot_count(&crate::NodePath::root().child(out_proxy)),
+                    3
+                );
                 assert!(ns.get_edge(&edge_b_mirror).is_some());
                 assert!(ns.get_edge(&edge_c_input).is_some());
             })
@@ -779,9 +787,13 @@ mod tests {
         // Parent now has slots [a, c] at indices 0 and 1.
         {
             let ns = graph.node_states().read().unwrap();
-            assert_eq!(ns.output_slot_count(&sg), 2);
-            let s0 = ns.output_slot(&sg, 0).unwrap();
-            let s1 = ns.output_slot(&sg, 1).unwrap();
+            assert_eq!(ns.output_slot_count(&crate::NodePath::root().child(sg)), 2);
+            let s0 = ns
+                .output_slot(&crate::NodePath::root().child(sg), 0)
+                .unwrap();
+            let s1 = ns
+                .output_slot(&crate::NodePath::root().child(sg), 1)
+                .unwrap();
             assert_eq!(s0.label, "a");
             assert_eq!(s1.label, "c");
         }
@@ -791,8 +803,14 @@ mod tests {
         graph
             .with_subgraph(&sg, |internal| {
                 let ns = internal.node_states().read().unwrap();
-                assert_eq!(ns.input_slot_count(&out_proxy), 2);
-                assert_eq!(ns.output_slot_count(&out_proxy), 2);
+                assert_eq!(
+                    ns.input_slot_count(&crate::NodePath::root().child(out_proxy)),
+                    2
+                );
+                assert_eq!(
+                    ns.output_slot_count(&crate::NodePath::root().child(out_proxy)),
+                    2
+                );
                 assert!(
                     ns.get_edge(&edge_b_mirror).is_none(),
                     "edge to mirror output 'b' should be dropped"
@@ -842,9 +860,13 @@ mod tests {
 
         {
             let ns = graph.node_states().read().unwrap();
-            assert_eq!(ns.input_slot_count(&sg), 2);
-            let s0 = ns.input_slot(&sg, 0).unwrap();
-            let s1 = ns.input_slot(&sg, 1).unwrap();
+            assert_eq!(ns.input_slot_count(&crate::NodePath::root().child(sg)), 2);
+            let s0 = ns
+                .input_slot(&crate::NodePath::root().child(sg), 0)
+                .unwrap();
+            let s1 = ns
+                .input_slot(&crate::NodePath::root().child(sg), 1)
+                .unwrap();
             assert_eq!(s0.label, "wall_height");
             assert_eq!(s1.label, "thickness");
             // The edge survives.
@@ -879,7 +901,9 @@ mod tests {
         // Parent external output slot is renamed.
         {
             let ns = graph.node_states().read().unwrap();
-            let slot = ns.output_slot(&sg, 0).unwrap();
+            let slot = ns
+                .output_slot(&crate::NodePath::root().child(sg), 0)
+                .unwrap();
             assert_eq!(slot.label, "new_name");
         }
 
@@ -888,8 +912,12 @@ mod tests {
         graph
             .with_subgraph(&sg, |internal| {
                 let ns = internal.node_states().read().unwrap();
-                let in_slot = ns.input_slot(&out_proxy, 0).unwrap();
-                let mirror = ns.output_slot(&out_proxy, 0).unwrap();
+                let in_slot = ns
+                    .input_slot(&crate::NodePath::root().child(out_proxy), 0)
+                    .unwrap();
+                let mirror = ns
+                    .output_slot(&crate::NodePath::root().child(out_proxy), 0)
+                    .unwrap();
                 assert_eq!(in_slot.label, "new_name");
                 assert_eq!(mirror.label, "new_name");
             })

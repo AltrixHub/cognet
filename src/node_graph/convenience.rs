@@ -12,7 +12,7 @@ impl NodeGraph {
     pub fn node_ids(&self) -> Vec<NodeId> {
         self.node_states
             .read()
-            .map(|guard| guard.node_ids().copied().collect())
+            .map(|guard| guard.node_ids().collect())
             .unwrap_or_default()
     }
 

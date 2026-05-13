@@ -6,7 +6,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    DataType, Edge, EdgeId, NodeGraph, NodeGraphRead, NodeGraphWrite, NodeId, SubGraphNode,
+    DataType, Edge, EdgeId, NodeGraph, NodeGraphRead, NodeGraphWrite, NodeId, NodePath,
+    SubGraphNode,
 };
 
 /// Information about an edge crossing the subgraph boundary.
@@ -127,8 +128,11 @@ impl NodeGraph {
                 .read()
                 .ok()
                 .and_then(|ns| {
-                    ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
-                        .map(|s| s.label)
+                    ns.output_slot(
+                        &NodePath::root().child(first.edge.from_node_id),
+                        first.edge.from_output_slot_index,
+                    )
+                    .map(|s| s.label)
                 })
                 .unwrap_or("");
             subgraph.add_input(source_label, data_type)?;
@@ -147,8 +151,11 @@ impl NodeGraph {
                 .read()
                 .ok()
                 .and_then(|ns| {
-                    ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
-                        .map(|s| s.label)
+                    ns.output_slot(
+                        &NodePath::root().child(first.edge.from_node_id),
+                        first.edge.from_output_slot_index,
+                    )
+                    .map(|s| s.label)
                 })
                 .unwrap_or("");
             subgraph.add_output(source_label, data_type)?;
@@ -186,9 +193,9 @@ impl NodeGraph {
         let mut terminal_outputs: Vec<TerminalOutput> = Vec::new();
         if let Ok(ns) = self.node_states.read() {
             for &node_id in node_ids {
-                let output_count = ns.output_slot_count(&node_id);
+                let output_count = ns.output_slot_count(&NodePath::root().child(node_id));
                 for slot_idx in 0..output_count {
-                    if let Some(slot) = ns.output_slot(&node_id, slot_idx) {
+                    if let Some(slot) = ns.output_slot(&NodePath::root().child(node_id), slot_idx) {
                         if !consumed_slots.contains(&(node_id, slot_idx))
                             && !slot.label.starts_with('_')
                         {
@@ -234,7 +241,7 @@ impl NodeGraph {
 
                 // Copy node data from NodeStates
                 if let Ok(ns) = self.node_states.read() {
-                    if let Some(state) = ns.get(&node_id) {
+                    if let Some(state) = ns.get(&NodePath::root().child(node_id)) {
                         if let Some(data) = state.data.as_ref() {
                             internal_graph.update_node_data(&internal_id, data.share())?;
                         }
@@ -316,8 +323,11 @@ impl NodeGraph {
                     .read()
                     .ok()
                     .and_then(|ns| {
-                        ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
-                            .map(|s| s.label)
+                        ns.output_slot(
+                            &NodePath::root().child(first.edge.from_node_id),
+                            first.edge.from_output_slot_index,
+                        )
+                        .map(|s| s.label)
                     })
                     .unwrap_or("");
                 (label, data_type)
@@ -336,8 +346,11 @@ impl NodeGraph {
                     .read()
                     .ok()
                     .and_then(|ns| {
-                        ns.output_slot(&first.edge.from_node_id, first.edge.from_output_slot_index)
-                            .map(|s| s.label)
+                        ns.output_slot(
+                            &NodePath::root().child(first.edge.from_node_id),
+                            first.edge.from_output_slot_index,
+                        )
+                        .map(|s| s.label)
                     })
                     .unwrap_or("");
                 (label, data_type)
@@ -347,13 +360,22 @@ impl NodeGraph {
         {
             let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
             for (label, data_type) in &input_slot_info {
-                ns.add_input_slot(&subgraph_id, label, *data_type, None);
+                ns.add_input_slot(
+                    &NodePath::root().child(subgraph_id),
+                    label,
+                    *data_type,
+                    None,
+                );
             }
             for (label, data_type) in &output_slot_info {
-                ns.add_output_slot(&subgraph_id, label, *data_type);
+                ns.add_output_slot(&NodePath::root().child(subgraph_id), label, *data_type);
             }
             for terminal in &terminal_outputs {
-                ns.add_output_slot(&subgraph_id, terminal.label, terminal.data_type);
+                ns.add_output_slot(
+                    &NodePath::root().child(subgraph_id),
+                    terminal.label,
+                    terminal.data_type,
+                );
             }
         }
 
@@ -633,7 +655,10 @@ impl NodeGraph {
     fn get_edge_data_type(&self, edge: &Edge) -> Result<DataType, String> {
         let ns = self.node_states.read().map_err(|e| e.to_string())?;
         let slot = ns
-            .output_slot(&edge.from_node_id, edge.from_output_slot_index)
+            .output_slot(
+                &NodePath::root().child(edge.from_node_id),
+                edge.from_output_slot_index,
+            )
             .ok_or("Edge source output slot not found")?;
         Ok(slot.data_type)
     }
@@ -709,8 +734,14 @@ mod tests {
         // Verify SubGraphNode was created with correct ports via NodeStates
         {
             let ns = graph.node_states().read().expect("ns");
-            assert_eq!(ns.input_slot_count(&result.subgraph_node_id), 2);
-            assert_eq!(ns.output_slot_count(&result.subgraph_node_id), 1);
+            assert_eq!(
+                ns.input_slot_count(&NodePath::root().child(result.subgraph_node_id)),
+                2
+            );
+            assert_eq!(
+                ns.output_slot_count(&NodePath::root().child(result.subgraph_node_id)),
+                1
+            );
         }
 
         // Verify original add node was removed
@@ -760,14 +791,14 @@ mod tests {
             let ns = graph.node_states().read().unwrap();
             // 1 input (from num1). Add's second input (slot 1) has no edge → no port.
             assert_eq!(
-                ns.input_slot_count(&result.subgraph_node_id),
+                ns.input_slot_count(&NodePath::root().child(result.subgraph_node_id)),
                 1,
                 "should have 1 input port"
             );
             // 1 output (mul→output). The add→external edge is intermediate
             // (add's output also feeds mul internally) and should be filtered out.
             assert_eq!(
-                ns.output_slot_count(&result.subgraph_node_id),
+                ns.output_slot_count(&NodePath::root().child(result.subgraph_node_id)),
                 1,
                 "should have 1 output port (intermediate filtered)"
             );
@@ -794,13 +825,13 @@ mod tests {
             let ns = graph.node_states().read().unwrap();
             // 1 input (from num1)
             assert_eq!(
-                ns.input_slot_count(&result.subgraph_node_id),
+                ns.input_slot_count(&NodePath::root().child(result.subgraph_node_id)),
                 1,
                 "should have 1 input port"
             );
             // 1 output (add.output0 is terminal — no consumers)
             assert_eq!(
-                ns.output_slot_count(&result.subgraph_node_id),
+                ns.output_slot_count(&NodePath::root().child(result.subgraph_node_id)),
                 1,
                 "should have 1 terminal output port"
             );
@@ -834,13 +865,13 @@ mod tests {
             let ns = graph.node_states().read().unwrap();
             // With source-based dedup: source.output0 → 1 input port (fans out to A and B)
             assert_eq!(
-                ns.input_slot_count(&result.subgraph_node_id),
+                ns.input_slot_count(&NodePath::root().child(result.subgraph_node_id)),
                 1,
                 "should have 1 input port (source deduped)"
             );
             // 2 outputs (A→out_a, B→out_b)
             assert_eq!(
-                ns.output_slot_count(&result.subgraph_node_id),
+                ns.output_slot_count(&NodePath::root().child(result.subgraph_node_id)),
                 2,
                 "should have 2 output ports"
             );

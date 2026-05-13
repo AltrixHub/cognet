@@ -1,9 +1,13 @@
 //! Runtime state for node instances.
 
-use crate::{Data, DataType, DataValue, Edge, EdgeId, InputSlotId, NodeId, OutputSlotId, SlotDef};
+use crate::{
+    Data, DataType, DataValue, Edge, EdgeId, InputSlotId, NodeId, NodePath, OutputSlotId, SlotDef,
+};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+
+use super::path_index::PathIndex;
 
 /// Runtime state for a single node instance.
 #[derive(Debug, Clone)]
@@ -54,22 +58,24 @@ pub(crate) type SharedNodeStates = Arc<RwLock<NodeStates>>;
 /// Manages all node states in the graph.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct NodeStates {
-    /// Node data by NodeId.
-    nodes: HashMap<NodeId, NodeState>,
-    /// Input slot states by (NodeId, slot_index).
-    input_slots: HashMap<(NodeId, usize), InputSlotState>,
-    /// Output slot states by (NodeId, slot_index).
-    output_slots: HashMap<(NodeId, usize), OutputSlotState>,
+    /// Node data by NodePath.
+    nodes: HashMap<NodePath, NodeState>,
+    /// Input slot states by (NodePath, slot_index).
+    input_slots: HashMap<(NodePath, usize), InputSlotState>,
+    /// Output slot states by (NodePath, slot_index).
+    output_slots: HashMap<(NodePath, usize), OutputSlotState>,
     /// All edges in the graph.
     edges: HashMap<EdgeId, Edge>,
     /// Index: input slot → connected edge IDs (ordered).
     input_connections: HashMap<InputSlotId, Vec<EdgeId>>,
     /// Index: output slot → connected edge IDs (ordered).
     output_connections: HashMap<OutputSlotId, Vec<EdgeId>>,
-    /// Index: source node → outgoing edge IDs.
+    /// Index: source node → outgoing edge IDs (NodeId-keyed for edge compatibility).
     outgoing_edges: HashMap<NodeId, Vec<EdgeId>>,
     /// Nodes changed since last drain (for deferred dirty tracking).
     changed_nodes: HashSet<NodeId>,
+    /// Hierarchical index: parent NodePath → direct children NodeIds.
+    path_index: PathIndex,
 }
 
 impl NodeStates {
@@ -80,20 +86,25 @@ impl NodeStates {
     /// Add a new node with slot metadata from `SlotDef` arrays.
     pub fn add_node(
         &mut self,
-        node_id: NodeId,
+        path: &NodePath,
         type_name: &'static str,
         type_id: Option<TypeId>,
         default_data: Option<Data>,
         input_defs: &[SlotDef],
         output_defs: &[SlotDef],
     ) {
-        self.nodes
-            .insert(node_id, NodeState::new(type_name, type_id, default_data));
+        // Register in path_index so subtree walks can find this node.
+        self.path_index.insert(path);
+
+        self.nodes.insert(
+            path.clone(),
+            NodeState::new(type_name, type_id, default_data),
+        );
 
         // Initialize input slot states with metadata
         for (i, def) in input_defs.iter().enumerate() {
             self.input_slots.insert(
-                (node_id, i),
+                (path.clone(), i),
                 InputSlotState {
                     id: InputSlotId::new(),
                     label: def.label,
@@ -107,7 +118,7 @@ impl NodeStates {
         // Initialize output slot states with metadata
         for (i, def) in output_defs.iter().enumerate() {
             self.output_slots.insert(
-                (node_id, i),
+                (path.clone(), i),
                 OutputSlotState {
                     id: OutputSlotId::new(),
                     label: def.label,
@@ -116,20 +127,23 @@ impl NodeStates {
             );
         }
 
-        self.changed_nodes.insert(node_id);
+        // Mark the node's leaf NodeId as changed.
+        if let Some(node_id) = path.leaf() {
+            self.changed_nodes.insert(node_id);
+        }
     }
 
     /// Add a dynamic input slot (for SubGraphNode).
     pub fn add_input_slot(
         &mut self,
-        node_id: &NodeId,
+        path: &NodePath,
         label: &'static str,
         data_type: DataType,
         max_connections: Option<usize>,
     ) -> usize {
-        let index = self.input_slot_count(node_id);
+        let index = self.input_slot_count(path);
         self.input_slots.insert(
-            (*node_id, index),
+            (path.clone(), index),
             InputSlotState {
                 id: InputSlotId::new(),
                 label,
@@ -144,13 +158,13 @@ impl NodeStates {
     /// Add a dynamic output slot (for SubGraphNode).
     pub fn add_output_slot(
         &mut self,
-        node_id: &NodeId,
+        path: &NodePath,
         label: &'static str,
         data_type: DataType,
     ) -> usize {
-        let index = self.output_slot_count(node_id);
+        let index = self.output_slot_count(path);
         self.output_slots.insert(
-            (*node_id, index),
+            (path.clone(), index),
             OutputSlotState {
                 id: OutputSlotId::new(),
                 label,
@@ -166,22 +180,22 @@ impl NodeStates {
     /// position so that existing edge references to higher slots remain valid.
     pub fn insert_output_slot_at(
         &mut self,
-        node_id: &NodeId,
+        path: &NodePath,
         index: usize,
         label: &'static str,
         data_type: DataType,
     ) -> OutputSlotId {
-        let count = self.output_slot_count(node_id);
+        let count = self.output_slot_count(path);
         // Shift existing slots at index..count up by 1 (iterate in reverse)
         for i in (index..count).rev() {
-            if let Some(slot) = self.output_slots.remove(&(*node_id, i)) {
-                self.output_slots.insert((*node_id, i + 1), slot);
+            if let Some(slot) = self.output_slots.remove(&(path.clone(), i)) {
+                self.output_slots.insert((path.clone(), i + 1), slot);
             }
         }
         // Insert new slot at index
         let id = OutputSlotId::new();
         self.output_slots.insert(
-            (*node_id, index),
+            (path.clone(), index),
             OutputSlotState {
                 id,
                 label,
@@ -195,11 +209,11 @@ impl NodeStates {
     /// are preserved so existing edges remain valid.
     pub fn set_input_slot_label(
         &mut self,
-        node_id: &NodeId,
+        path: &NodePath,
         index: usize,
         label: &'static str,
     ) -> bool {
-        if let Some(slot) = self.input_slots.get_mut(&(*node_id, index)) {
+        if let Some(slot) = self.input_slots.get_mut(&(path.clone(), index)) {
             slot.label = label;
             true
         } else {
@@ -211,11 +225,11 @@ impl NodeStates {
     /// are preserved so existing edges remain valid.
     pub fn set_output_slot_label(
         &mut self,
-        node_id: &NodeId,
+        path: &NodePath,
         index: usize,
         label: &'static str,
     ) -> bool {
-        if let Some(slot) = self.output_slots.get_mut(&(*node_id, index)) {
+        if let Some(slot) = self.output_slots.get_mut(&(path.clone(), index)) {
             slot.label = label;
             true
         } else {
@@ -230,23 +244,24 @@ impl NodeStates {
     /// Callers must drop edges that touch the removed slot before
     /// calling this — surviving edges keep their `to_input_slot_id`,
     /// only the index is adjusted.
-    pub fn remove_input_slot(&mut self, node_id: &NodeId, index: usize) {
-        let count = self.input_slot_count(node_id);
+    pub fn remove_input_slot(&mut self, path: &NodePath, index: usize) {
+        let count = self.input_slot_count(path);
         if index >= count {
             return;
         }
         // Remove the slot at index
-        self.input_slots.remove(&(*node_id, index));
+        self.input_slots.remove(&(path.clone(), index));
         // Shift slots above index down by 1
         for i in (index + 1)..count {
-            if let Some(slot) = self.input_slots.remove(&(*node_id, i)) {
-                self.input_slots.insert((*node_id, i - 1), slot);
+            if let Some(slot) = self.input_slots.remove(&(path.clone(), i)) {
+                self.input_slots.insert((path.clone(), i - 1), slot);
             }
         }
         // Decrement to_input_slot_index on edges that reference this
         // node's higher-indexed input slots so indices stay aligned.
+        let node_id = path.leaf();
         for edge in self.edges.values_mut() {
-            if edge.to_node_id == *node_id && edge.to_input_slot_index > index {
+            if Some(edge.to_node_id) == node_id && edge.to_input_slot_index > index {
                 edge.to_input_slot_index -= 1;
             }
         }
@@ -259,88 +274,88 @@ impl NodeStates {
     /// Callers must drop edges that touch the removed slot before
     /// calling this — surviving edges keep their `from_output_slot_id`,
     /// only the index is adjusted.
-    pub fn remove_output_slot(&mut self, node_id: &NodeId, index: usize) {
-        let count = self.output_slot_count(node_id);
+    pub fn remove_output_slot(&mut self, path: &NodePath, index: usize) {
+        let count = self.output_slot_count(path);
         if index >= count {
             return;
         }
         // Remove the slot at index
-        self.output_slots.remove(&(*node_id, index));
+        self.output_slots.remove(&(path.clone(), index));
         // Shift slots above index down by 1
         for i in (index + 1)..count {
-            if let Some(slot) = self.output_slots.remove(&(*node_id, i)) {
-                self.output_slots.insert((*node_id, i - 1), slot);
+            if let Some(slot) = self.output_slots.remove(&(path.clone(), i)) {
+                self.output_slots.insert((path.clone(), i - 1), slot);
             }
         }
         // Decrement from_output_slot_index on edges that reference this
         // node's higher-indexed output slots so indices stay aligned.
+        let node_id = path.leaf();
         for edge in self.edges.values_mut() {
-            if edge.from_node_id == *node_id && edge.from_output_slot_index > index {
+            if Some(edge.from_node_id) == node_id && edge.from_output_slot_index > index {
                 edge.from_output_slot_index -= 1;
             }
         }
     }
 
     /// Count input slots for a node.
-    pub fn input_slot_count(&self, node_id: &NodeId) -> usize {
-        self.input_slots
-            .keys()
-            .filter(|(id, _)| id == node_id)
-            .count()
+    pub fn input_slot_count(&self, path: &NodePath) -> usize {
+        self.input_slots.keys().filter(|(p, _)| p == path).count()
     }
 
     /// Count output slots for a node.
-    pub fn output_slot_count(&self, node_id: &NodeId) -> usize {
-        self.output_slots
-            .keys()
-            .filter(|(id, _)| id == node_id)
-            .count()
+    pub fn output_slot_count(&self, path: &NodePath) -> usize {
+        self.output_slots.keys().filter(|(p, _)| p == path).count()
     }
 
     /// Remove a node, its slot states, and all connected edges.
-    pub fn remove_node(&mut self, node_id: &NodeId) -> Option<NodeState> {
+    pub fn remove_node(&mut self, path: &NodePath) -> Option<NodeState> {
+        // Tear down the path_index entry.
+        self.path_index.remove(path);
+
         // Remove all edges involving this node (maintains indexes)
-        self.remove_edges_for_node(node_id);
+        if let Some(node_id) = path.leaf() {
+            self.remove_edges_for_node(&node_id);
+        }
 
         // Remove slot states
-        self.input_slots.retain(|(id, _), _| id != node_id);
-        self.output_slots.retain(|(id, _), _| id != node_id);
+        self.input_slots.retain(|(p, _), _| p != path);
+        self.output_slots.retain(|(p, _), _| p != path);
 
-        self.nodes.remove(node_id)
+        self.nodes.remove(path)
     }
 
     /// Get node state.
-    pub fn get(&self, node_id: &NodeId) -> Option<&NodeState> {
-        self.nodes.get(node_id)
+    pub fn get(&self, path: &NodePath) -> Option<&NodeState> {
+        self.nodes.get(path)
     }
 
     /// Get mutable node state.
-    pub fn get_mut(&mut self, node_id: &NodeId) -> Option<&mut NodeState> {
-        self.nodes.get_mut(node_id)
+    pub fn get_mut(&mut self, path: &NodePath) -> Option<&mut NodeState> {
+        self.nodes.get_mut(path)
     }
 
     /// Get input slot state.
-    pub fn input_slot(&self, node_id: &NodeId, slot_index: usize) -> Option<&InputSlotState> {
-        self.input_slots.get(&(*node_id, slot_index))
+    pub fn input_slot(&self, path: &NodePath, slot_index: usize) -> Option<&InputSlotState> {
+        self.input_slots.get(&(path.clone(), slot_index))
     }
 
     /// Get mutable input slot state.
     pub fn input_slot_mut(
         &mut self,
-        node_id: &NodeId,
+        path: &NodePath,
         slot_index: usize,
     ) -> Option<&mut InputSlotState> {
-        self.input_slots.get_mut(&(*node_id, slot_index))
+        self.input_slots.get_mut(&(path.clone(), slot_index))
     }
 
     /// Get output slot state.
-    pub fn output_slot(&self, node_id: &NodeId, slot_index: usize) -> Option<&OutputSlotState> {
-        self.output_slots.get(&(*node_id, slot_index))
+    pub fn output_slot(&self, path: &NodePath, slot_index: usize) -> Option<&OutputSlotState> {
+        self.output_slots.get(&(path.clone(), slot_index))
     }
 
-    /// Get all node IDs.
-    pub fn node_ids(&self) -> impl Iterator<Item = &NodeId> {
-        self.nodes.keys()
+    /// Get all leaf NodeIds (compatibility helper for callers that only need flat IDs).
+    pub fn node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.keys().filter_map(|p| p.leaf())
     }
 
     /// Add an edge and update lookup indexes.
@@ -482,9 +497,30 @@ impl NodeStates {
         self.changed_nodes.insert(node_id);
     }
 
+    /// Mark all nodes under (and including) `root` as changed.
+    ///
+    /// Uses the `path_index` to walk the subtree so that SubGraph
+    /// descendants are also marked dirty when a parent is re-executed.
+    pub fn mark_all_changed_at(&mut self, root: &NodePath) {
+        let mut stack: Vec<NodePath> = vec![root.clone()];
+        while let Some(p) = stack.pop() {
+            if let Some(node_id) = p.leaf() {
+                if self.nodes.contains_key(&p) {
+                    self.changed_nodes.insert(node_id);
+                }
+            }
+            for child in self.path_index.children_of(&p) {
+                stack.push(p.child(*child));
+            }
+        }
+    }
+
     /// Mark all nodes as changed (forces full re-execution).
+    ///
+    /// Convenience wrapper that calls `mark_all_changed_at` from root,
+    /// covering every node registered in this `NodeStates`.
     pub fn mark_all_changed(&mut self) {
-        self.changed_nodes.extend(self.nodes.keys().copied());
+        self.mark_all_changed_at(&NodePath::root());
     }
 
     /// Drain and return all changed node IDs since last drain.

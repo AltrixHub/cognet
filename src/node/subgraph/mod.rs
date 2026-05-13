@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::{
     Data, DataType, Edge, EdgeId, ExecutionContext, InterfaceDirection, InterfaceNode,
     InterfaceNodeData, NodeCategory, NodeCore, NodeGraph, NodeGraphWrite, NodeId, NodeImpl,
-    NodeManager, NodeMeta, SharedExecutionCache, SharedNodeStates, SlotDef,
+    NodeManager, NodeMeta, NodePath, SharedExecutionCache, SharedNodeStates, SlotDef,
     INTERFACE_NODE_DATA_DOMAIN,
 };
 
@@ -167,7 +167,7 @@ impl SubGraphNode {
         self.internal_graph
             .node_states()
             .read()
-            .map(|ns| ns.input_slot_count(&self.output_proxy_id))
+            .map(|ns| ns.input_slot_count(&NodePath::root().child(self.output_proxy_id)))
             .unwrap_or(0)
     }
 
@@ -191,8 +191,17 @@ impl SubGraphNode {
             .map_err(|e| e.to_string())?;
         // Bidirectional input proxy: 1 input + 1 output per single-port
         // add. Mirrors `add_output`'s shape on the output proxy.
-        ns.add_input_slot(&self.input_proxy_id, label, data_type, Some(1));
-        ns.add_output_slot(&self.input_proxy_id, label, data_type);
+        ns.add_input_slot(
+            &NodePath::root().child(self.input_proxy_id),
+            label,
+            data_type,
+            Some(1),
+        );
+        ns.add_output_slot(
+            &NodePath::root().child(self.input_proxy_id),
+            label,
+            data_type,
+        );
         Ok(())
     }
 
@@ -216,7 +225,11 @@ impl SubGraphNode {
             .write()
             .map_err(|e| e.to_string())?;
         for _ in 0..proxy_count {
-            ns.add_output_slot(&self.input_proxy_id, proxy_label, proxy_data_type);
+            ns.add_output_slot(
+                &NodePath::root().child(self.input_proxy_id),
+                proxy_label,
+                proxy_data_type,
+            );
         }
         Ok(())
     }
@@ -302,7 +315,7 @@ impl SubGraphNode {
 
             // Count edges connected to this external input slot
             let edge_count = parent_ns
-                .input_slot(parent_node_id, slot_idx)
+                .input_slot(&NodePath::root().child(*parent_node_id), slot_idx)
                 .map(|slot_state| parent_ns.edges_for_input(&slot_state.id).len())
                 .unwrap_or(0);
 
@@ -326,15 +339,16 @@ impl SubGraphNode {
                 for i in current_count..edge_count {
                     let insert_idx = proxy_start + i;
                     let new_slot_id = internal_ns.insert_output_slot_at(
-                        &self.input_proxy_id,
+                        &NodePath::root().child(self.input_proxy_id),
                         insert_idx,
                         target.proxy_label,
                         target.proxy_data_type,
                     );
                     // Create internal edge: new proxy output → target node's multi-input slot
-                    if let Some(to_slot) =
-                        internal_ns.input_slot(&target.internal_node_id, target.internal_slot)
-                    {
+                    if let Some(to_slot) = internal_ns.input_slot(
+                        &NodePath::root().child(target.internal_node_id),
+                        target.internal_slot,
+                    ) {
                         let edge_id = EdgeId::new();
                         let edge = Edge {
                             from_node_id: self.input_proxy_id,
@@ -352,8 +366,8 @@ impl SubGraphNode {
                 for _ in edge_count..current_count {
                     let remove_idx = proxy_start + edge_count;
                     // Remove internal edges from this proxy output
-                    if let Some(out_slot) =
-                        internal_ns.output_slot(&self.input_proxy_id, remove_idx)
+                    if let Some(out_slot) = internal_ns
+                        .output_slot(&NodePath::root().child(self.input_proxy_id), remove_idx)
                     {
                         let slot_id = out_slot.id;
                         let outgoing = internal_ns
@@ -368,7 +382,10 @@ impl SubGraphNode {
                             }
                         }
                     }
-                    internal_ns.remove_output_slot(&self.input_proxy_id, remove_idx);
+                    internal_ns.remove_output_slot(
+                        &NodePath::root().child(self.input_proxy_id),
+                        remove_idx,
+                    );
                 }
             }
 
@@ -387,7 +404,8 @@ impl SubGraphNode {
     /// first matching proxy output's external slot index is returned.
     pub fn input_slot_index_by_label(&self, label: &str) -> Option<usize> {
         let ns = self.internal_graph.node_states().read().ok()?;
-        let proxy_count = ns.output_slot_count(&self.input_proxy_id);
+        let input_proxy_path = NodePath::root().child(self.input_proxy_id);
+        let proxy_count = ns.output_slot_count(&input_proxy_path);
         // input_proxy_counts tracks how many proxy outputs each external
         // input maps to. Walk the proxy outputs in order; the slot
         // index in the external view is the input_proxy_counts cursor.
@@ -398,7 +416,7 @@ impl SubGraphNode {
                 if proxy_idx >= proxy_count {
                     return None;
                 }
-                if let Some(slot) = ns.output_slot(&self.input_proxy_id, proxy_idx) {
+                if let Some(slot) = ns.output_slot(&input_proxy_path, proxy_idx) {
                     if slot.label == label {
                         return Some(external_idx);
                     }
@@ -414,9 +432,10 @@ impl SubGraphNode {
     /// internal output proxy's input slots.
     pub fn output_slot_index_by_label(&self, label: &str) -> Option<usize> {
         let ns = self.internal_graph.node_states().read().ok()?;
-        let count = ns.input_slot_count(&self.output_proxy_id);
+        let output_proxy_path = NodePath::root().child(self.output_proxy_id);
+        let count = ns.input_slot_count(&output_proxy_path);
         for i in 0..count {
-            if let Some(slot) = ns.input_slot(&self.output_proxy_id, i) {
+            if let Some(slot) = ns.input_slot(&output_proxy_path, i) {
                 if slot.label == label {
                     return Some(i);
                 }
@@ -462,14 +481,15 @@ impl SubGraphNode {
             .node_states()
             .write()
             .map_err(|e| e.to_string())?;
+        let input_proxy_path = NodePath::root().child(self.input_proxy_id);
         for offset in 0..proxy_count {
-            ns.set_output_slot_label(&self.input_proxy_id, proxy_start + offset, new_label);
+            ns.set_output_slot_label(&input_proxy_path, proxy_start + offset, new_label);
         }
         // Bidirectional single-port adds also carry an input slot at
         // `external_idx`; rename it too. Multi-input ports
         // (`proxy_count > 1`) have no matching input slot.
         if proxy_count == 1 {
-            ns.set_input_slot_label(&self.input_proxy_id, external_idx, new_label);
+            ns.set_input_slot_label(&input_proxy_path, external_idx, new_label);
         }
         Ok(external_idx)
     }
@@ -498,8 +518,9 @@ impl SubGraphNode {
             .node_states()
             .write()
             .map_err(|e| e.to_string())?;
-        ns.set_input_slot_label(&self.output_proxy_id, idx, new_label);
-        ns.set_output_slot_label(&self.output_proxy_id, idx, new_label);
+        let output_proxy_path = NodePath::root().child(self.output_proxy_id);
+        ns.set_input_slot_label(&output_proxy_path, idx, new_label);
+        ns.set_output_slot_label(&output_proxy_path, idx, new_label);
         Ok(idx)
     }
 
@@ -528,11 +549,12 @@ impl SubGraphNode {
             .node_states()
             .write()
             .map_err(|e| e.to_string())?;
+        let input_proxy_path = NodePath::root().child(self.input_proxy_id);
         for _ in 0..proxy_count {
             // Drop edges that consume the proxy output at proxy_start
             // before removing the slot itself.
             let mut edges_to_remove: Vec<EdgeId> = Vec::new();
-            if let Some(slot) = ns.output_slot(&self.input_proxy_id, proxy_start) {
+            if let Some(slot) = ns.output_slot(&input_proxy_path, proxy_start) {
                 let slot_id = slot.id;
                 for (eid, edge) in ns.edges() {
                     if edge.from_output_slot_id == slot_id {
@@ -543,7 +565,7 @@ impl SubGraphNode {
             for eid in edges_to_remove {
                 ns.remove_edge(&eid);
             }
-            ns.remove_output_slot(&self.input_proxy_id, proxy_start);
+            ns.remove_output_slot(&input_proxy_path, proxy_start);
         }
         // Bidirectional single-port adds also carry an input slot on
         // the proxy. Its index is the count of preceding single-port
@@ -554,7 +576,7 @@ impl SubGraphNode {
                 .filter(|c| **c == 1)
                 .count();
             let mut edges_to_remove: Vec<EdgeId> = Vec::new();
-            if let Some(slot) = ns.input_slot(&self.input_proxy_id, input_proxy_idx) {
+            if let Some(slot) = ns.input_slot(&input_proxy_path, input_proxy_idx) {
                 let slot_id = slot.id;
                 for (eid, edge) in ns.edges() {
                     if edge.to_input_slot_id == slot_id {
@@ -565,7 +587,7 @@ impl SubGraphNode {
             for eid in edges_to_remove {
                 ns.remove_edge(&eid);
             }
-            ns.remove_input_slot(&self.input_proxy_id, input_proxy_idx);
+            ns.remove_input_slot(&input_proxy_path, input_proxy_idx);
         }
         drop(ns);
 
@@ -606,8 +628,9 @@ impl SubGraphNode {
         // the output proxy's input slot at `index`, or whose
         // from_output_slot_id is the output proxy's mirror output slot
         // at `index`.
+        let output_proxy_path = NodePath::root().child(self.output_proxy_id);
         let mut edges_to_remove: Vec<EdgeId> = Vec::new();
-        if let Some(in_slot) = ns.input_slot(&self.output_proxy_id, index) {
+        if let Some(in_slot) = ns.input_slot(&output_proxy_path, index) {
             let in_slot_id = in_slot.id;
             for (eid, edge) in ns.edges() {
                 if edge.to_input_slot_id == in_slot_id {
@@ -615,7 +638,7 @@ impl SubGraphNode {
                 }
             }
         }
-        if let Some(out_slot) = ns.output_slot(&self.output_proxy_id, index) {
+        if let Some(out_slot) = ns.output_slot(&output_proxy_path, index) {
             let out_slot_id = out_slot.id;
             for (eid, edge) in ns.edges() {
                 if edge.from_output_slot_id == out_slot_id {
@@ -627,8 +650,8 @@ impl SubGraphNode {
             ns.remove_edge(&eid);
         }
 
-        ns.remove_input_slot(&self.output_proxy_id, index);
-        ns.remove_output_slot(&self.output_proxy_id, index);
+        ns.remove_input_slot(&output_proxy_path, index);
+        ns.remove_output_slot(&output_proxy_path, index);
 
         Ok(())
     }
@@ -646,9 +669,10 @@ impl SubGraphNode {
             .node_states()
             .write()
             .map_err(|e| e.to_string())?;
-        ns.add_input_slot(&self.output_proxy_id, label, data_type, None);
+        let output_proxy_path = NodePath::root().child(self.output_proxy_id);
+        ns.add_input_slot(&output_proxy_path, label, data_type, None);
         // Add the matching mirror output slot at the same index.
-        ns.add_output_slot(&self.output_proxy_id, label, data_type);
+        ns.add_output_slot(&output_proxy_path, label, data_type);
         Ok(())
     }
 
@@ -671,11 +695,13 @@ impl SubGraphNode {
             .read()
             .map_err(|e| e.to_string())?;
         let internal_cache = self.internal_graph.shared_cache();
+        let input_proxy_path = NodePath::root().child(self.input_proxy_id);
 
         let mut proxy_cursor: usize = 0;
+        let parent_node_path = NodePath::root().child(*parent_node_id);
         let input_count = {
             let ns = parent_node_states.read().map_err(|e| e.to_string())?;
-            ns.input_slot_count(parent_node_id)
+            ns.input_slot_count(&parent_node_path)
         };
 
         for idx in 0..input_count {
@@ -686,7 +712,8 @@ impl SubGraphNode {
             let ns = parent_node_states.read().map_err(|e| e.to_string())?;
             let parent_cache_read = parent_cache.read()?;
             let mut data_values = Vec::new();
-            let default_value_ref = if let Some(slot_state) = ns.input_slot(parent_node_id, idx) {
+            let default_value_ref = if let Some(slot_state) = ns.input_slot(&parent_node_path, idx)
+            {
                 for edge_id in ns.edges_for_input(&slot_state.id) {
                     if let Some(edge) = ns.get_edge(edge_id) {
                         if let Some(data) = parent_cache_read.outputs.get(&edge.from_output_slot_id)
@@ -706,7 +733,7 @@ impl SubGraphNode {
                 // Normal 1:1 mapping with default value fallback
                 if let Some(data) = data_values.into_iter().next() {
                     if let Some(proxy_slot) =
-                        internal_ns.output_slot(&self.input_proxy_id, proxy_cursor)
+                        internal_ns.output_slot(&input_proxy_path, proxy_cursor)
                     {
                         let mut cache = internal_cache.lock()?;
                         cache.outputs.insert(proxy_slot.id, data);
@@ -714,7 +741,7 @@ impl SubGraphNode {
                 } else if let Some(default_ref) = default_value_ref {
                     if let Ok(default_data) = Data::from_any(default_ref) {
                         if let Some(proxy_slot) =
-                            internal_ns.output_slot(&self.input_proxy_id, proxy_cursor)
+                            internal_ns.output_slot(&input_proxy_path, proxy_cursor)
                         {
                             let mut cache = internal_cache.lock()?;
                             cache.outputs.insert(proxy_slot.id, default_data);
@@ -726,7 +753,7 @@ impl SubGraphNode {
                 let distribute_count = data_values.len().min(count);
                 for (i, data) in data_values.iter().enumerate().take(distribute_count) {
                     if let Some(proxy_slot) =
-                        internal_ns.output_slot(&self.input_proxy_id, proxy_cursor + i)
+                        internal_ns.output_slot(&input_proxy_path, proxy_cursor + i)
                     {
                         let mut cache = internal_cache.lock()?;
                         cache.outputs.insert(proxy_slot.id, data.share());
@@ -794,16 +821,19 @@ impl SubGraphNode {
             .map_err(|e| e.to_string())?;
         let internal_cache = self.internal_graph.shared_cache();
         let parent_ns = parent_node_states.read().map_err(|e| e.to_string())?;
-        let output_count = parent_ns.output_slot_count(parent_node_id);
+        let parent_node_path = NodePath::root().child(*parent_node_id);
+        let output_count = parent_ns.output_slot_count(&parent_node_path);
 
         for idx in 0..output_count {
-            let parent_output_slot_id = match parent_ns.output_slot(parent_node_id, idx) {
+            let parent_output_slot_id = match parent_ns.output_slot(&parent_node_path, idx) {
                 Some(s) => s.id,
                 None => continue,
             };
 
             // Find edges connected to the output proxy's input slot at this index
-            if let Some(slot_state) = internal_ns.input_slot(&self.output_proxy_id, idx) {
+            if let Some(slot_state) =
+                internal_ns.input_slot(&NodePath::root().child(self.output_proxy_id), idx)
+            {
                 let cache_read = internal_cache.read()?;
                 for edge_id in internal_ns.edges_for_input(&slot_state.id) {
                     if let Some(edge) = internal_ns.get_edge(edge_id) {
@@ -913,8 +943,11 @@ mod tests {
         drop(read);
 
         let ns = graph.node_states().read().expect("NodeStates lock");
-        assert_eq!(ns.input_slot_count(&subgraph_id), 0);
-        assert_eq!(ns.output_slot_count(&subgraph_id), 0);
+        assert_eq!(ns.input_slot_count(&NodePath::root().child(subgraph_id)), 0);
+        assert_eq!(
+            ns.output_slot_count(&NodePath::root().child(subgraph_id)),
+            0
+        );
     }
 
     #[test]
