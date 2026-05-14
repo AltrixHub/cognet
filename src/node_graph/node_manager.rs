@@ -464,7 +464,7 @@ impl NodeManager {
     }
 
     /// Path-aware variant of [`create_node_by_name_with_id`] (plan-007 P007b).
-    pub fn create_node_by_name_with_id_at(
+    pub fn create_node_by_name_at_with_id(
         &self,
         parent_path: &NodePath,
         id: NodeId,
@@ -539,11 +539,6 @@ impl NodeManager {
     /// before invocation — enables recursive factories.
     pub fn graph_factory(&self, name: &str) -> Option<GraphFactory> {
         self.graph_factories.get(name).map(Arc::clone)
-    }
-
-    /// True when `name` has a graph-shaped factory registered.
-    pub fn has_graph_factory(&self, name: &str) -> bool {
-        self.graph_factories.contains_key(name)
     }
 }
 

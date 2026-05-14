@@ -197,8 +197,9 @@ impl NodeGraphSystem for NodeGraph {
 //
 // `create_edge_at` and `connect_nodes_at` accept `NodePath`s directly so
 // callers can wire SubGraph-internal nodes (depth ≥ 2) without resorting
-// to root-wrap workarounds. The root-only `NodeGraphSystem::create_edge`
-// and `NodeGraphWrite::connect_nodes` shapes remain as thin wrappers.
+// to root-wrap workarounds. `NodeGraphWrite::connect_nodes` remains as a
+// thin root-path wrapper; the prior `NodeGraphSystem::create_edge` has been
+// removed (zero callers).
 
 impl NodeGraph {
     /// Construct an `Edge` between two arbitrary `NodePath` endpoints.

@@ -410,7 +410,7 @@ impl NodeGraphWrite for NodeGraph {
     }
 
     fn create_node_by_name_with_id(&mut self, id: NodeId, name: &str) -> Result<NodeId, String> {
-        self.create_node_by_name_with_id_at(&NodePath::root(), id, name)
+        self.create_node_by_name_at_with_id(&NodePath::root(), id, name)
     }
 
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {

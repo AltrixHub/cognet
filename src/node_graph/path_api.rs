@@ -337,7 +337,7 @@ impl NodeGraph {
     /// Create a node by name under `parent_path` using the caller-provided
     /// `id`. Path-aware sibling of
     /// [`NodeGraphWrite::create_node_by_name_with_id`].
-    pub fn create_node_by_name_with_id_at(
+    pub fn create_node_by_name_at_with_id(
         &mut self,
         parent_path: &NodePath,
         id: NodeId,
@@ -345,7 +345,7 @@ impl NodeGraph {
     ) -> Result<NodeId, String> {
         let (_node_id, default_data, type_id) =
             self.node_manager
-                .create_node_by_name_with_id_at(parent_path, id, name)?;
+                .create_node_by_name_at_with_id(parent_path, id, name)?;
         self.register_named_node_in_states(parent_path, id, name, default_data, type_id)?;
         Ok(id)
     }
