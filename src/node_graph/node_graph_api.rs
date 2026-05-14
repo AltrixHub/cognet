@@ -1025,17 +1025,21 @@ impl NodeGraph {
                     }
                 }
 
-                for (edge_id, edge) in ns.edges() {
-                    let Some(from_id) = edge.from_node.leaf() else {
-                        continue;
-                    };
-                    let Some(to_id) = edge.to_node.leaf() else {
-                        continue;
-                    };
-                    if executed_node_paths
-                        .iter()
-                        .any(|p| p.leaf() == Some(from_id))
-                    {
+                // Walk only the edges fanning out from executed paths via
+                // the reverse map, so we avoid an O(N x E) scan over the
+                // full edge set. Mirrors the iteration shape used by
+                // `topological_sort` in `node_graph_system.rs`.
+                for path in executed_node_paths {
+                    for edge_id in ns.outgoing_edges_at(path) {
+                        let Some(edge) = ns.get_edge(edge_id) else {
+                            continue;
+                        };
+                        let Some(from_id) = edge.from_node.leaf() else {
+                            continue;
+                        };
+                        let Some(to_id) = edge.to_node.leaf() else {
+                            continue;
+                        };
                         let data = cache
                             .outputs
                             .get(&edge.from_output_slot_id)
@@ -1147,9 +1151,8 @@ impl NodeGraph {
 
             for (path, res) in level_results {
                 if let Err(msg) = res {
-                    let leaf_id = path.leaf().unwrap_or_default();
+                    self.add_error(GraphError::execution_at_path(&path, msg));
                     failed_paths.insert(path);
-                    self.add_error(GraphError::execution(leaf_id, msg));
                 }
             }
         }
@@ -1267,9 +1270,8 @@ impl NodeGraph {
 
             for (path, res) in &sync_results {
                 if let Err(msg) = res {
-                    let leaf_id = path.leaf().unwrap_or_default();
+                    self.add_error(GraphError::execution_at_path(path, msg.clone()));
                     failed_paths.insert(path.clone());
-                    self.add_error(GraphError::execution(leaf_id, msg.clone()));
                 }
             }
 
@@ -1286,9 +1288,8 @@ impl NodeGraph {
                         let guard = match shared_nodes.lock() {
                             Ok(g) => g,
                             Err(_) => {
-                                let leaf_id = path.leaf().unwrap_or_default();
-                                self.add_error(GraphError::execution(
-                                    leaf_id,
+                                self.add_error(GraphError::execution_at_path(
+                                    &path,
                                     "Lock poisoned".to_string(),
                                 ));
                                 continue;
@@ -1331,9 +1332,8 @@ impl NodeGraph {
                     Ok(()) => on_progress(ExecutionEvent::Completed(path)),
                     Err(msg) => {
                         on_progress(ExecutionEvent::Failed(path.clone(), msg.clone()));
-                        let leaf_id = path.leaf().unwrap_or_default();
+                        self.add_error(GraphError::execution_at_path(&path, msg));
                         failed_paths.insert(path);
-                        self.add_error(GraphError::execution(leaf_id, msg));
                     }
                 }
             }

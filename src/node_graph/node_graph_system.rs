@@ -69,7 +69,12 @@ impl NodeGraphSystem for NodeGraph {
 
             for _ in 0..queue.len() {
                 if let Some(path) = queue.pop_front() {
-                    let neighbors = adj_list.get(&path).cloned().unwrap_or_default();
+                    // `remove` consumes the adjacency entry — each node is
+                    // popped from the queue at most once during topo sort,
+                    // so this is semantically equivalent to `get(..).cloned()`
+                    // while avoiding a per-pop Vec<NodePath> allocation now
+                    // that `NodePath: Clone` is no longer `Copy`.
+                    let neighbors = adj_list.remove(&path).unwrap_or_default();
                     current_level.push(path);
 
                     for neighbor in &neighbors {
