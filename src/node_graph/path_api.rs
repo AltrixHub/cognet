@@ -1,4 +1,4 @@
-//! Path-aware NodeGraph APIs (plan-006 P3c.10).
+//! Path-aware NodeGraph APIs.
 //!
 //! Provides `add_node_at`, `add_subgraph_at`, `remove_node_at`,
 //! `node_at_path`, `children_of_path`, `is_subgraph_node_at_path`,
@@ -488,8 +488,8 @@ impl NodeGraph {
         type_id: Option<TypeId>,
     ) -> Result<(), String> {
         // SubGraphNode external slots are derived from the child
-        // InterfaceNodes (transparent-container architecture,
-        // plan-006 P3c) — no mirroring needed at creation time.
+        // InterfaceNodes (transparent-container architecture) —
+        // no mirroring needed at creation time.
         let (resolved_name, inputs, outputs): (&'static str, &[SlotDef], &[SlotDef]) =
             match crate::get_node_type_info(name) {
                 Some(info) => (info.name, info.inputs, info.outputs),

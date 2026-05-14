@@ -6,7 +6,7 @@
 //! and `sg_path.child(output_proxy_id)` ARE the SubGraph's external
 //! schema — there are no mirrored slots on the SubGraphNode itself.
 //!
-//! plan-006 P3c.10 removed: `internal_graph`, `input_proxy_counts`,
+//! Removed fields: `internal_graph`, `input_proxy_counts`,
 //! `dynamic_input_targets`, `inject_inputs`, `execute_internal_sync`,
 //! `collect_outputs`, `sync_dynamic_inputs`.
 
@@ -20,8 +20,8 @@ use crate::{
 
 /// A transparent containment boundary for a sub-graph of nodes.
 ///
-/// In the transparent-container architecture (plan-006 P3c), the
-/// SubGraphNode holds no execution state of its own. Its children
+/// In the transparent-container architecture, the SubGraphNode holds no
+/// execution state of its own. Its children
 /// (including the two boundary `InterfaceNode`s) live in the parent
 /// `NodeStates` at paths `parent_path.child(sg_id).child(child_id)`.
 /// Execution visits all children directly — the SubGraphNode itself

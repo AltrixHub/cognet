@@ -23,9 +23,9 @@ use crate::{
 /// must NOT clear the changed-node set, so a follow-up `execute_async`
 /// can run the same plan.
 ///
-/// plan-006 P3c: `RequiresAsyncSubgraphSupport` is deleted — with
-/// transparent SubGraphs, every node in the plan executes at the same
-/// level and there is no opaque internal graph to check separately.
+/// `RequiresAsyncSubgraphSupport` is deleted — with transparent SubGraphs,
+/// every node in the plan executes at the same level and there is no opaque
+/// internal graph to check separately.
 #[derive(Debug, Clone)]
 pub enum GraphExecutionError {
     /// The dirty plan contains one or more `AsyncIo` nodes; the sync
@@ -514,7 +514,7 @@ fn node_execution_kind(
 /// Validate that no node in the sync plan requires `AsyncIo` execution.
 ///
 /// Replaces the old `validate_async_subgraphs` + `subgraph_internal_has_async`
-/// pair (plan-006 P3c Step 11.3). With a transparent SubGraph boundary, every
+/// pair. With a transparent SubGraph boundary, every
 /// node in the execution plan is a direct entry — no downcast or internal-graph
 /// recursion needed. This is a flat check over the executed `NodePath` list.
 ///
@@ -885,7 +885,7 @@ impl NodeGraph {
     /// any node in the plan has `NodeExecutionKind::AsyncIo`. The caller can
     /// then switch to `execute_async`.
     ///
-    /// With transparent SubGraphs (plan-006 P3c) every node in the plan
+    /// With transparent SubGraphs, every node in the plan
     /// executes directly — there is no internal-graph recursion to inspect.
     fn validate_for_sync(&self, plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
         let shared_nodes = self.node_manager.nodes();
@@ -894,7 +894,7 @@ impl NodeGraph {
 
     /// Validate that the plan can run on the asynchronous kernel.
     ///
-    /// With transparent SubGraphs (plan-006 P3c) every node in the plan
+    /// With transparent SubGraphs, every node in the plan
     /// executes directly — there is no internal graph to check separately.
     /// The async kernel handles `AsyncIo` nodes natively; no further
     /// validation is needed beyond what `build_execution_plan` already

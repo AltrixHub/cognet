@@ -1,12 +1,12 @@
 //! SubGraph operations: group_nodes and ungroup_node.
 //!
-//! plan-006 P3c.10: Both operations have been removed pending the full
-//! transparent-SubGraph path-aware rewrite (P3c.11+). The old implementations
-//! relied on `SubGraphNode::internal_graph` which is deleted in this phase.
+//! `group_nodes` and `ungroup_node` are not yet implemented under the
+//! transparent-SubGraph architecture. The old implementations relied on
+//! `SubGraphNode::internal_graph` which no longer exists.
 //!
 //! `GroupResult` and `UngroupResult` are kept as public types so call sites
 //! in the modeling example compile; the operations themselves return errors
-//! indicating they are not yet implemented under the new architecture.
+//! indicating they are not yet implemented.
 
 use std::collections::HashSet;
 
@@ -31,28 +31,26 @@ pub struct UngroupResult {
 impl NodeGraph {
     /// Group a set of nodes into a SubGraphNode.
     ///
-    /// **Not yet implemented in P3c.10.** The transparent-SubGraph group
-    /// operation requires path-aware node insertion (P3c.11+).
+    /// **Not yet implemented.** The transparent-SubGraph group
+    /// operation requires path-aware node insertion.
     pub fn group_nodes(
         &mut self,
         _node_ids: &HashSet<NodeId>,
         _label: impl Into<String>,
     ) -> Result<GroupResult, String> {
         Err(
-            "group_nodes is not yet implemented under the transparent-SubGraph \
-             architecture (plan-006 P3c.11)"
+            "group_nodes is not yet implemented under the transparent-SubGraph architecture"
                 .to_string(),
         )
     }
 
     /// Ungroup a SubGraphNode, extracting its internal nodes back into the parent.
     ///
-    /// **Not yet implemented in P3c.10.** The transparent-SubGraph ungroup
-    /// operation requires path-aware node extraction (P3c.11+).
+    /// **Not yet implemented.** The transparent-SubGraph ungroup
+    /// operation requires path-aware node extraction.
     pub fn ungroup_node(&mut self, _subgraph_node_id: NodeId) -> Result<UngroupResult, String> {
         Err(
-            "ungroup_node is not yet implemented under the transparent-SubGraph \
-             architecture (plan-006 P3c.11)"
+            "ungroup_node is not yet implemented under the transparent-SubGraph architecture"
                 .to_string(),
         )
     }

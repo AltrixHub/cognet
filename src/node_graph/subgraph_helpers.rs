@@ -1,4 +1,4 @@
-//! SubGraph convenience methods for NodeGraph (plan-006 P3c).
+//! SubGraph convenience methods for NodeGraph.
 //!
 //! After the transparent-container rework, SubGraph children live in the
 //! parent `NodeStates` at paths `sg_path.child(child_id)`. There is no
@@ -73,7 +73,7 @@ impl NodeGraph {
 
     /// Get all NodeIds of the direct children of this SubGraphNode.
     ///
-    /// In the transparent-container architecture (plan-006 P3c), children
+    /// In the transparent-container architecture, children
     /// live in the parent `NodeStates` at `sg_path.child(child_id)`.
     pub fn subgraph_node_ids(&self, node_id: &NodeId) -> Option<Vec<NodeId>> {
         let sg_path = NodePath::root().child(*node_id);
