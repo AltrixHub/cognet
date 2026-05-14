@@ -202,6 +202,16 @@ impl NodeGraph {
             .and_then(|s| s.data.as_ref().map(|d| d.share()))
     }
 
+    /// Get the data value of a node at the given path. Path-aware sibling of
+    /// [`node_data`](Self::node_data); needed by consumers (e.g. catalog
+    /// populate, interface-bidirectional proxy) that reference depth-2 nodes
+    /// living inside SubGraph templates.
+    pub fn node_data_at_path(&self, path: &NodePath) -> Option<Data> {
+        let ns = self.node_states.read().ok()?;
+        ns.get(path)
+            .and_then(|state| state.data.as_ref().map(|d| d.share()))
+    }
+
     /// Check if a node exists.
     pub fn has_node(&self, node_id: &NodeId) -> bool {
         self.node_states

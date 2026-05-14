@@ -62,24 +62,26 @@ impl std::error::Error for GraphExecutionError {}
 /// it, so a `RequiresAsyncExecution` rejection leaves the graph
 /// re-executable from the same dirty state.
 struct ExecutionPlan {
-    /// Snapshot of nodes that were dirty when the plan was built. The
-    /// executor drains the underlying `NodeStates::changed_nodes` only
-    /// after API validation succeeds.
-    dirty_nodes: HashSet<NodeId>,
+    /// Snapshot of node paths that were dirty when the plan was built.
+    /// The executor drains the underlying `NodeStates::changed_nodes`
+    /// only after API validation succeeds.
+    dirty_nodes: HashSet<NodePath>,
     /// Topologically grouped node levels — same-level nodes have no
     /// data dependencies on each other and may run in parallel.
-    levels: Vec<Vec<NodeId>>,
+    levels: Vec<Vec<NodePath>>,
     /// Flattened executed-node list in topological order, for output
     /// collection.
-    executed_node_ids: Vec<NodeId>,
+    executed_node_paths: Vec<NodePath>,
     /// Removed nodes drained from bookkeeping at plan time (they don't
     /// participate in execution but are reported in `ExecutionResult`).
+    /// Removal bookkeeping is id-keyed (the Remove API takes a
+    /// `NodeId`), so this list stays as `NodeId`.
     removed_nodes: Vec<NodeId>,
 }
 
 impl ExecutionPlan {
     fn is_empty(&self) -> bool {
-        self.executed_node_ids.is_empty()
+        self.executed_node_paths.is_empty()
     }
 }
 
@@ -87,11 +89,11 @@ impl ExecutionPlan {
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
     /// Node execution started.
-    Started(NodeId),
+    Started(NodePath),
     /// Node execution completed successfully.
-    Completed(NodeId),
+    Completed(NodePath),
     /// Node execution failed with an error.
-    Failed(NodeId, String),
+    Failed(NodePath, String),
 }
 
 /// Execution scheduling mode for `NodeGraph::execute_sync_with_mode`.
@@ -112,18 +114,11 @@ pub enum ExecutionMode {
     Parallel,
 }
 
-/// Output from a single node execution.
-#[derive(Debug, Clone)]
-pub struct NodeOutput {
-    /// The node that produced this output.
-    pub node_id: NodeId,
-    /// Output slot index.
-    pub slot_index: usize,
-    /// The output data (Arc-shared with ExecutionCache for zero-copy).
-    pub data: Data,
-}
-
 /// Value flowing through an edge after execution.
+///
+/// plan-007 keeps `from_node` / `to_node` as `NodeId` for now — the
+/// edge-value scope is intentionally out of the path migration; the
+/// executor wraps depth via `.leaf()` at the single collection site.
 #[derive(Debug, Clone)]
 pub struct EdgeValue {
     pub from_node: NodeId,
@@ -141,20 +136,19 @@ pub struct NodeError {
 
 /// Result of a graph execution.
 ///
-/// Contains all outputs from nodes that were (re)computed, edge values,
-/// execution errors, and removed nodes.
+/// Contains all node outputs keyed by `NodePath`, edge values, execution
+/// errors keyed by `NodePath`, and removed nodes (still id-keyed —
+/// removal bookkeeping is `NodeId`-driven).
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionResult {
     /// Outputs from nodes computed in this execution (new + updated).
-    pub node_outputs: HashMap<NodeId, Vec<Option<Data>>>,
+    pub node_outputs: HashMap<NodePath, Vec<Option<Data>>>,
     /// Values flowing through edges after execution.
     pub edge_values: HashMap<EdgeId, EdgeValue>,
-    /// Execution errors per node.
-    pub errors: HashMap<NodeId, NodeError>,
+    /// Execution errors per node path.
+    pub errors: HashMap<NodePath, NodeError>,
     /// Nodes removed since the last execute() call.
     pub removed_nodes: Vec<NodeId>,
-    /// Raw outputs for backward compatibility during migration.
-    pub outputs: Vec<NodeOutput>,
 }
 
 impl ExecutionResult {
@@ -165,7 +159,7 @@ impl ExecutionResult {
 
     /// Check if there are no changes.
     pub fn is_empty(&self) -> bool {
-        self.outputs.is_empty() && self.removed_nodes.is_empty()
+        self.node_outputs.is_empty() && self.removed_nodes.is_empty()
     }
 }
 
@@ -178,7 +172,7 @@ pub type GraphChanges = ExecutionResult;
 /// using NodeStates for edge topology and ExecutionCache for output values.
 /// Captures node_data and creates an OutputWriter for the node's output slots.
 fn build_execution_context(
-    node_id: &NodeId,
+    path: &NodePath,
     node_states: &SharedNodeStates,
     cache: &SharedExecutionCache,
 ) -> Result<ExecutionContext, String> {
@@ -186,12 +180,11 @@ fn build_execution_context(
     let cache_read = cache.read()?;
 
     // Resolve input values from NodeStates slot metadata
-    let path = NodePath::root().child(*node_id);
-    let input_count = ns.input_slot_count(&path);
+    let input_count = ns.input_slot_count(path);
     let input_values = (0..input_count)
         .map(|idx| {
             let mut values = Vec::new();
-            if let Some(slot_state) = ns.input_slot(&path, idx) {
+            if let Some(slot_state) = ns.input_slot(path, idx) {
                 for edge_id in ns.edges_for_input(&slot_state.id) {
                     if let Some(edge) = ns.get_edge(edge_id) {
                         if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
@@ -214,13 +207,13 @@ fn build_execution_context(
 
     // Capture node data from NodeStates
     let node_data = ns
-        .get(&path)
+        .get(path)
         .and_then(|state| state.data.as_ref().map(|d| d.share()));
 
     // Build output writer from NodeStates output slot metadata
-    let output_count = ns.output_slot_count(&path);
+    let output_count = ns.output_slot_count(path);
     let slots = (0..output_count)
-        .filter_map(|idx| ns.output_slot(&path, idx).map(|s| (s.id, s.data_type)))
+        .filter_map(|idx| ns.output_slot(path, idx).map(|s| (s.id, s.data_type)))
         .collect();
     let output_writer = OutputWriter::new(cache.share(), slots);
 
@@ -615,18 +608,14 @@ impl NodeGraphWrite for NodeGraph {
     }
 }
 
-/// Look up a node's execution kind (`SyncCpu` / `AsyncIo`) by `NodeId`.
-///
-/// The planner is still NodeId-based at this sub-phase (P3c.10); the
-/// executor resolves through `NodePath::root().child(node_id)` internally.
+/// Look up a node's execution kind (`SyncCpu` / `AsyncIo`) by `NodePath`.
 fn node_execution_kind(
-    node_id: &NodeId,
+    path: &NodePath,
     shared_nodes: &crate::SharedNodes,
 ) -> Option<NodeExecutionKind> {
-    let path = NodePath::root().child(*node_id);
     let entity = {
         let guard = shared_nodes.lock().ok()?;
-        guard.get(&path).map(Arc::clone)?
+        guard.get(path).map(Arc::clone)?
     };
     let read = match entity.read() {
         Ok(r) => r,
@@ -640,19 +629,23 @@ fn node_execution_kind(
 /// Replaces the old `validate_async_subgraphs` + `subgraph_internal_has_async`
 /// pair (plan-006 P3c Step 11.3). With a transparent SubGraph boundary, every
 /// node in the execution plan is a direct entry — no downcast or internal-graph
-/// recursion needed. This is a flat check over the executed NodeId list.
+/// recursion needed. This is a flat check over the executed `NodePath` list.
+///
+/// The `RequiresAsyncExecution` error variant still reports `Vec<NodeId>` so
+/// it stays compatible with id-keyed callers; depth-2 async nodes are
+/// projected via `.leaf()` at the error boundary.
 fn validate_async_in_sync_plan(
-    executed_ids: &[NodeId],
+    executed_paths: &[NodePath],
     shared_nodes: &crate::SharedNodes,
 ) -> Result<(), GraphExecutionError> {
-    let async_nodes: Vec<NodeId> = executed_ids
+    let async_nodes: Vec<NodeId> = executed_paths
         .iter()
-        .filter(|id| {
-            node_execution_kind(id, shared_nodes)
+        .filter(|path| {
+            node_execution_kind(path, shared_nodes)
                 .map(|k| k == NodeExecutionKind::AsyncIo)
                 .unwrap_or(false)
         })
-        .copied()
+        .filter_map(|path| path.leaf())
         .collect();
     if async_nodes.is_empty() {
         Ok(())
@@ -675,30 +668,32 @@ fn validate_async_in_sync_plan(
 /// Wraps execution in `catch_unwind` so a single node panic does not abort
 /// the surrounding rayon level.
 fn execute_node_sync(
-    node_id: NodeId,
+    path: NodePath,
     shared_nodes: &crate::SharedNodes,
     shared_cache: &SharedExecutionCache,
     shared_node_states: &SharedNodeStates,
     on_progress: &(dyn Fn(ExecutionEvent) + Send + Sync),
-) -> (NodeId, Result<(), String>) {
-    on_progress(ExecutionEvent::Started(node_id));
+) -> (NodePath, Result<(), String>) {
+    on_progress(ExecutionEvent::Started(path.clone()));
 
     let result: Result<(), String> = {
-        let path = NodePath::root().child(node_id);
         let entity = {
             let nodes_guard = match shared_nodes.lock() {
                 Ok(g) => g,
                 Err(_) => {
-                    on_progress(ExecutionEvent::Failed(node_id, "Lock poisoned".to_string()));
-                    return (node_id, Err("Lock poisoned".to_string()));
+                    on_progress(ExecutionEvent::Failed(
+                        path.clone(),
+                        "Lock poisoned".to_string(),
+                    ));
+                    return (path, Err("Lock poisoned".to_string()));
                 }
             };
             nodes_guard.get(&path).map(Arc::clone)
         };
 
         let Some(node_entity) = entity else {
-            on_progress(ExecutionEvent::Completed(node_id));
-            return (node_id, Ok(()));
+            on_progress(ExecutionEvent::Completed(path.clone()));
+            return (path, Ok(()));
         };
 
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -706,7 +701,7 @@ fn execute_node_sync(
                 Ok(r) => r,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            match build_execution_context(&node_id, shared_node_states, shared_cache) {
+            match build_execution_context(&path, shared_node_states, shared_cache) {
                 Ok(ctx) => node_read.execute_sync(ctx),
                 Err(e) => Err(e),
             }
@@ -730,11 +725,11 @@ fn execute_node_sync(
     };
 
     match &result {
-        Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
-        Err(msg) => on_progress(ExecutionEvent::Failed(node_id, msg.clone())),
+        Ok(()) => on_progress(ExecutionEvent::Completed(path.clone())),
+        Err(msg) => on_progress(ExecutionEvent::Failed(path.clone(), msg.clone())),
     }
 
-    (node_id, result)
+    (path, result)
 }
 
 impl NodeGraph {
@@ -901,29 +896,24 @@ impl NodeGraph {
             return Ok(ExecutionPlan {
                 dirty_nodes: HashSet::new(),
                 levels: Vec::new(),
-                executed_node_ids: Vec::new(),
+                executed_node_paths: Vec::new(),
                 removed_nodes: removed,
             });
         }
 
-        let dirty_nodes: HashSet<NodeId> = {
+        let dirty_nodes: HashSet<NodePath> = {
             let ns = self
                 .node_states
                 .read()
                 .map_err(|e| GraphExecutionError::PlanningFailed(e.to_string()))?;
-            let mut affected = HashSet::new();
-            // Convert NodePaths from changed set to NodeIds for propagation.
-            let mut queue: VecDeque<NodeId> =
-                changed.into_iter().filter_map(|p| p.leaf()).collect();
-            while let Some(node_id) = queue.pop_front() {
-                if affected.insert(node_id) {
-                    let path = NodePath::root().child(node_id);
+            let mut affected: HashSet<NodePath> = HashSet::new();
+            let mut queue: VecDeque<NodePath> = changed.into_iter().collect();
+            while let Some(path) = queue.pop_front() {
+                if affected.insert(path.clone()) {
                     for edge_id in ns.outgoing_edges_at(&path) {
                         if let Some(edge) = ns.get_edge(edge_id) {
-                            if let Some(to_id) = edge.to_node.leaf() {
-                                if !affected.contains(&to_id) {
-                                    queue.push_back(to_id);
-                                }
+                            if !affected.contains(&edge.to_node) {
+                                queue.push_back(edge.to_node.clone());
                             }
                         }
                     }
@@ -936,15 +926,15 @@ impl NodeGraph {
             .topological_sort(&dirty_nodes)
             .map_err(GraphExecutionError::PlanningFailed)?;
 
-        let executed_node_ids: Vec<NodeId> = levels
+        let executed_node_paths: Vec<NodePath> = levels
             .iter()
-            .flat_map(|level| level.iter().copied())
+            .flat_map(|level| level.iter().cloned())
             .collect();
 
         Ok(ExecutionPlan {
             dirty_nodes,
             levels,
-            executed_node_ids,
+            executed_node_paths,
             removed_nodes: removed,
         })
     }
@@ -959,7 +949,7 @@ impl NodeGraph {
     /// executes directly — there is no internal-graph recursion to inspect.
     fn validate_for_sync(&self, plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
         let shared_nodes = self.node_manager.nodes();
-        validate_async_in_sync_plan(&plan.executed_node_ids, &shared_nodes)
+        validate_async_in_sync_plan(&plan.executed_node_paths, &shared_nodes)
     }
 
     /// Validate that the plan can run on the asynchronous kernel.
@@ -999,36 +989,29 @@ impl NodeGraph {
     fn collect_outputs(&self, plan: &ExecutionPlan) -> ExecutionResult {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
-        let executed_node_ids = &plan.executed_node_ids;
+        let executed_node_paths = &plan.executed_node_paths;
 
-        let mut outputs = Vec::new();
-        let mut node_outputs: HashMap<NodeId, Vec<Option<Data>>> = HashMap::new();
+        let mut node_outputs: HashMap<NodePath, Vec<Option<Data>>> = HashMap::new();
         let mut edge_values: HashMap<EdgeId, EdgeValue> = HashMap::new();
 
         if let Ok(ns) = shared_node_states.read() {
             if let Ok(cache) = shared_cache.read() {
-                for node_id in executed_node_ids {
-                    let node_path = NodePath::root().child(*node_id);
-                    let output_count = ns.output_slot_count(&node_path);
+                for node_path in executed_node_paths {
+                    let output_count = ns.output_slot_count(node_path);
                     let mut slot_outputs = vec![None; output_count];
                     for (idx, slot_out) in slot_outputs.iter_mut().enumerate() {
-                        if let Some(slot) = ns.output_slot(&node_path, idx) {
+                        if let Some(slot) = ns.output_slot(node_path, idx) {
                             if let Some(data) = cache.outputs.get(&slot.id) {
                                 *slot_out = Some(data.share());
-                                outputs.push(NodeOutput {
-                                    node_id: *node_id,
-                                    slot_index: idx,
-                                    data: data.share(),
-                                });
                             }
                         }
                     }
 
                     if output_count == 0 {
-                        let input_count = ns.input_slot_count(&node_path);
+                        let input_count = ns.input_slot_count(node_path);
                         let mut slot_inputs = vec![None; input_count];
                         for edge in ns.edges().values() {
-                            if edge.to_node.leaf().as_ref() == Some(node_id)
+                            if edge.to_node == *node_path
                                 && (edge.to_input_slot_index) < slot_inputs.len()
                             {
                                 if let Some(data) = cache.outputs.get(&edge.from_output_slot_id) {
@@ -1036,9 +1019,9 @@ impl NodeGraph {
                                 }
                             }
                         }
-                        node_outputs.insert(*node_id, slot_inputs);
+                        node_outputs.insert(node_path.clone(), slot_inputs);
                     } else {
-                        node_outputs.insert(*node_id, slot_outputs);
+                        node_outputs.insert(node_path.clone(), slot_outputs);
                     }
                 }
 
@@ -1049,7 +1032,10 @@ impl NodeGraph {
                     let Some(to_id) = edge.to_node.leaf() else {
                         continue;
                     };
-                    if executed_node_ids.contains(&from_id) {
+                    if executed_node_paths
+                        .iter()
+                        .any(|p| p.leaf() == Some(from_id))
+                    {
                         let data = cache
                             .outputs
                             .get(&edge.from_output_slot_id)
@@ -1069,13 +1055,14 @@ impl NodeGraph {
             }
         }
 
-        let mut errors: HashMap<NodeId, NodeError> = HashMap::new();
+        let mut errors: HashMap<NodePath, NodeError> = HashMap::new();
         let all_errors = self.errors();
         for (target, err) in &all_errors {
             if let ErrorTarget::Node(node_id) = target {
                 if err.is_execution_error() {
+                    // plan-007: ErrorTarget migration TBD
                     errors.insert(
-                        *node_id,
+                        NodePath::root().child(*node_id),
                         NodeError {
                             message: err.message(),
                         },
@@ -1089,7 +1076,6 @@ impl NodeGraph {
             edge_values,
             errors,
             removed_nodes: plan.removed_nodes.clone(),
-            outputs,
         }
     }
 
@@ -1129,15 +1115,15 @@ impl NodeGraph {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
 
-        let mut failed_ids: HashSet<NodeId> = HashSet::new();
+        let mut failed_paths: HashSet<NodePath> = HashSet::new();
         for level_nodes in &plan.levels {
-            let level_vec: Vec<NodeId> = level_nodes.clone();
-            let level_results: Vec<(NodeId, Result<(), String>)> = match mode {
+            let level_vec: Vec<NodePath> = level_nodes.clone();
+            let level_results: Vec<(NodePath, Result<(), String>)> = match mode {
                 ExecutionMode::Sequential => level_vec
                     .into_iter()
-                    .map(|node_id| {
+                    .map(|path| {
                         execute_node_sync(
-                            node_id,
+                            path,
                             &shared_nodes,
                             &shared_cache,
                             &shared_node_states,
@@ -1147,9 +1133,9 @@ impl NodeGraph {
                     .collect(),
                 ExecutionMode::Parallel => level_vec
                     .into_par_iter()
-                    .map(|node_id| {
+                    .map(|path| {
                         execute_node_sync(
-                            node_id,
+                            path,
                             &shared_nodes,
                             &shared_cache,
                             &shared_node_states,
@@ -1159,10 +1145,11 @@ impl NodeGraph {
                     .collect(),
             };
 
-            for (node_id, res) in level_results {
+            for (path, res) in level_results {
                 if let Err(msg) = res {
-                    failed_ids.insert(node_id);
-                    self.add_error(GraphError::execution(node_id, msg));
+                    let leaf_id = path.leaf().unwrap_or_default();
+                    failed_paths.insert(path);
+                    self.add_error(GraphError::execution(leaf_id, msg));
                 }
             }
         }
@@ -1171,23 +1158,19 @@ impl NodeGraph {
         // dirty state for a later retry. Re-mark every failed node as
         // changed so the next `execute_*` call replans from the same
         // failure point. Successful nodes stay clean.
-        self.restore_dirty_for_failed(failed_ids);
+        self.restore_dirty_for_failed(failed_paths);
 
         Ok(self.collect_outputs(&plan))
     }
 
-    /// Re-mark `failed_ids` as changed in `NodeStates`. Idempotent if
+    /// Re-mark `failed_paths` as changed in `NodeStates`. Idempotent if
     /// the set is empty. Logs but does not propagate a poisoned-lock
     /// error — the executor has already finished, so the worst case is
     /// that a future caller sees a slightly stale dirty set.
-    fn restore_dirty_for_failed(&self, failed_ids: HashSet<NodeId>) {
-        if failed_ids.is_empty() {
+    fn restore_dirty_for_failed(&self, failed_paths: HashSet<NodePath>) {
+        if failed_paths.is_empty() {
             return;
         }
-        let failed_paths: HashSet<NodePath> = failed_ids
-            .into_iter()
-            .map(|id| NodePath::root().child(id))
-            .collect();
         match self.node_states.write() {
             Ok(mut ns) => ns.restore_changed_nodes(failed_paths),
             Err(e) => tracing::warn!(
@@ -1236,17 +1219,17 @@ impl NodeGraph {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
 
-        let mut failed_ids: HashSet<NodeId> = HashSet::new();
+        let mut failed_paths: HashSet<NodePath> = HashSet::new();
         for level_nodes in &plan.levels {
             // Partition dirty level into Sync/Async by execution_kind.
-            let mut sync_ids: Vec<NodeId> = Vec::new();
-            let mut async_ids: Vec<NodeId> = Vec::new();
-            for &id in level_nodes {
-                match node_execution_kind(&id, &shared_nodes) {
-                    Some(NodeExecutionKind::AsyncIo) => async_ids.push(id),
+            let mut sync_paths: Vec<NodePath> = Vec::new();
+            let mut async_paths: Vec<NodePath> = Vec::new();
+            for path in level_nodes {
+                match node_execution_kind(path, &shared_nodes) {
+                    Some(NodeExecutionKind::AsyncIo) => async_paths.push(path.clone()),
                     // Missing entity falls through to the sync path —
                     // execute_node_sync records a per-node error.
-                    _ => sync_ids.push(id),
+                    _ => sync_paths.push(path.clone()),
                 }
             }
 
@@ -1255,12 +1238,12 @@ impl NodeGraph {
             // caller's runtime can offload via `spawn_blocking` if it
             // dislikes that — the plan-14c invariant is only that the
             // graph executor itself never calls `block_on`.
-            let sync_results: Vec<(NodeId, Result<(), String>)> = match mode {
-                ExecutionMode::Sequential => sync_ids
+            let sync_results: Vec<(NodePath, Result<(), String>)> = match mode {
+                ExecutionMode::Sequential => sync_paths
                     .into_iter()
-                    .map(|node_id| {
+                    .map(|path| {
                         execute_node_sync(
-                            node_id,
+                            path,
                             &shared_nodes,
                             &shared_cache,
                             &shared_node_states,
@@ -1268,11 +1251,11 @@ impl NodeGraph {
                         )
                     })
                     .collect(),
-                ExecutionMode::Parallel => sync_ids
+                ExecutionMode::Parallel => sync_paths
                     .into_par_iter()
-                    .map(|node_id| {
+                    .map(|path| {
                         execute_node_sync(
-                            node_id,
+                            path,
                             &shared_nodes,
                             &shared_cache,
                             &shared_node_states,
@@ -1282,10 +1265,11 @@ impl NodeGraph {
                     .collect(),
             };
 
-            for (node_id, res) in &sync_results {
+            for (path, res) in &sync_results {
                 if let Err(msg) = res {
-                    failed_ids.insert(*node_id);
-                    self.add_error(GraphError::execution(*node_id, msg.clone()));
+                    let leaf_id = path.leaf().unwrap_or_default();
+                    failed_paths.insert(path.clone());
+                    self.add_error(GraphError::execution(leaf_id, msg.clone()));
                 }
             }
 
@@ -1293,23 +1277,24 @@ impl NodeGraph {
             // lock, drop the lock, then await all futures concurrently.
             // The lock-across-await invariant from plan-14c §Locking
             // Rule lives here.
-            let mut async_futs = Vec::with_capacity(async_ids.len());
-            for node_id in async_ids {
-                on_progress(ExecutionEvent::Started(node_id));
+            let mut async_futs = Vec::with_capacity(async_paths.len());
+            for path in async_paths {
+                on_progress(ExecutionEvent::Started(path.clone()));
 
                 let prep_result: Result<BoxNodeFuture, String> = {
                     let entity = {
                         let guard = match shared_nodes.lock() {
                             Ok(g) => g,
                             Err(_) => {
+                                let leaf_id = path.leaf().unwrap_or_default();
                                 self.add_error(GraphError::execution(
-                                    node_id,
+                                    leaf_id,
                                     "Lock poisoned".to_string(),
                                 ));
                                 continue;
                             }
                         };
-                        guard.get(&NodePath::root().child(node_id)).map(Arc::clone)
+                        guard.get(&path).map(Arc::clone)
                     };
                     match entity {
                         None => Err("node entity missing".to_string()),
@@ -1322,11 +1307,8 @@ impl NodeGraph {
                             // the end of this match arm — strictly BEFORE
                             // we await the prepared future, which is the
                             // plan-14c lock-across-await invariant.
-                            match build_execution_context(
-                                &node_id,
-                                &shared_node_states,
-                                &shared_cache,
-                            ) {
+                            match build_execution_context(&path, &shared_node_states, &shared_cache)
+                            {
                                 Ok(ctx) => read.prepare_async(ctx),
                                 Err(e) => Err(e),
                             }
@@ -1336,21 +1318,22 @@ impl NodeGraph {
 
                 async_futs.push(async move {
                     match prep_result {
-                        Ok(fut) => (node_id, fut.await),
-                        Err(e) => (node_id, Err(e)),
+                        Ok(fut) => (path, fut.await),
+                        Err(e) => (path, Err(e)),
                     }
                 });
             }
 
             let async_results = futures::future::join_all(async_futs).await;
 
-            for (node_id, res) in async_results {
+            for (path, res) in async_results {
                 match res {
-                    Ok(()) => on_progress(ExecutionEvent::Completed(node_id)),
+                    Ok(()) => on_progress(ExecutionEvent::Completed(path)),
                     Err(msg) => {
-                        on_progress(ExecutionEvent::Failed(node_id, msg.clone()));
-                        failed_ids.insert(node_id);
-                        self.add_error(GraphError::execution(node_id, msg));
+                        on_progress(ExecutionEvent::Failed(path.clone(), msg.clone()));
+                        let leaf_id = path.leaf().unwrap_or_default();
+                        failed_paths.insert(path);
+                        self.add_error(GraphError::execution(leaf_id, msg));
                     }
                 }
             }
@@ -1358,7 +1341,7 @@ impl NodeGraph {
 
         // Per plan-14c §Dirty-State Rule: AsyncIo failures (transient
         // remote errors etc.) must leave the dirty plan re-runnable.
-        self.restore_dirty_for_failed(failed_ids);
+        self.restore_dirty_for_failed(failed_paths);
 
         Ok(self.collect_outputs(&plan))
     }
@@ -1393,7 +1376,7 @@ mod sync_executor_tests {
     fn output_for(result: &ExecutionResult, node_id: NodeId) -> f64 {
         result
             .node_outputs
-            .get(&node_id)
+            .get(&NodePath::root().child(node_id))
             .and_then(|slots| slots.first().cloned().flatten())
             .and_then(|d| d.value::<f64>().ok().copied())
             .expect("node output present")
@@ -1756,14 +1739,15 @@ mod sync_executor_tests {
             .execute_async()
             .await
             .expect("execute_async itself does not fail on per-node errors");
+        let flaky_path = NodePath::root().child(flaky_id);
         assert!(
-            r1.errors.contains_key(&flaky_id),
+            r1.errors.contains_key(&flaky_path),
             "first run records per-node failure"
         );
         // Output absent because the node didn't write its value.
         assert!(r1
             .node_outputs
-            .get(&flaky_id)
+            .get(&flaky_path)
             .and_then(|s| s.first().cloned().flatten())
             .is_none());
 
@@ -1771,7 +1755,7 @@ mod sync_executor_tests {
         // failed node is in the dirty plan again.
         let r2 = graph.execute_async().await.expect("retry succeeds");
         assert!(
-            !r2.errors.contains_key(&flaky_id),
+            !r2.errors.contains_key(&flaky_path),
             "retry produces no error"
         );
         assert_eq!(output_for(&r2, flaky_id), 123.0);
@@ -1793,10 +1777,11 @@ mod sync_executor_tests {
         let r1 = graph
             .execute_sync()
             .expect("graph-level Ok despite per-node err");
-        assert!(r1.errors.contains_key(&id));
+        let path = NodePath::root().child(id);
+        assert!(r1.errors.contains_key(&path));
 
         let r2 = graph.execute_sync().expect("retry succeeds");
-        assert!(!r2.errors.contains_key(&id));
+        assert!(!r2.errors.contains_key(&path));
         assert_eq!(output_for(&r2, id), 7.0);
     }
 

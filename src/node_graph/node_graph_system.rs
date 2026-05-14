@@ -2,7 +2,12 @@ use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodeId, NodePath};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
-    fn topological_sort(&self, target_nodes: &HashSet<NodeId>) -> Result<Vec<Vec<NodeId>>, String>;
+    /// Topologically sort `target_paths`, returning levels of paths
+    /// whose elements share no data dependencies on each other.
+    fn topological_sort(
+        &self,
+        target_paths: &HashSet<NodePath>,
+    ) -> Result<Vec<Vec<NodePath>>, String>;
 
     /// Build an `Edge` value from node IDs and slot indices.
     ///
@@ -21,42 +26,40 @@ pub(crate) trait NodeGraphSystem {
 }
 
 impl NodeGraphSystem for NodeGraph {
-    fn topological_sort(&self, target_nodes: &HashSet<NodeId>) -> Result<Vec<Vec<NodeId>>, String> {
-        let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
-        let mut adj_list: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    fn topological_sort(
+        &self,
+        target_paths: &HashSet<NodePath>,
+    ) -> Result<Vec<Vec<NodePath>>, String> {
+        let mut in_degree: HashMap<NodePath, usize> = HashMap::new();
+        let mut adj_list: HashMap<NodePath, Vec<NodePath>> = HashMap::new();
 
-        for &node_id in target_nodes {
-            in_degree.insert(node_id, 0);
-            adj_list.insert(node_id, Vec::new());
+        for path in target_paths {
+            in_degree.insert(path.clone(), 0);
+            adj_list.insert(path.clone(), Vec::new());
         }
 
         let ns = self.node_states.read().map_err(|e| e.to_string())?;
-        for &node_id in target_nodes {
-            for edge_id in ns.outgoing_edges_at(&NodePath::root().child(node_id)) {
+        for target_path in target_paths {
+            for edge_id in ns.outgoing_edges_at(target_path) {
                 if let Some(edge) = ns.get_edge(edge_id) {
-                    // Planner is still NodeId-based (P3c.12 will migrate it
-                    // to NodePath). Extract the leaf ID from the path for now.
-                    let Some(to_id) = edge.to_node.leaf() else {
-                        continue;
-                    };
-                    let Some(from_id) = edge.from_node.leaf() else {
-                        continue;
-                    };
-                    if target_nodes.contains(&to_id) {
+                    if target_paths.contains(&edge.to_node) {
                         in_degree
-                            .entry(to_id)
+                            .entry(edge.to_node.clone())
                             .and_modify(|count| *count += 1)
                             .or_insert(1);
-                        adj_list.entry(from_id).or_default().push(to_id);
+                        adj_list
+                            .entry(edge.from_node.clone())
+                            .or_default()
+                            .push(edge.to_node.clone());
                     }
                 }
             }
         }
 
-        let mut queue: VecDeque<NodeId> = in_degree
+        let mut queue: VecDeque<NodePath> = in_degree
             .iter()
             .filter(|&(_, &deg)| deg == 0)
-            .map(|(node_id, _)| *node_id)
+            .map(|(path, _)| path.clone())
             .collect();
 
         let mut sorted = Vec::new();
@@ -65,16 +68,15 @@ impl NodeGraphSystem for NodeGraph {
             let mut current_level = Vec::new();
 
             for _ in 0..queue.len() {
-                if let Some(node_id) = queue.pop_front() {
-                    current_level.push(node_id);
+                if let Some(path) = queue.pop_front() {
+                    let neighbors = adj_list.get(&path).cloned().unwrap_or_default();
+                    current_level.push(path);
 
-                    if let Some(neighbors) = adj_list.get(&node_id) {
-                        for neighbor in neighbors {
-                            if let Some(deg) = in_degree.get_mut(neighbor) {
-                                *deg -= 1;
-                                if *deg == 0 {
-                                    queue.push_back(*neighbor);
-                                }
+                    for neighbor in &neighbors {
+                        if let Some(deg) = in_degree.get_mut(neighbor) {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                queue.push_back(neighbor.clone());
                             }
                         }
                     }
@@ -85,7 +87,7 @@ impl NodeGraphSystem for NodeGraph {
         }
 
         let total_count: usize = sorted.iter().map(|level| level.len()).sum();
-        if total_count != target_nodes.len() {
+        if total_count != target_paths.len() {
             return Err("Graph contains a cycle.".to_string());
         }
 
