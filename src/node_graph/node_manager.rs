@@ -13,6 +13,28 @@ impl<T: NodeImpl + NodeCore> Node for T {}
 pub type NodeEntity = Arc<RwLock<dyn Node>>;
 type NodeFactory = Arc<dyn Fn() -> Result<NodeEntity, String> + Send + Sync>;
 
+/// Graph-shaped factory: a closure that materialises a composite of
+/// nodes + edges under `parent_path` on `NodeGraph`, optionally taking
+/// a caller-provided `NodeId` hint (e.g. when the caller already
+/// reserved an id for the top node of the composite).
+///
+/// Distinct from [`NodeFactory`] (single-node, returns one
+/// `NodeEntity`): a `GraphFactory` drives the graph itself, so it
+/// receives `&mut NodeGraph` and may invoke other path-aware APIs
+/// (including nested `GraphFactory` calls). Implementations must not
+/// hold any internal lock across the closure boundary — the
+/// dispatcher in [`NodeGraph::create_graph_by_name_at`] clones the
+/// `Arc` and drops its borrow before invocation so nested factories
+/// work naturally.
+///
+/// Returns the `NodeId` of the composite's root entity at
+/// `parent_path.child(returned_id)`.
+pub type GraphFactory = Arc<
+    dyn Fn(&mut crate::NodeGraph, &NodePath, Option<NodeId>) -> Result<NodeId, String>
+        + Send
+        + Sync,
+>;
+
 /// Factory with metadata for name-based node creation.
 pub struct NodeFactoryWithMeta {
     /// The factory function to create the node.
@@ -68,6 +90,12 @@ pub struct NodeManager {
     /// [`restore_factory_registration`] can find a previously-leaked
     /// key after the corresponding `name_registry` entry was removed.
     leaked_names: HashMap<String, &'static str>,
+    /// Graph-shaped factory registry (plan-007 P007b). Owns-string
+    /// keyed; separate from [`name_registry`] which dispenses single
+    /// `NodeEntity` values. Stored as `Arc<dyn Fn>` so the dispatcher
+    /// can clone the handle and release its borrow before invocation
+    /// (enables recursive graph factories).
+    graph_factories: HashMap<String, GraphFactory>,
 }
 
 pub type NodeRegistrationFn = fn(&mut NodeManager) -> Result<(), String>;
@@ -411,6 +439,50 @@ impl NodeManager {
         Ok((id, default_data, type_id))
     }
 
+    /// Path-aware variant of [`create_node_by_name`] (plan-007 P007b).
+    ///
+    /// Same as `create_node_by_name` but inserts the freshly-built node
+    /// entity under `parent_path.child(node_id)` instead of root.
+    /// Returns `(node_id, default_data, type_id)`.
+    pub fn create_node_by_name_at(
+        &self,
+        parent_path: &NodePath,
+        name: &str,
+    ) -> Result<(NodeId, Option<Data>, Option<TypeId>), String> {
+        let factory_meta = self
+            .name_registry
+            .get(name)
+            .ok_or_else(|| format!("Node type '{}' is not registered", name))?;
+
+        let node = (factory_meta.factory)()?;
+        let default_data = factory_meta.default_data.as_ref().map(|d| d.share());
+        let type_id = factory_meta.type_id;
+        let node_id = NodeId::new();
+        self.insert_at(parent_path.child(node_id), node);
+
+        Ok((node_id, default_data, type_id))
+    }
+
+    /// Path-aware variant of [`create_node_by_name_with_id`] (plan-007 P007b).
+    pub fn create_node_by_name_with_id_at(
+        &self,
+        parent_path: &NodePath,
+        id: NodeId,
+        name: &str,
+    ) -> Result<(NodeId, Option<Data>, Option<TypeId>), String> {
+        let factory_meta = self
+            .name_registry
+            .get(name)
+            .ok_or_else(|| format!("Node type '{}' is not registered", name))?;
+
+        let node = (factory_meta.factory)()?;
+        let default_data = factory_meta.default_data.as_ref().map(|d| d.share());
+        let type_id = factory_meta.type_id;
+        self.insert_at(parent_path.child(id), node);
+
+        Ok((id, default_data, type_id))
+    }
+
     /// Insert a node entity at an explicit path (used by `add_node_at_locked`).
     pub fn insert_node_at_path(&self, path: NodePath, node: NodeEntity) -> Option<NodeEntity> {
         self.insert_at(path, node)
@@ -446,6 +518,32 @@ impl NodeManager {
     /// Get all registered node type names.
     pub fn registered_names(&self) -> Vec<&'static str> {
         self.name_registry.keys().copied().collect()
+    }
+
+    // ── Graph-shaped factories (plan-007 P007b) ──
+
+    /// Register a graph-shaped factory under `name`. Replaces any
+    /// existing entry for the same name.
+    pub fn register_graph_factory(&mut self, name: impl Into<String>, factory: GraphFactory) {
+        self.graph_factories.insert(name.into(), factory);
+    }
+
+    /// Remove a graph-shaped factory by name. Returns the previous
+    /// entry if present.
+    pub fn unregister_graph_factory(&mut self, name: &str) -> Option<GraphFactory> {
+        self.graph_factories.remove(name)
+    }
+
+    /// Look up a graph-shaped factory by name. Returns a cloned
+    /// `Arc<dyn Fn>` so the caller can drop the borrow on `self`
+    /// before invocation — enables recursive factories.
+    pub fn graph_factory(&self, name: &str) -> Option<GraphFactory> {
+        self.graph_factories.get(name).map(Arc::clone)
+    }
+
+    /// True when `name` has a graph-shaped factory registered.
+    pub fn has_graph_factory(&self, name: &str) -> bool {
+        self.graph_factories.contains_key(name)
     }
 }
 

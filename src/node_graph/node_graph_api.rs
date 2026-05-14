@@ -11,7 +11,7 @@ use crate::{
     node_graph_system::NodeGraphSystem, BoxNodeFuture, ColorValue, Data, DataType, DataValue, Edge,
     EdgeId, ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeExecutionKind, NodeGraph,
     NodeId, NodeImpl, NodeMeta, NodePath, OutputWriter, SharedExecutionCache, SharedNodeStates,
-    SlotDef, Vector3,
+    Vector3,
 };
 
 /// Typed error returned by `NodeGraph::execute_sync` and `execute_async`.
@@ -406,59 +406,11 @@ impl NodeGraphWrite for NodeGraph {
     }
 
     fn create_node_by_name(&mut self, name: &str) -> Result<NodeId, String> {
-        // Create node and get default data from factory
-        let (node_id, default_data, type_id) = self.node_manager.create_node_by_name(name)?;
-
-        // Static slot defs from inventory (when present); fall back to
-        // empty slots for runtime-registered factories. SubGraphNode
-        // external slots are derived from the child InterfaceNodes
-        // (transparent-container architecture, plan-006 P3c) — no
-        // mirroring needed at creation time.
-        let (resolved_name, inputs, outputs): (&'static str, &[SlotDef], &[SlotDef]) =
-            match crate::get_node_type_info(name) {
-                Some(info) => (info.name, info.inputs, info.outputs),
-                None => (self.node_manager.leaked_factory_name(name)?, &[], &[]),
-            };
-
-        // Register in NodeStates
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            guard.add_node(
-                &NodePath::root().child(node_id),
-                resolved_name,
-                type_id,
-                default_data,
-                inputs,
-                outputs,
-            );
-        }
-
-        Ok(node_id)
+        self.create_node_by_name_at(&NodePath::root(), name)
     }
 
     fn create_node_by_name_with_id(&mut self, id: NodeId, name: &str) -> Result<NodeId, String> {
-        let (_node_id, default_data, type_id) =
-            self.node_manager.create_node_by_name_with_id(id, name)?;
-
-        let (resolved_name, inputs, outputs): (&'static str, &[SlotDef], &[SlotDef]) =
-            match crate::get_node_type_info(name) {
-                Some(info) => (info.name, info.inputs, info.outputs),
-                None => (self.node_manager.leaked_factory_name(name)?, &[], &[]),
-            };
-
-        {
-            let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-            guard.add_node(
-                &NodePath::root().child(id),
-                resolved_name,
-                type_id,
-                default_data,
-                inputs,
-                outputs,
-            );
-        }
-
-        Ok(id)
+        self.create_node_by_name_with_id_at(&NodePath::root(), id, name)
     }
 
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
@@ -588,16 +540,12 @@ impl NodeGraphWrite for NodeGraph {
         to_node_id: &NodeId,
         to_input_slot_index: usize,
     ) -> Result<EdgeId, String> {
-        let edge = self
-            .create_edge(
-                from_node_id,
-                from_output_slot_index,
-                to_node_id,
-                to_input_slot_index,
-            )
-            .map_err(|e| e.to_string())?;
-
-        self.add_edge(edge)
+        self.connect_nodes_at(
+            &NodePath::root().child(*from_node_id),
+            from_output_slot_index,
+            &NodePath::root().child(*to_node_id),
+            to_input_slot_index,
+        )
     }
 
     fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), String> {
@@ -768,6 +716,59 @@ impl NodeGraph {
         entry: crate::NodeFactoryWithMeta,
     ) -> Result<(), crate::NodeFactoryWithMeta> {
         self.node_manager.restore_factory_registration(name, entry)
+    }
+
+    // === Graph-shaped factories (plan-007 P007b) =========================
+
+    /// Register a graph-shaped factory (plan-007 P007b).
+    ///
+    /// Unlike [`register_factory_with_name_owned`] which dispenses
+    /// single `NodeEntity` values, a [`GraphFactory`] is a closure that
+    /// drives the graph itself — it can call `add_subgraph_at*`,
+    /// `create_node_by_name_at`, `connect_nodes_at`, and even other
+    /// `create_graph_by_name_at` calls to build a composite of nodes
+    /// and edges under a caller-supplied `parent_path`.
+    ///
+    /// Factories MAY recurse: the dispatcher
+    /// ([`create_graph_by_name_at`]) clones the `Arc<dyn Fn>` and
+    /// drops its borrow before invocation so nested factories run
+    /// without lock contention.
+    pub fn register_graph_factory(
+        &mut self,
+        name: impl Into<String>,
+        factory: crate::GraphFactory,
+    ) {
+        self.node_manager.register_graph_factory(name, factory);
+    }
+
+    /// Remove a graph-shaped factory by name. Returns the previous
+    /// entry if registered.
+    pub fn unregister_graph_factory(&mut self, name: &str) -> Option<crate::GraphFactory> {
+        self.node_manager.unregister_graph_factory(name)
+    }
+
+    /// Invoke the graph-shaped factory `name` to materialise a
+    /// composite under `parent_path`.
+    ///
+    /// `id_hint` is forwarded to the factory; semantics are
+    /// factory-specific (typical pattern: use it as the `NodeId` of
+    /// the composite's top entity so callers can pre-reserve the id).
+    /// Returns whatever `NodeId` the factory chose to expose as the
+    /// composite's externally-visible root.
+    pub fn create_graph_by_name_at(
+        &mut self,
+        parent_path: &NodePath,
+        name: &str,
+        id_hint: Option<NodeId>,
+    ) -> Result<NodeId, String> {
+        // Clone the Arc<dyn Fn> and drop the borrow so the factory may
+        // re-enter `self` via further path-aware mutators (including
+        // nested `create_graph_by_name_at` calls).
+        let factory = self
+            .node_manager
+            .graph_factory(name)
+            .ok_or_else(|| format!("Graph factory '{}' is not registered", name))?;
+        (factory)(self, parent_path, id_hint)
     }
 
     // === Public synchronous API ===========================================

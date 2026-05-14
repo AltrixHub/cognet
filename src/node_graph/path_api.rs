@@ -12,7 +12,7 @@ use std::{any::TypeId, sync::Arc};
 
 use crate::{
     Data, InputSlotId, InterfaceDirection, InterfaceNode, InterfaceNodeData, NodeEntity, NodeGraph,
-    NodeId, NodeMeta, NodePath, OutputSlotId, SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
+    NodeId, NodeMeta, NodePath, OutputSlotId, SlotDef, SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
 };
 
 use super::node_state::NodeStates;
@@ -194,22 +194,38 @@ impl NodeGraph {
     /// Atomically allocate a SubGraphNode with its two InterfaceNodes
     /// under a single `NodeStates` write lock.
     ///
-    /// Creates:
-    /// - SubGraphNode at `parent_path.child(sg_id)`
-    /// - Input-direction InterfaceNode at `sg_path.child(in_id)`
-    /// - Output-direction InterfaceNode at `sg_path.child(out_id)`
-    ///
-    /// All three insertions and both direction stamps happen while
-    /// `node_states` is write-locked, so no reader can observe the
-    /// SubGraph in a half-built state. On failure, any nodes already
-    /// inserted within this call are rolled back. Returns the `NodeId`
-    /// of the new SubGraphNode.
+    /// Thin wrapper around [`add_subgraph_at_with_id`] that mints a
+    /// fresh `NodeId` for the SubGraph itself.
     pub fn add_subgraph_at(
         &mut self,
         parent_path: &NodePath,
         label: impl Into<String>,
     ) -> Result<NodeId, String> {
-        let sg_id = NodeId::new();
+        self.add_subgraph_at_with_id(parent_path, NodeId::new(), label)
+    }
+
+    /// Atomically allocate a SubGraphNode with its two InterfaceNodes
+    /// using the caller-provided `sg_id` (plan-007 P007b).
+    ///
+    /// Creates:
+    /// - SubGraphNode at `parent_path.child(sg_id)`
+    /// - Input-direction InterfaceNode at `sg_path.child(in_id)`
+    /// - Output-direction InterfaceNode at `sg_path.child(out_id)`
+    ///
+    /// The two proxy ids (`in_id`, `out_id`) are still minted
+    /// internally; only the SubGraph's own id is taken from the
+    /// argument. Returns the same `sg_id` on success.
+    ///
+    /// All three insertions and both direction stamps happen while
+    /// `node_states` is write-locked, so no reader can observe the
+    /// SubGraph in a half-built state. On failure, any nodes already
+    /// inserted within this call are rolled back.
+    pub fn add_subgraph_at_with_id(
+        &mut self,
+        parent_path: &NodePath,
+        sg_id: NodeId,
+        label: impl Into<String>,
+    ) -> Result<NodeId, String> {
         let sg_path = parent_path.child(sg_id);
         let in_id = NodeId::new();
         let out_id = NodeId::new();
@@ -222,7 +238,7 @@ impl NodeGraph {
             || self.node_manager.contains_path(&out_path)
         {
             return Err(format!(
-                "add_subgraph_at: path collision under {}",
+                "add_subgraph_at_with_id: path collision under {}",
                 parent_path
             ));
         }
@@ -296,6 +312,75 @@ impl NodeGraph {
         }
 
         Ok(sg_id)
+    }
+
+    // ── Path-aware factory dispatch (plan-007 P007b) ──
+
+    /// Create a node by name under `parent_path`, recovering slot
+    /// metadata from inventory or the runtime factory name registry.
+    ///
+    /// The root variant
+    /// ([`NodeGraphWrite::create_node_by_name`]) is now a thin wrapper
+    /// over this method with `parent_path = NodePath::root()`.
+    pub fn create_node_by_name_at(
+        &mut self,
+        parent_path: &NodePath,
+        name: &str,
+    ) -> Result<NodeId, String> {
+        let (node_id, default_data, type_id) = self
+            .node_manager
+            .create_node_by_name_at(parent_path, name)?;
+        self.register_named_node_in_states(parent_path, node_id, name, default_data, type_id)?;
+        Ok(node_id)
+    }
+
+    /// Create a node by name under `parent_path` using the caller-provided
+    /// `id`. Path-aware sibling of
+    /// [`NodeGraphWrite::create_node_by_name_with_id`].
+    pub fn create_node_by_name_with_id_at(
+        &mut self,
+        parent_path: &NodePath,
+        id: NodeId,
+        name: &str,
+    ) -> Result<NodeId, String> {
+        let (_node_id, default_data, type_id) =
+            self.node_manager
+                .create_node_by_name_with_id_at(parent_path, id, name)?;
+        self.register_named_node_in_states(parent_path, id, name, default_data, type_id)?;
+        Ok(id)
+    }
+
+    /// Shared NodeStates registration step for the `_at` factory
+    /// dispatch paths. Resolves the static `'static` name + slot defs
+    /// (from inventory when available, otherwise from the leaked
+    /// runtime-registered factory name) and inserts the path entry.
+    fn register_named_node_in_states(
+        &mut self,
+        parent_path: &NodePath,
+        node_id: NodeId,
+        name: &str,
+        default_data: Option<Data>,
+        type_id: Option<TypeId>,
+    ) -> Result<(), String> {
+        // SubGraphNode external slots are derived from the child
+        // InterfaceNodes (transparent-container architecture,
+        // plan-006 P3c) — no mirroring needed at creation time.
+        let (resolved_name, inputs, outputs): (&'static str, &[SlotDef], &[SlotDef]) =
+            match crate::get_node_type_info(name) {
+                Some(info) => (info.name, info.inputs, info.outputs),
+                None => (self.node_manager.leaked_factory_name(name)?, &[], &[]),
+            };
+
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+        guard.add_node(
+            &parent_path.child(node_id),
+            resolved_name,
+            type_id,
+            default_data,
+            inputs,
+            outputs,
+        );
+        Ok(())
     }
 
     /// Remove the node at `path` and all its descendants, tearing down
@@ -482,5 +567,86 @@ mod tests {
         assert!(graph
             .stamp_interface_direction(&in_path, crate::InterfaceDirection::Input)
             .is_ok());
+    }
+
+    // ── Path-aware API additions (plan-007 P007b) ──
+
+    #[test]
+    fn create_node_by_name_at_subgraph_registers_slots() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+
+        let add_id = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create_node_by_name_at Add");
+        let add_path = sg_path.child(add_id);
+
+        // The entity is reachable at the depth-2 path.
+        assert!(graph.node_at_path(&add_path).is_some());
+
+        // Slot metadata was recovered from the inventory entry — the
+        // load-bearing distinction vs raw `add_node_at`.
+        let ns = graph.node_states.read().expect("read node_states");
+        assert_eq!(
+            ns.input_slot_count(&add_path),
+            2,
+            "Add should have 2 input slots at depth-2 path",
+        );
+        assert_eq!(
+            ns.output_slot_count(&add_path),
+            1,
+            "Add should have 1 output slot at depth-2 path",
+        );
+    }
+
+    #[test]
+    fn add_subgraph_at_with_id_preserves_caller_id() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = crate::NodeId::new();
+        let returned = graph
+            .add_subgraph_at_with_id(&crate::NodePath::root(), sg_id, "SG")
+            .expect("add_subgraph_at_with_id");
+        assert_eq!(returned, sg_id, "must return the caller-supplied id");
+
+        let sg_path = crate::NodePath::root().child(sg_id);
+        assert!(
+            graph.node_at_path(&sg_path).is_some(),
+            "SubGraph must resolve at the caller-supplied path",
+        );
+        // Two proxy children are still created internally.
+        assert_eq!(graph.children_of_path(&sg_path).len(), 2);
+    }
+
+    #[test]
+    fn register_graph_factory_invokes_closure_at_parent_path() {
+        use std::sync::Arc;
+
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let captured = Arc::new(std::sync::Mutex::new(None::<crate::NodeId>));
+        let captured_in_closure = Arc::clone(&captured);
+
+        let factory: crate::GraphFactory = Arc::new(move |g, parent_path, _id_hint| {
+            let id = g.create_node_by_name_at(parent_path, "Number")?;
+            *captured_in_closure.lock().unwrap() = Some(id);
+            Ok(id)
+        });
+        graph.register_graph_factory("TestFactory", factory);
+
+        let returned = graph
+            .create_graph_by_name_at(&crate::NodePath::root(), "TestFactory", None)
+            .expect("create_graph_by_name_at");
+
+        let from_closure = captured.lock().unwrap().expect("closure ran");
+        assert_eq!(
+            returned, from_closure,
+            "dispatcher returns the factory's NodeId verbatim",
+        );
+        // Node exists at root.child(returned).
+        assert!(graph
+            .node_at_path(&crate::NodePath::root().child(returned))
+            .is_some());
     }
 }

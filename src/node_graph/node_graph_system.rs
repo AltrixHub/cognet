@@ -1,4 +1,4 @@
-use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodeId, NodePath};
+use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodePath};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
@@ -8,19 +8,6 @@ pub(crate) trait NodeGraphSystem {
         &self,
         target_paths: &HashSet<NodePath>,
     ) -> Result<Vec<Vec<NodePath>>, String>;
-
-    /// Build an `Edge` value from node IDs and slot indices.
-    ///
-    /// Constructs root-level `NodePath`s for both endpoints. When the
-    /// caller has real (non-root) paths available it should construct
-    /// the `Edge` directly instead.
-    fn create_edge(
-        &self,
-        from_node_id: &NodeId,
-        from_output_slot_index: usize,
-        to_node_id: &NodeId,
-        to_input_slot_index: usize,
-    ) -> Result<Edge, &'static str>;
 
     fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
 }
@@ -97,46 +84,6 @@ impl NodeGraphSystem for NodeGraph {
         }
 
         Ok(sorted)
-    }
-
-    fn create_edge(
-        &self,
-        from_node_id: &NodeId,
-        from_output_slot_index: usize,
-        to_node_id: &NodeId,
-        to_input_slot_index: usize,
-    ) -> Result<Edge, &'static str> {
-        tracing::debug!("[cognet] create_edge: START");
-
-        let ns = self
-            .node_states
-            .read()
-            .map_err(|_| "Failed to read node states")?;
-
-        let from_output_slot_id = ns
-            .output_slot(
-                &NodePath::root().child(*from_node_id),
-                from_output_slot_index,
-            )
-            .ok_or("Invalid output slot index")?
-            .id;
-
-        let to_input_slot_id = ns
-            .input_slot(&NodePath::root().child(*to_node_id), to_input_slot_index)
-            .ok_or("Invalid input slot index")?
-            .id;
-
-        drop(ns);
-
-        tracing::debug!("[cognet] create_edge: DONE");
-        Ok(Edge {
-            from_node: NodePath::root().child(*from_node_id),
-            from_output_slot_index,
-            from_output_slot_id,
-            to_node: NodePath::root().child(*to_node_id),
-            to_input_slot_index,
-            to_input_slot_id,
-        })
     }
 
     fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
@@ -243,5 +190,131 @@ impl NodeGraphSystem for NodeGraph {
         }
 
         Ok(edge_id)
+    }
+}
+
+// ── Path-aware edge construction (plan-007 P007b) ──
+//
+// `create_edge_at` and `connect_nodes_at` accept `NodePath`s directly so
+// callers can wire SubGraph-internal nodes (depth ≥ 2) without resorting
+// to root-wrap workarounds. The root-only `NodeGraphSystem::create_edge`
+// and `NodeGraphWrite::connect_nodes` shapes remain as thin wrappers.
+
+impl NodeGraph {
+    /// Construct an `Edge` between two arbitrary `NodePath` endpoints.
+    ///
+    /// Resolves the slot ids for both endpoints from `NodeStates`. The
+    /// returned `Edge` is not added to the graph; pass it to
+    /// [`NodeGraphSystem::add_edge`] (or use [`connect_nodes_at`] which
+    /// does both).
+    pub fn create_edge_at(
+        &self,
+        from_path: &NodePath,
+        from_output_slot_index: usize,
+        to_path: &NodePath,
+        to_input_slot_index: usize,
+    ) -> Result<Edge, &'static str> {
+        tracing::debug!("[cognet] create_edge_at: START");
+
+        let ns = self
+            .node_states
+            .read()
+            .map_err(|_| "Failed to read node states")?;
+
+        let from_output_slot_id = ns
+            .output_slot(from_path, from_output_slot_index)
+            .ok_or("Invalid output slot index")?
+            .id;
+
+        let to_input_slot_id = ns
+            .input_slot(to_path, to_input_slot_index)
+            .ok_or("Invalid input slot index")?
+            .id;
+
+        drop(ns);
+
+        tracing::debug!("[cognet] create_edge_at: DONE");
+        Ok(Edge {
+            from_node: from_path.clone(),
+            from_output_slot_index,
+            from_output_slot_id,
+            to_node: to_path.clone(),
+            to_input_slot_index,
+            to_input_slot_id,
+        })
+    }
+
+    /// Connect two nodes identified by `NodePath`. Path-aware sibling of
+    /// [`NodeGraphWrite::connect_nodes`]; builds the `Edge` via
+    /// [`create_edge_at`] and inserts it via
+    /// [`NodeGraphSystem::add_edge`].
+    pub fn connect_nodes_at(
+        &mut self,
+        from_path: &NodePath,
+        from_output_slot_index: usize,
+        to_path: &NodePath,
+        to_input_slot_index: usize,
+    ) -> Result<EdgeId, String> {
+        let edge = self
+            .create_edge_at(
+                from_path,
+                from_output_slot_index,
+                to_path,
+                to_input_slot_index,
+            )
+            .map_err(|e| e.to_string())?;
+
+        self.add_edge(edge)
+    }
+}
+
+#[cfg(test)]
+mod path_aware_edge_tests {
+    use crate::{NodeGraph, NodeGraphWrite, NodePath};
+
+    #[test]
+    fn connect_nodes_at_two_subgraph_children_creates_edge_at_depth_2() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = NodePath::root().child(sg_id);
+
+        let num_id = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create num");
+        let add_id = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create add");
+
+        let from_path = sg_path.child(num_id);
+        let to_path = sg_path.child(add_id);
+        // Wire Number.Value (output 0) → Add.A (input 0).
+        let edge_id = graph
+            .connect_nodes_at(&from_path, 0, &to_path, 0)
+            .expect("connect_nodes_at");
+
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
+        assert_eq!(edge.from_node, from_path, "from_node must be depth-2 path");
+        assert_eq!(edge.to_node, to_path, "to_node must be depth-2 path");
+    }
+
+    #[test]
+    fn connect_nodes_root_wrapper_still_works() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let num_id = graph
+            .create_node_by_name("Number")
+            .expect("create_node_by_name num");
+        let add_id = graph
+            .create_node_by_name("Add")
+            .expect("create_node_by_name add");
+
+        let edge_id = graph
+            .connect_nodes(&num_id, 0, &add_id, 0)
+            .expect("connect_nodes root");
+
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
+        assert_eq!(edge.from_node, NodePath::root().child(num_id));
+        assert_eq!(edge.to_node, NodePath::root().child(add_id));
     }
 }
