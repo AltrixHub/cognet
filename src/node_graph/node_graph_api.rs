@@ -11,7 +11,7 @@ use crate::{
     node_graph_system::NodeGraphSystem, BoxNodeFuture, ColorValue, Data, DataType, DataValue, Edge,
     EdgeId, ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeExecutionKind, NodeGraph,
     NodeId, NodeImpl, NodeMeta, NodePath, OutputWriter, SharedExecutionCache, SharedNodeStates,
-    SlotDef, SubGraphNode, Vector3,
+    SlotDef, Vector3,
 };
 
 /// Typed error returned by `NodeGraph::execute_sync` and `execute_async`.
@@ -22,21 +22,16 @@ use crate::{
 /// plan-14c the dirty-state contract requires that returning this error
 /// must NOT clear the changed-node set, so a follow-up `execute_async`
 /// can run the same plan.
+///
+/// plan-006 P3c: `RequiresAsyncSubgraphSupport` is deleted — with
+/// transparent SubGraphs, every node in the plan executes at the same
+/// level and there is no opaque internal graph to check separately.
 #[derive(Debug, Clone)]
 pub enum GraphExecutionError {
     /// The dirty plan contains one or more `AsyncIo` nodes; the sync
     /// kernel cannot run them. Re-run via `execute_async`. Dirty state
     /// is preserved so the async re-run sees the same plan.
     RequiresAsyncExecution { node_ids: Vec<NodeId> },
-    /// The dirty plan contains one or more `SubGraphNode`s whose
-    /// internal graph has `AsyncIo` nodes. Plan-14c phase 1 does not
-    /// yet implement async subgraph execution — that requires
-    /// refactoring `SubGraphNode` so the parent executor can drop its
-    /// write lock across the internal `.await`. Returned from BOTH
-    /// `execute_sync` and `execute_async` (the latter because we don't
-    /// want to silently block on the internal async graph). Dirty
-    /// state is preserved.
-    RequiresAsyncSubgraphSupport { subgraph_node_ids: Vec<NodeId> },
     /// The execution plan could not be built (e.g. lock poisoning,
     /// topological cycle, missing graph metadata).
     PlanningFailed(String),
@@ -53,12 +48,6 @@ impl fmt::Display for GraphExecutionError {
                 f,
                 "graph contains {} AsyncIo node(s); call `execute_async` instead",
                 node_ids.len()
-            ),
-            Self::RequiresAsyncSubgraphSupport { subgraph_node_ids } => write!(
-                f,
-                "graph contains {} SubGraphNode(s) with AsyncIo internal nodes; \
-                 async subgraph execution is not yet supported in plan-14c phase 1",
-                subgraph_node_ids.len()
             ),
             Self::PlanningFailed(msg) => write!(f, "graph planning failed: {msg}"),
             Self::ExecutionFailed(msg) => write!(f, "graph execution failed: {msg}"),
@@ -433,10 +422,10 @@ impl NodeGraphWrite for NodeGraph {
         let (node_id, default_data, type_id) = self.node_manager.create_node_by_name(name)?;
 
         // Static slot defs from inventory (when present); fall back to
-        // empty slots for runtime-registered factories. Runtime
-        // factories whose nodes are SubGraphNodes get their external
-        // proxy slots mirrored into NodeStates by
-        // `mirror_subgraph_external_slots` below.
+        // empty slots for runtime-registered factories. SubGraphNode
+        // external slots are derived from the child InterfaceNodes
+        // (transparent-container architecture, plan-006 P3c) — no
+        // mirroring needed at creation time.
         let (resolved_name, inputs, outputs): (&'static str, &[SlotDef], &[SlotDef]) =
             match crate::get_node_type_info(name) {
                 Some(info) => (info.name, info.inputs, info.outputs),
@@ -455,12 +444,6 @@ impl NodeGraphWrite for NodeGraph {
                 outputs,
             );
         }
-
-        // Mirror SubGraph external slots into the parent NodeStates so
-        // recook / runtime-factory paths see the same slot count as
-        // the node's internal proxies expose. No-op for non-SubGraph
-        // nodes.
-        self.mirror_subgraph_external_slots(&node_id);
 
         Ok(node_id)
     }
@@ -486,8 +469,6 @@ impl NodeGraphWrite for NodeGraph {
                 outputs,
             );
         }
-
-        self.mirror_subgraph_external_slots(&id);
 
         Ok(id)
     }
@@ -641,17 +622,16 @@ impl NodeGraphWrite for NodeGraph {
 
 /// Look up a node's execution kind (`SyncCpu` / `AsyncIo`) by `NodeId`.
 ///
-/// Used by the planner to decide whether the dirty plan can run on the
-/// sync kernel or requires `execute_async`. Locks the nodes map briefly,
-/// then holds a read lock on the node entity only long enough to call
-/// `execution_kind()` (a cheap method that does not touch I/O).
+/// The planner is still NodeId-based at this sub-phase (P3c.10); the
+/// executor resolves through `NodePath::root().child(node_id)` internally.
 fn node_execution_kind(
     node_id: &NodeId,
     shared_nodes: &crate::SharedNodes,
 ) -> Option<NodeExecutionKind> {
+    let path = NodePath::root().child(*node_id);
     let entity = {
         let guard = shared_nodes.lock().ok()?;
-        guard.get(node_id).map(Arc::clone)?
+        guard.get(&path).map(Arc::clone)?
     };
     let read = match entity.read() {
         Ok(r) => r,
@@ -660,74 +640,42 @@ fn node_execution_kind(
     Some(read.execution_kind())
 }
 
-/// Walk the planned dirty set; if any `SubGraphNode` has `AsyncIo`
-/// nodes in its internal graph, return
-/// `RequiresAsyncSubgraphSupport` listing the parent subgraph IDs.
-/// Used by both sync + async validators.
-fn validate_async_subgraphs(
+/// Validate that no node in the sync plan requires `AsyncIo` execution.
+///
+/// Replaces the old `validate_async_subgraphs` + `subgraph_internal_has_async`
+/// pair (plan-006 P3c Step 11.3). With a transparent SubGraph boundary, every
+/// node in the execution plan is a direct entry — no downcast or internal-graph
+/// recursion needed. This is a flat check over the executed NodeId list.
+fn validate_async_in_sync_plan(
     executed_ids: &[NodeId],
     shared_nodes: &crate::SharedNodes,
 ) -> Result<(), GraphExecutionError> {
-    let async_subgraphs: Vec<NodeId> = executed_ids
+    let async_nodes: Vec<NodeId> = executed_ids
         .iter()
-        .filter(|id| subgraph_internal_has_async(id, shared_nodes))
+        .filter(|id| {
+            node_execution_kind(id, shared_nodes)
+                .map(|k| k == NodeExecutionKind::AsyncIo)
+                .unwrap_or(false)
+        })
         .copied()
         .collect();
-    if async_subgraphs.is_empty() {
+    if async_nodes.is_empty() {
         Ok(())
     } else {
-        Err(GraphExecutionError::RequiresAsyncSubgraphSupport {
-            subgraph_node_ids: async_subgraphs,
+        Err(GraphExecutionError::RequiresAsyncExecution {
+            node_ids: async_nodes,
         })
     }
-}
-
-/// Inspect a `SubGraphNode`'s internal graph for `AsyncIo` nodes.
-///
-/// Returns true iff the node at `sg_id` is a `SubGraphNode` and its
-/// internal graph contains at least one node with
-/// `NodeExecutionKind::AsyncIo`. Used by both validators (sync + async
-/// subgraph) to surface a typed error rather than silently blocking on
-/// the internal async graph.
-fn subgraph_internal_has_async(sg_id: &NodeId, shared_nodes: &crate::SharedNodes) -> bool {
-    let entity = {
-        let Ok(guard) = shared_nodes.lock() else {
-            return false;
-        };
-        let Some(e) = guard.get(sg_id) else {
-            return false;
-        };
-        Arc::clone(e)
-    };
-    let read = match entity.read() {
-        Ok(r) => r,
-        Err(p) => p.into_inner(),
-    };
-    let Some(sg) = read.as_any().downcast_ref::<SubGraphNode>() else {
-        return false;
-    };
-    let internal_nodes = sg.internal_graph().node_manager.nodes();
-    let Ok(internal_guard) = internal_nodes.lock() else {
-        return false;
-    };
-    for inner in internal_guard.values() {
-        let inner_read = match inner.read() {
-            Ok(r) => r,
-            Err(p) => p.into_inner(),
-        };
-        if inner_read.execution_kind() == NodeExecutionKind::AsyncIo {
-            return true;
-        }
-    }
-    false
 }
 
 /// Execute a single node synchronously.
 ///
 /// Locks the nodes map only long enough to clone out the node entity, then
-/// holds a read lock on the entity for regular nodes (allowing concurrent
-/// reads from UI) and upgrades to a write lock for `SubGraphNode` (which
-/// needs `&mut self` to drive its internal graph).
+/// holds a read lock on the entity while building the execution context and
+/// dispatching `execute_sync`. The transparent SubGraph boundary (plan-006
+/// P3c Step 11.1) means there is no special-casing for SubGraphNode — it
+/// simply calls `execute_sync` like every other node, and its children are
+/// visited directly by the planner.
 ///
 /// Wraps execution in `catch_unwind` so a single node panic does not abort
 /// the surrounding rayon level.
@@ -741,6 +689,7 @@ fn execute_node_sync(
     on_progress(ExecutionEvent::Started(node_id));
 
     let result: Result<(), String> = {
+        let path = NodePath::root().child(node_id);
         let entity = {
             let nodes_guard = match shared_nodes.lock() {
                 Ok(g) => g,
@@ -749,7 +698,7 @@ fn execute_node_sync(
                     return (node_id, Err("Lock poisoned".to_string()));
                 }
             };
-            nodes_guard.get(&node_id).map(Arc::clone)
+            nodes_guard.get(&path).map(Arc::clone)
         };
 
         let Some(node_entity) = entity else {
@@ -757,40 +706,17 @@ fn execute_node_sync(
             return (node_id, Ok(()));
         };
 
-        // Identify SubGraphNode under a read lock first to decide whether we
-        // need the write lock. Most nodes are regular and never need it.
-        let is_subgraph = match node_entity.read() {
-            Ok(r) => r.as_any().downcast_ref::<SubGraphNode>().is_some(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .as_any()
-                .downcast_ref::<SubGraphNode>()
-                .is_some(),
-        };
-
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if is_subgraph {
-                let mut node_write = match node_entity.write() {
-                    Ok(w) => w,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                let sg = node_write
-                    .as_any_mut()
-                    .downcast_mut::<SubGraphNode>()
-                    .expect("downcast verified above");
-                sg.execute_internal_sync(&node_id, shared_cache.share(), shared_node_states.clone())
-            } else {
-                let node_read = match node_entity.read() {
-                    Ok(r) => r,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                match build_execution_context(&node_id, shared_node_states, shared_cache) {
-                    Ok(ctx) => node_read.execute_sync(ctx),
-                    Err(e) => Err(e),
-                }
-                // node_read drops at end of branch — locks released
-                // before the next level starts.
+            let node_read = match node_entity.read() {
+                Ok(r) => r,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match build_execution_context(&node_id, shared_node_states, shared_cache) {
+                Ok(ctx) => node_read.execute_sync(ctx),
+                Err(e) => Err(e),
             }
+            // node_read drops at end of scope — locks released
+            // before the next level starts.
         }));
 
         match panic_result {
@@ -852,80 +778,6 @@ impl NodeGraph {
         entry: crate::NodeFactoryWithMeta,
     ) -> Result<(), crate::NodeFactoryWithMeta> {
         self.node_manager.restore_factory_registration(name, entry)
-    }
-
-    /// Mirror a SubGraphNode's external proxy slots into the parent
-    /// `NodeStates`. No-op when the node is not a SubGraphNode.
-    ///
-    /// Reads:
-    ///   * the SubGraphNode's input proxy's OUTPUT slots → mirrored
-    ///     as the parent's external INPUT slots.
-    ///   * the SubGraphNode's output proxy's INPUT slots → mirrored
-    ///     as the parent's external OUTPUT slots.
-    ///
-    /// Idempotent: existing slots with the same (label, data_type)
-    /// are left intact; only the *count* extends. Used by
-    /// runtime-registered factories whose closures fully populate
-    /// the SubGraph internal proxies and need the parent NodeStates
-    /// to see the same external schema.
-    pub fn mirror_subgraph_external_slots(&self, node_id: &NodeId) {
-        let entity = match self.get_node_by_id(node_id) {
-            Some(e) => e,
-            None => return,
-        };
-        let read = match entity.read() {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let sg = match read.as_any().downcast_ref::<SubGraphNode>() {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Read the SubGraphNode's internal proxy slot vocabularies.
-        let input_proxy_id = sg.input_proxy_id();
-        let output_proxy_id = sg.output_proxy_id();
-        let internal_ns = match sg.internal_graph().node_states.read() {
-            Ok(ns) => ns,
-            Err(_) => return,
-        };
-
-        let input_proxy_path = NodePath::root().child(input_proxy_id);
-        let output_proxy_path = NodePath::root().child(output_proxy_id);
-        let input_count = internal_ns.output_slot_count(&input_proxy_path);
-        let mut external_inputs: Vec<(&'static str, DataType)> = Vec::with_capacity(input_count);
-        for i in 0..input_count {
-            if let Some(slot) = internal_ns.output_slot(&input_proxy_path, i) {
-                external_inputs.push((slot.label, slot.data_type));
-            }
-        }
-        let output_count = internal_ns.input_slot_count(&output_proxy_path);
-        let mut external_outputs: Vec<(&'static str, DataType)> = Vec::with_capacity(output_count);
-        for i in 0..output_count {
-            if let Some(slot) = internal_ns.input_slot(&output_proxy_path, i) {
-                external_outputs.push((slot.label, slot.data_type));
-            }
-        }
-        drop(internal_ns);
-        drop(read);
-
-        let mut parent_ns = match self.node_states.write() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let node_path = NodePath::root().child(*node_id);
-        let existing_inputs = parent_ns.input_slot_count(&node_path);
-        for (i, (label, dt)) in external_inputs.into_iter().enumerate() {
-            if i >= existing_inputs {
-                parent_ns.add_input_slot(&node_path, label, dt, None);
-            }
-        }
-        let existing_outputs = parent_ns.output_slot_count(&node_path);
-        for (i, (label, dt)) in external_outputs.into_iter().enumerate() {
-            if i >= existing_outputs {
-                parent_ns.add_output_slot(&node_path, label, dt);
-            }
-        }
     }
 
     // === Public synchronous API ===========================================
@@ -1102,51 +954,26 @@ impl NodeGraph {
 
     /// Validate that the plan can run on the synchronous kernel.
     ///
-    /// Two failure modes, each returning a typed error WITHOUT draining
-    /// the dirty set so the caller can re-plan:
+    /// Returns `RequiresAsyncExecution` (without draining the dirty set) if
+    /// any node in the plan has `NodeExecutionKind::AsyncIo`. The caller can
+    /// then switch to `execute_async`.
     ///
-    /// - `RequiresAsyncSubgraphSupport` — a dirty `SubGraphNode` has
-    ///   `AsyncIo` nodes inside its internal graph. Plan-14c phase 1
-    ///   does not yet drive the internal graph through
-    ///   `execute_async`, so neither sync NOR async kernels can run
-    ///   the plan. Reported with priority over plain
-    ///   `RequiresAsyncExecution` because the caller cannot recover
-    ///   simply by switching to `execute_async`.
-    /// - `RequiresAsyncExecution` — direct dirty `AsyncIo` nodes.
-    ///   Caller can switch to `execute_async`.
+    /// With transparent SubGraphs (plan-006 P3c) every node in the plan
+    /// executes directly — there is no internal-graph recursion to inspect.
     fn validate_for_sync(&self, plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
         let shared_nodes = self.node_manager.nodes();
-        validate_async_subgraphs(&plan.executed_node_ids, &shared_nodes)?;
-
-        let async_nodes: Vec<NodeId> = plan
-            .executed_node_ids
-            .iter()
-            .filter(|id| {
-                node_execution_kind(id, &shared_nodes)
-                    .map(|k| k == NodeExecutionKind::AsyncIo)
-                    .unwrap_or(false)
-            })
-            .copied()
-            .collect();
-        if async_nodes.is_empty() {
-            Ok(())
-        } else {
-            Err(GraphExecutionError::RequiresAsyncExecution {
-                node_ids: async_nodes,
-            })
-        }
+        validate_async_in_sync_plan(&plan.executed_node_ids, &shared_nodes)
     }
 
     /// Validate that the plan can run on the asynchronous kernel.
     ///
-    /// `execute_async` handles direct `AsyncIo` nodes natively, but
-    /// plan-14c phase 1 does not yet drive `SubGraphNode`'s internal
-    /// graph through `execute_async`. Reject early with a typed error
-    /// rather than silently propagating an internal
-    /// `RequiresAsyncExecution` as a per-node string failure.
-    fn validate_for_async(&self, plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
-        let shared_nodes = self.node_manager.nodes();
-        validate_async_subgraphs(&plan.executed_node_ids, &shared_nodes)
+    /// With transparent SubGraphs (plan-006 P3c) every node in the plan
+    /// executes directly — there is no internal graph to check separately.
+    /// The async kernel handles `AsyncIo` nodes natively; no further
+    /// validation is needed beyond what `build_execution_plan` already
+    /// captured.
+    fn validate_for_async(&self, _plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
+        Ok(())
     }
 
     /// Drain the changed-nodes set after planning + validation succeeded.
@@ -1479,7 +1306,7 @@ impl NodeGraph {
                                 continue;
                             }
                         };
-                        guard.get(&node_id).map(Arc::clone)
+                        guard.get(&NodePath::root().child(node_id)).map(Arc::clone)
                     };
                     match entity {
                         None => Err("node entity missing".to_string()),
@@ -1537,7 +1364,7 @@ impl NodeGraph {
 #[cfg(test)]
 mod sync_executor_tests {
     use super::*;
-    use crate::{AddNode, NumberNode, SubGraphNode};
+    use crate::{AddNode, NumberNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
 
@@ -1858,98 +1685,6 @@ mod sync_executor_tests {
     }
 
     // ============================================================
-    // Plan-14c finding 1: async subgraph typed error
-    // ============================================================
-
-    #[test]
-    fn execute_sync_returns_async_subgraph_support_for_inner_async_node() {
-        // Build a SubGraphNode whose internal graph contains an async
-        // node. execute_sync must reject with the specific
-        // RequiresAsyncSubgraphSupport variant — NOT a per-node string
-        // error from execute_internal_sync's inner failure path.
-        let mut graph = NodeGraph::new().unwrap();
-        let sub_id = graph.create_node::<SubGraphNode>().unwrap();
-        graph
-            .add_subgraph_output(&sub_id, "Out", DataType::Number)
-            .unwrap();
-        let (_in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sub_id).unwrap();
-        graph
-            .with_subgraph_mut(&sub_id, |internal| {
-                let echo = internal.create_node::<AsyncEchoNode>().unwrap();
-                internal.connect_nodes(&echo, 0, &out_proxy, 0).unwrap();
-            })
-            .unwrap();
-
-        let err = graph
-            .execute_sync()
-            .expect_err("inner async should reject sync");
-        match err {
-            GraphExecutionError::RequiresAsyncSubgraphSupport { subgraph_node_ids } => {
-                assert!(subgraph_node_ids.contains(&sub_id));
-            }
-            other => panic!("expected RequiresAsyncSubgraphSupport, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_async_returns_async_subgraph_support_for_inner_async_node() {
-        // Plan-14c phase 1 explicitly does NOT yet implement async
-        // subgraph execution. The async kernel must surface that as a
-        // typed error rather than silently falling through to
-        // execute_internal_sync (which would block on the inner async
-        // graph or string-error per-node).
-        let mut graph = NodeGraph::new().unwrap();
-        let sub_id = graph.create_node::<SubGraphNode>().unwrap();
-        graph
-            .add_subgraph_output(&sub_id, "Out", DataType::Number)
-            .unwrap();
-        let (_in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sub_id).unwrap();
-        graph
-            .with_subgraph_mut(&sub_id, |internal| {
-                let echo = internal.create_node::<AsyncEchoNode>().unwrap();
-                internal.connect_nodes(&echo, 0, &out_proxy, 0).unwrap();
-            })
-            .unwrap();
-
-        let err = graph
-            .execute_async()
-            .await
-            .expect_err("inner async should reject async too in phase 1");
-        assert!(matches!(
-            err,
-            GraphExecutionError::RequiresAsyncSubgraphSupport { .. }
-        ));
-    }
-
-    #[test]
-    fn execute_sync_async_subgraph_rejection_preserves_dirty_state() {
-        // The validation rejects BEFORE drain, so a follow-up
-        // execute_sync still sees the dirty plan (and still errors).
-        let mut graph = NodeGraph::new().unwrap();
-        let sub_id = graph.create_node::<SubGraphNode>().unwrap();
-        graph
-            .add_subgraph_output(&sub_id, "Out", DataType::Number)
-            .unwrap();
-        let (_in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sub_id).unwrap();
-        graph
-            .with_subgraph_mut(&sub_id, |internal| {
-                let echo = internal.create_node::<AsyncEchoNode>().unwrap();
-                internal.connect_nodes(&echo, 0, &out_proxy, 0).unwrap();
-            })
-            .unwrap();
-
-        // First call rejects.
-        let _ = graph.execute_sync().expect_err("first reject");
-        // Dirty preserved → second call sees the same plan and rejects
-        // with the same variant.
-        let err2 = graph.execute_sync().expect_err("second reject");
-        assert!(matches!(
-            err2,
-            GraphExecutionError::RequiresAsyncSubgraphSupport { .. }
-        ));
-    }
-
-    // ============================================================
     // Plan-14c finding 2: dirty preservation on per-node failure
     // ============================================================
 
@@ -2092,49 +1827,4 @@ mod sync_executor_tests {
     }
 
     crate::register_nodes!(FlakySyncNode);
-
-    #[test]
-    fn subgraph_executes_recursively_through_sync_kernel() {
-        let mut graph = NodeGraph::new().unwrap();
-        let outer_a = graph.create_node::<NumberNode>().unwrap();
-        let outer_b = graph.create_node::<NumberNode>().unwrap();
-        graph
-            .update_node_data(&outer_a, Data::new(11.0_f64).unwrap())
-            .unwrap();
-        graph
-            .update_node_data(&outer_b, Data::new(31.0_f64).unwrap())
-            .unwrap();
-
-        // Build a subgraph that sums two inputs.
-        let sub_id = graph.create_node::<SubGraphNode>().unwrap();
-        graph
-            .add_subgraph_input(&sub_id, "A", DataType::Number)
-            .unwrap();
-        graph
-            .add_subgraph_input(&sub_id, "B", DataType::Number)
-            .unwrap();
-        graph
-            .add_subgraph_output(&sub_id, "Sum", DataType::Number)
-            .unwrap();
-
-        let (in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sub_id).unwrap();
-        let inner_add = graph
-            .with_subgraph_mut(&sub_id, |internal| {
-                let inner_add = internal.create_node::<AddNode>().unwrap();
-                internal.connect_nodes(&in_proxy, 0, &inner_add, 0).unwrap();
-                internal.connect_nodes(&in_proxy, 1, &inner_add, 1).unwrap();
-                internal
-                    .connect_nodes(&inner_add, 0, &out_proxy, 0)
-                    .unwrap();
-                inner_add
-            })
-            .unwrap();
-        let _ = inner_add; // value unused after construction; only for clarity
-
-        graph.connect_nodes(&outer_a, 0, &sub_id, 0).unwrap();
-        graph.connect_nodes(&outer_b, 0, &sub_id, 1).unwrap();
-
-        let result = graph.execute_sync().unwrap();
-        assert_eq!(output_for(&result, sub_id), 42.0);
-    }
 }

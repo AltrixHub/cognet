@@ -172,37 +172,6 @@ impl NodeStates {
         index
     }
 
-    /// Insert an output slot at a specific index, shifting higher-indexed slots up.
-    ///
-    /// Used by dynamic multi-input to insert proxy outputs at the correct
-    /// position so that existing edge references to higher slots remain valid.
-    pub fn insert_output_slot_at(
-        &mut self,
-        path: &NodePath,
-        index: usize,
-        label: &'static str,
-        data_type: DataType,
-    ) -> OutputSlotId {
-        let count = self.output_slot_count(path);
-        // Shift existing slots at index..count up by 1 (iterate in reverse)
-        for i in (index..count).rev() {
-            if let Some(slot) = self.output_slots.remove(&(path.clone(), i)) {
-                self.output_slots.insert((path.clone(), i + 1), slot);
-            }
-        }
-        // Insert new slot at index
-        let id = OutputSlotId::new();
-        self.output_slots.insert(
-            (path.clone(), index),
-            OutputSlotState {
-                id,
-                label,
-                data_type,
-            },
-        );
-        id
-    }
-
     /// Rewrite the label of an input slot in place. Slot index and id
     /// are preserved so existing edges remain valid.
     pub fn set_input_slot_label(
@@ -538,6 +507,14 @@ impl NodeStates {
     /// covering every node registered in this `NodeStates`.
     pub fn mark_all_changed(&mut self) {
         self.mark_all_changed_at(&NodePath::root());
+    }
+
+    /// Direct children of a path from the path_index.
+    ///
+    /// Used by `remove_node_at` to collect descendant paths for
+    /// subtree teardown.
+    pub(crate) fn path_index_children_of(&self, path: &NodePath) -> &[NodeId] {
+        self.path_index.children_of(path)
     }
 
     /// Drain and return all changed node paths since last drain.

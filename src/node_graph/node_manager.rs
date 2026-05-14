@@ -1,6 +1,6 @@
 use std::sync::{Mutex, MutexGuard, RwLock};
 
-use crate::{Data, NodeCore, NodeId, NodeImpl};
+use crate::{Data, NodeCore, NodeId, NodeImpl, NodePath};
 use std::{
     any::{type_name, Any, TypeId},
     collections::{HashMap, HashSet},
@@ -23,13 +23,18 @@ pub struct NodeFactoryWithMeta {
     pub type_id: Option<TypeId>,
 }
 
+/// Shared node entity table keyed by `NodePath`.
+///
+/// C16: The map is path-keyed so NodeManager and NodeStates agree on
+/// the canonical identity for every node. Root-level nodes are stored
+/// at `NodePath::root().child(id)`; SubGraph children at deeper paths.
 #[derive(Default, Debug)]
 pub struct SharedNodes {
-    inner: Arc<Mutex<HashMap<NodeId, NodeEntity>>>,
+    inner: Arc<Mutex<HashMap<NodePath, NodeEntity>>>,
 }
 
 impl SharedNodes {
-    pub fn new(nodes: HashMap<NodeId, NodeEntity>) -> Self {
+    pub fn new(nodes: HashMap<NodePath, NodeEntity>) -> Self {
         SharedNodes {
             inner: Arc::new(Mutex::new(nodes)),
         }
@@ -37,7 +42,7 @@ impl SharedNodes {
 
     /// Lock the nodes map for access.
     /// Recovers from poisoned locks (caused by panics caught via catch_unwind).
-    pub fn lock(&self) -> Result<MutexGuard<'_, HashMap<NodeId, NodeEntity>>, String> {
+    pub fn lock(&self) -> Result<MutexGuard<'_, HashMap<NodePath, NodeEntity>>, String> {
         match self.inner.lock() {
             Ok(guard) => Ok(guard),
             Err(poisoned) => Ok(poisoned.into_inner()),
@@ -86,17 +91,35 @@ impl NodeManager {
         self.nodes.share()
     }
 
+    /// All NodeIds of root-level nodes (paths of depth 1).
     pub fn all_node_ids(&self) -> Vec<NodeId> {
         self.nodes
             .lock()
             .ok()
-            .map(|nodes| nodes.keys().copied().collect())
+            .map(|nodes| {
+                nodes
+                    .keys()
+                    .filter_map(|p| {
+                        if p.segments().len() == 1 {
+                            p.leaf()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    pub fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
+    /// Look up a node entity by `NodePath`.
+    pub fn get_at(&self, path: &NodePath) -> Option<NodeEntity> {
         let nodes = self.nodes.lock().ok()?;
-        nodes.get(id).cloned()
+        nodes.get(path).cloned()
+    }
+
+    /// Backward-compatible lookup for root-level nodes by `NodeId`.
+    pub fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
+        self.get_at(&NodePath::root().child(*id))
     }
 
     pub fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
@@ -106,7 +129,10 @@ impl NodeManager {
         };
 
         ids.into_iter()
-            .filter_map(|id| nodes.get(&id).map(|node| (id, Arc::clone(node))))
+            .filter_map(|id| {
+                let path = NodePath::root().child(id);
+                nodes.get(&path).map(|node| (id, Arc::clone(node)))
+            })
             .collect()
     }
 
@@ -118,31 +144,50 @@ impl NodeManager {
 
         let mut result: Vec<NodeId> = Vec::new();
 
-        for (id, node) in nodes.iter() {
+        for (path, node) in nodes.iter() {
             if TypeId::of::<T>() == node.type_id() {
-                result.push(*id);
+                if let Some(id) = path.leaf() {
+                    result.push(id);
+                }
             }
         }
 
         result
     }
 
-    pub fn contains_key(&self, id: &NodeId) -> bool {
+    pub fn contains_path(&self, path: &NodePath) -> bool {
         let nodes = match self.nodes.lock() {
             Ok(n) => n,
             Err(_) => return false,
         };
-        nodes.contains_key(id)
+        nodes.contains_key(path)
     }
 
+    /// Backward-compatible `contains_key` for root-level nodes.
+    pub fn contains_key(&self, id: &NodeId) -> bool {
+        self.contains_path(&NodePath::root().child(*id))
+    }
+
+    /// Insert a node entity at the given path.
+    pub fn insert_at(&self, path: NodePath, node: NodeEntity) -> Option<NodeEntity> {
+        let mut nodes = self.nodes.lock().ok()?;
+        nodes.insert(path, node)
+    }
+
+    /// Backward-compatible insert for root-level nodes.
     pub fn node_insert(&self, node_id: NodeId, node: NodeEntity) -> Option<NodeEntity> {
-        let mut nodes = self.nodes.lock().ok()?;
-        nodes.insert(node_id, node)
+        self.insert_at(NodePath::root().child(node_id), node)
     }
 
-    pub fn node_remove(&self, node_id: &NodeId) -> Option<NodeEntity> {
+    /// Remove a node entity at the given path.
+    pub fn remove_at(&self, path: &NodePath) -> Option<NodeEntity> {
         let mut nodes = self.nodes.lock().ok()?;
-        nodes.remove(node_id)
+        nodes.remove(path)
+    }
+
+    /// Backward-compatible remove for root-level nodes.
+    pub fn node_remove(&self, node_id: &NodeId) -> Option<NodeEntity> {
+        self.remove_at(&NodePath::root().child(*node_id))
     }
 
     pub fn variants(&self) -> &HashSet<String> {
@@ -369,6 +414,11 @@ impl NodeManager {
         self.node_insert(id, node);
 
         Ok((id, default_data, type_id))
+    }
+
+    /// Insert a node entity at an explicit path (used by `add_node_at_locked`).
+    pub fn insert_node_at_path(&self, path: NodePath, node: NodeEntity) -> Option<NodeEntity> {
+        self.insert_at(path, node)
     }
 
     /// Check if a node type is registered by name.

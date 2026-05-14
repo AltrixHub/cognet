@@ -7,8 +7,8 @@ pub mod node_graph_system;
 pub mod node_manager;
 pub mod node_path;
 pub(crate) mod node_state;
+pub mod path_api;
 mod path_index;
-pub mod path_navigation;
 pub mod subgraph_helpers;
 pub mod subgraph_ops;
 
@@ -56,9 +56,9 @@ struct Bookkeeping {
 }
 
 pub struct NodeGraph {
-    node_manager: NodeManager,
+    pub(crate) node_manager: NodeManager,
     /// Node states (type_name, data, slots) — shared with app via Arc.
-    node_states: Arc<RwLock<NodeStates>>,
+    pub(crate) node_states: Arc<RwLock<NodeStates>>,
     cache: SharedExecutionCache,
     /// Interior-mutable bookkeeping (dirty_nodes, errors, removed list).
     bookkeeping: Mutex<Bookkeeping>,
@@ -138,9 +138,6 @@ impl NodeGraph {
     }
 
     /// Mark all nodes in the graph as dirty, forcing re-execution.
-    ///
-    /// Used by SubGraphNode to ensure all internal nodes execute
-    /// after external inputs are injected into the input proxy.
     pub fn mark_all_nodes_dirty(&self) {
         if let Ok(mut ns) = self.node_states.write() {
             ns.mark_all_changed();
@@ -148,8 +145,6 @@ impl NodeGraph {
     }
 
     // ── High-level query API ──
-    // These methods provide access to node/slot/edge data without exposing
-    // the internal NodeStates structure.
 
     /// Get the type name of a node.
     pub fn node_type_name(&self, node_id: &NodeId) -> Option<&'static str> {
@@ -161,10 +156,8 @@ impl NodeGraph {
     /// Get the Rust TypeId of a node for type-safe identification.
     ///
     /// For SubGraphNodes with a template type, returns the template's TypeId
-    /// instead of the generic SubGraphNode TypeId. This enables callers to
-    /// identify what kind of subgraph this is (e.g., StairTemplate vs WallTemplate).
+    /// instead of the generic SubGraphNode TypeId.
     pub fn node_type_id(&self, node_id: &NodeId) -> Option<TypeId> {
-        // Check for SubGraph template TypeId first
         if let Some(template_id) = self.subgraph_template_type_id(node_id) {
             return Some(template_id);
         }
@@ -174,10 +167,6 @@ impl NodeGraph {
     }
 
     /// Set the template TypeId for a SubGraphNode.
-    ///
-    /// This associates a template type with a SubGraphNode, allowing
-    /// `node_type_id()` to return the template's TypeId instead of
-    /// the generic SubGraphNode TypeId.
     pub fn set_subgraph_template_type_id(
         &self,
         node_id: &NodeId,
@@ -349,10 +338,6 @@ impl NodeGraph {
     }
 
     /// Reorder an edge within its input slot's connection list.
-    ///
-    /// Changes the position of the edge to `new_index`, affecting the order
-    /// in which multi-input values are received during execution.
-    /// Returns `true` if the reorder was successful.
     pub fn reorder_input_edge(&self, edge_id: &EdgeId, new_index: usize) -> bool {
         self.node_states
             .write()
