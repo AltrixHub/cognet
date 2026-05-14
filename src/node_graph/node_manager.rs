@@ -117,11 +117,6 @@ impl NodeManager {
         nodes.get(path).cloned()
     }
 
-    /// Backward-compatible lookup for root-level nodes by `NodeId`.
-    pub fn get_node_by_id(&self, id: &NodeId) -> Option<NodeEntity> {
-        self.get_at(&NodePath::root().child(*id))
-    }
-
     pub fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)> {
         let nodes = match self.nodes.lock() {
             Ok(n) => n,

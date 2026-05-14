@@ -17,6 +17,60 @@ use crate::{
 use super::node_state::NodeStates;
 
 impl NodeGraph {
+    // ── Locked helpers (take already-acquired NodeStates guard) ──
+
+    /// Insert a node entity into NodeManager and into an already-locked
+    /// `NodeStates`.  The caller is responsible for pre-validating that
+    /// `path` is not already occupied.
+    fn add_node_at_locked(
+        &self,
+        ns: &mut NodeStates,
+        path: &NodePath,
+        entity: NodeEntity,
+        meta: NodeMeta_,
+    ) -> Result<(), String> {
+        if self.node_manager.contains_path(path) {
+            return Err(format!(
+                "add_node_at_locked: path {path} already registered"
+            ));
+        }
+        self.node_manager.insert_at(path.clone(), entity);
+        ns.add_node(
+            path,
+            meta.name,
+            meta.type_id,
+            meta.default_data,
+            meta.input_defs,
+            meta.output_defs,
+        );
+        Ok(())
+    }
+
+    /// Stamp an InterfaceNode direction inside an already-locked `NodeStates`.
+    fn stamp_interface_direction_locked(
+        ns: &mut NodeStates,
+        path: &NodePath,
+        direction: InterfaceDirection,
+    ) -> Result<(), String> {
+        let data = InterfaceNodeData {
+            direction,
+            locked: std::collections::HashSet::new(),
+        };
+        let state = ns
+            .get_mut(path)
+            .ok_or_else(|| format!("stamp_interface_direction: node at {} not found", path))?;
+        state.data = Some(Data::from_domain(data, INTERFACE_NODE_DATA_DOMAIN));
+        ns.mark_changed(path);
+        Ok(())
+    }
+
+    /// Remove a node from NodeManager and from an already-locked `NodeStates`.
+    fn remove_node_at_locked(&self, ns: &mut NodeStates, path: &NodePath) -> Result<(), String> {
+        ns.remove_node(path);
+        self.node_manager.remove_at(path);
+        Ok(())
+    }
+
     // ── Path-aware node queries ──
 
     /// Get the node entity at an arbitrary `NodePath`.
@@ -62,30 +116,37 @@ impl NodeGraph {
     // ── Atomic node insertion ──
 
     /// Insert a single node entity at `path`, keeping NodeManager and
-    /// NodeStates in lock-step. This acquires both write locks for the
-    /// duration of the call.
+    /// NodeStates in lock-step.
     pub fn add_node_at(&mut self, path: &NodePath, entity: NodeEntity) -> Result<(), String> {
-        let nm = &self.node_manager;
         let (name, type_id, default_data, input_defs, output_defs) = entity_meta_views(&entity)?;
-        if nm.contains_path(path) {
-            return Err(format!("add_node_at: path {path} already registered"));
-        }
-        nm.insert_at(path.clone(), entity);
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        ns.add_node(path, name, type_id, default_data, input_defs, output_defs);
-        Ok(())
+        self.add_node_at_locked(
+            &mut ns,
+            path,
+            entity,
+            NodeMeta_ {
+                name,
+                type_id,
+                default_data,
+                input_defs,
+                output_defs,
+            },
+        )
     }
 
     /// Atomically allocate a SubGraphNode with its two InterfaceNodes
-    /// under a single pair of write locks.
+    /// under a single `NodeStates` write lock.
     ///
     /// Creates:
     /// - SubGraphNode at `parent_path.child(sg_id)`
     /// - Input-direction InterfaceNode at `sg_path.child(in_id)`
     /// - Output-direction InterfaceNode at `sg_path.child(out_id)`
     ///
-    /// On failure, any nodes already inserted within this call are
-    /// rolled back. Returns the `NodeId` of the new SubGraphNode.
+    /// All three insertions and both direction stamps happen while
+    /// `node_states` is write-locked, so no reader can observe the
+    /// SubGraph in a half-built state. On failure, any nodes already
+    /// inserted within this call are rolled back. Returns the `NodeId`
+    /// of the new SubGraphNode.
     pub fn add_subgraph_at(
         &mut self,
         parent_path: &NodePath,
@@ -116,10 +177,14 @@ impl NodeGraph {
         let in_entity: NodeEntity = Arc::new(std::sync::RwLock::new(InterfaceNode));
         let out_entity: NodeEntity = Arc::new(std::sync::RwLock::new(InterfaceNode));
 
-        // Insert SubGraphNode.
+        // Acquire the NodeStates write lock ONCE for all three insertions
+        // and both direction stamps.
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+
         let mut inserted: Vec<NodePath> = Vec::with_capacity(3);
         let result = (|| -> Result<(), String> {
-            self.insert_entity_at(
+            self.add_node_at_locked(
+                &mut ns,
                 &sg_path,
                 sg_entity,
                 NodeMeta_ {
@@ -132,7 +197,8 @@ impl NodeGraph {
             )?;
             inserted.push(sg_path.clone());
 
-            self.insert_entity_at(
+            self.add_node_at_locked(
+                &mut ns,
                 &in_path,
                 in_entity,
                 NodeMeta_ {
@@ -144,9 +210,10 @@ impl NodeGraph {
                 },
             )?;
             inserted.push(in_path.clone());
-            self.stamp_interface_direction_internal(&in_path, InterfaceDirection::Input)?;
+            Self::stamp_interface_direction_locked(&mut ns, &in_path, InterfaceDirection::Input)?;
 
-            self.insert_entity_at(
+            self.add_node_at_locked(
+                &mut ns,
                 &out_path,
                 out_entity,
                 NodeMeta_ {
@@ -158,18 +225,15 @@ impl NodeGraph {
                 },
             )?;
             inserted.push(out_path.clone());
-            self.stamp_interface_direction_internal(&out_path, InterfaceDirection::Output)?;
+            Self::stamp_interface_direction_locked(&mut ns, &out_path, InterfaceDirection::Output)?;
 
             Ok(())
         })();
 
         if let Err(e) = result {
-            // Rollback: remove any successfully-inserted nodes.
+            // Rollback: remove any successfully-inserted nodes (ns still held).
             for p in inserted.iter().rev() {
-                self.node_manager.remove_at(p);
-                if let Ok(mut ns) = self.node_states.write() {
-                    ns.remove_node(p);
-                }
+                let _ = self.remove_node_at_locked(&mut ns, p);
             }
             return Err(e);
         }
@@ -196,10 +260,7 @@ impl NodeGraph {
             if let Some(node_id) = p.leaf() {
                 ns.remove_edges_for_node(&node_id);
             }
-            // Remove slot tables and NodeStates entry.
-            ns.remove_node(p);
-            // Remove from NodeManager.
-            self.node_manager.remove_at(p);
+            let _ = self.remove_node_at_locked(&mut ns, p);
         }
 
         // Record removals for execution result reporting.
@@ -214,54 +275,23 @@ impl NodeGraph {
 
     // ── stamp_interface_direction ──
 
-    // Private: stamp an InterfaceNode at `path` with the given direction.
-    fn stamp_interface_direction_internal(
-        &self,
+    /// Stamp an InterfaceNode at `path` with the given direction.
+    ///
+    /// Acquires the `NodeStates` write lock and delegates to the
+    /// `_locked` variant. Exposed as `pub(crate)` for P3c.12+ callers;
+    /// the current P3c.10 codebase uses the internal `_locked` form.
+    #[allow(dead_code)]
+    pub(crate) fn stamp_interface_direction(
+        &mut self,
         path: &NodePath,
         direction: InterfaceDirection,
     ) -> Result<(), String> {
-        let data = InterfaceNodeData {
-            direction,
-            locked: std::collections::HashSet::new(),
-        };
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        let state = ns
-            .get_mut(path)
-            .ok_or_else(|| format!("stamp_interface_direction: node at {} not found", path))?;
-        state.data = Some(Data::from_domain(data, INTERFACE_NODE_DATA_DOMAIN));
-        ns.mark_changed(path);
-        Ok(())
-    }
-
-    // Internal helper: insert entity + register in both NodeManager and NodeStates.
-    fn insert_entity_at(
-        &self,
-        path: &NodePath,
-        entity: NodeEntity,
-        meta: NodeMeta_,
-    ) -> Result<(), String> {
-        if self.node_manager.contains_path(path) {
-            return Err(format!("insert_entity_at: path {path} already registered"));
-        }
-        self.node_manager.insert_at(path.clone(), entity);
-        let mut ns = self.node_states.write().map_err(|e| {
-            // Rollback NodeManager insert on NodeStates failure.
-            self.node_manager.remove_at(path);
-            e.to_string()
-        })?;
-        ns.add_node(
-            path,
-            meta.name,
-            meta.type_id,
-            meta.default_data,
-            meta.input_defs,
-            meta.output_defs,
-        );
-        Ok(())
+        Self::stamp_interface_direction_locked(&mut ns, path, direction)
     }
 }
 
-/// Compact metadata bundle for `insert_entity_at`.
+/// Compact metadata bundle for `add_node_at_locked`.
 struct NodeMeta_ {
     name: &'static str,
     type_id: Option<TypeId>,
@@ -282,27 +312,15 @@ type EntityMetaViews = (
 /// Extract (name, type_id, default_data, input_defs, output_defs) from a
 /// NodeEntity by reading the node through its RwLock.
 fn entity_meta_views(entity: &NodeEntity) -> Result<EntityMetaViews, String> {
-    let read = entity.read().map_err(|e| e.to_string())?;
-    // We can get name, but type_id / default_data / slot defs require NodeMeta
-    // static methods. Use AsAny-based downcast to try known types; fall back
-    // to a name-only registration. This is only used by `add_node_at` for
-    // externally-built entities; `add_subgraph_at` passes these directly.
-    let name = read.node_name();
-    // Drop read to avoid held-across-acquire issues.
-    drop(read);
+    // Read the static name before dropping the guard so the `'static`
+    // lifetime is preserved naturally — no transmute needed.
+    let name: &'static str = entity.read().map_err(|e| e.to_string())?.node_name();
 
     // For externally-supplied entities we cannot recover static slot defs
     // because the trait object erases them. The caller is responsible for
     // registering slots separately via `add_input_slot`/`add_output_slot`.
     // We just use empty slices here and rely on the caller to wire slots.
-    Ok((
-        // SAFETY: node_name() returns &'static str
-        unsafe { std::mem::transmute::<&str, &'static str>(name) },
-        None,
-        None,
-        &[],
-        &[],
-    ))
+    Ok((name, None, None, &[], &[]))
 }
 
 /// Collect all paths in the subtree rooted at `root`, leaves first.
@@ -323,8 +341,6 @@ fn collect_subtree_paths(ns: &NodeStates, root: &NodePath) -> Vec<NodePath> {
 
 #[cfg(test)]
 mod tests {
-    use crate::NodeGraphRead;
-
     #[test]
     fn add_subgraph_at_root_registers_three_nodes() {
         let mut graph = crate::NodeGraph::new().expect("create graph");
@@ -333,7 +349,9 @@ mod tests {
             .expect("add_subgraph_at");
 
         // SubGraphNode in NodeManager at root.child(sg_id)
-        assert!(graph.get_node_by_id(&sg_id).is_some());
+        assert!(graph
+            .node_at_path(&crate::NodePath::root().child(sg_id))
+            .is_some());
 
         // Two proxy children
         let sg_path = crate::NodePath::root().child(sg_id);
@@ -375,7 +393,7 @@ mod tests {
         graph.remove_node_at(&sg_path).expect("remove_node_at");
 
         // SubGraph and its children are gone
-        assert!(graph.get_node_by_id(&sg_id).is_none());
+        assert!(graph.node_at_path(&sg_path).is_none());
         assert!(graph.node_at_path(&sg_path.child(in_id)).is_none());
     }
 
@@ -392,5 +410,22 @@ mod tests {
 
         assert!(graph.is_subgraph_node_at_path(&sg_path));
         assert!(!graph.is_subgraph_node_at_path(&sg_path.child(in_id)));
+    }
+
+    #[test]
+    fn stamp_interface_direction_pub_crate_wrapper_works() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let (in_id, _) = graph
+            .subgraph_proxy_ids_at_path(&sg_path)
+            .expect("proxy ids");
+        let in_path = sg_path.child(in_id);
+        // Re-stamping the same direction should succeed without error.
+        assert!(graph
+            .stamp_interface_direction(&in_path, crate::InterfaceDirection::Input)
+            .is_ok());
     }
 }

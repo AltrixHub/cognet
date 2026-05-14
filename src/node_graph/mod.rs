@@ -173,7 +173,8 @@ impl NodeGraph {
         type_id: TypeId,
     ) -> Result<(), String> {
         let entity = self
-            .get_node_by_id(node_id)
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
         let mut write = entity.write().map_err(|e| e.to_string())?;
         let sg = write
@@ -186,7 +187,9 @@ impl NodeGraph {
 
     /// Get the template TypeId of a SubGraphNode.
     pub fn subgraph_template_type_id(&self, node_id: &NodeId) -> Option<TypeId> {
-        let entity = self.get_node_by_id(node_id)?;
+        let entity = self
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))?;
         let read = entity.read().ok()?;
         let sg = read.as_any().downcast_ref::<SubGraphNode>()?;
         sg.template_type_id()

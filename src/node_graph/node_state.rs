@@ -517,6 +517,48 @@ impl NodeStates {
         self.path_index.children_of(path)
     }
 
+    /// Return the (label, DataType) pairs visible to the SubGraph's
+    /// external callers on its *input* side.
+    ///
+    /// The input proxy's input slots ARE the external input schema:
+    /// wires from outside the SubGraph connect to these slots.
+    /// Exposed as `pub(crate)` for P3c.12+ callers (plan-006 Step 10.7).
+    #[allow(dead_code)]
+    pub(crate) fn subgraph_external_inputs(
+        &self,
+        sg_path: &NodePath,
+        input_proxy_id: NodeId,
+    ) -> Vec<(&'static str, DataType)> {
+        let in_path = sg_path.child(input_proxy_id);
+        let n = self.input_slot_count(&in_path);
+        (0..n)
+            .filter_map(|i| self.input_slot(&in_path, i).map(|s| (s.label, s.data_type)))
+            .collect()
+    }
+
+    /// Return the (label, DataType) pairs visible to the SubGraph's
+    /// external callers on its *output* side.
+    ///
+    /// The output proxy's *input* slots ARE the external output schema:
+    /// the proxy receives data from the SubGraph's internal nodes on
+    /// these slots and tees it out to external consumers.
+    /// Exposed as `pub(crate)` for P3c.12+ callers (plan-006 Step 10.7).
+    #[allow(dead_code)]
+    pub(crate) fn subgraph_external_outputs(
+        &self,
+        sg_path: &NodePath,
+        output_proxy_id: NodeId,
+    ) -> Vec<(&'static str, DataType)> {
+        let out_path = sg_path.child(output_proxy_id);
+        let n = self.input_slot_count(&out_path);
+        (0..n)
+            .filter_map(|i| {
+                self.input_slot(&out_path, i)
+                    .map(|s| (s.label, s.data_type))
+            })
+            .collect()
+    }
+
     /// Drain and return all changed node paths since last drain.
     pub fn drain_changed_nodes(&mut self) -> HashSet<NodePath> {
         std::mem::take(&mut self.changed_nodes)
@@ -540,5 +582,48 @@ impl NodeStates {
     /// nodes against the same plan without losing the change record.
     pub fn restore_changed_nodes(&mut self, paths: HashSet<NodePath>) {
         self.changed_nodes.extend(paths);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Verify that `subgraph_external_inputs` returns the input proxy's
+    /// input slots.
+    #[test]
+    fn subgraph_external_inputs_returns_proxy_input_slots() {
+        let mut ns = NodeStates::new();
+        let sg_id = NodeId::new();
+        let in_id = NodeId::new();
+        let sg_path = NodePath::root().child(sg_id);
+        let in_path = sg_path.child(in_id);
+
+        ns.add_node(&sg_path, "SubGraph", None, None, &[], &[]);
+        ns.add_node(&in_path, "Interface", None, None, &[], &[]);
+        ns.add_input_slot(&in_path, "value", DataType::Number, Some(1));
+
+        let schema = ns.subgraph_external_inputs(&sg_path, in_id);
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].0, "value");
+        assert_eq!(schema[0].1, DataType::Number);
+    }
+
+    /// Verify that `subgraph_external_outputs` reads the output proxy's
+    /// *input* slots (the external output schema).
+    #[test]
+    fn subgraph_external_outputs_returns_output_proxy_input_slots() {
+        let mut ns = NodeStates::new();
+        let sg_id = NodeId::new();
+        let out_id = NodeId::new();
+        let sg_path = NodePath::root().child(sg_id);
+        let out_path = sg_path.child(out_id);
+
+        ns.add_node(&sg_path, "SubGraph", None, None, &[], &[]);
+        ns.add_node(&out_path, "Interface", None, None, &[], &[]);
+        ns.add_input_slot(&out_path, "result", DataType::Number, None);
+
+        let schema = ns.subgraph_external_outputs(&sg_path, out_id);
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].0, "result");
     }
 }

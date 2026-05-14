@@ -292,7 +292,6 @@ fn extract_fields_from_default_value(
 
 /// Read-only queries on a node graph.
 pub trait NodeGraphRead {
-    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity>;
     fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId>;
     fn get_nodes_by_ids(&self, ids: Vec<NodeId>) -> Vec<(NodeId, NodeEntity)>;
     fn get_output_value(&self, node_id: &NodeId, output_slot_index: usize) -> Option<Data>;
@@ -342,10 +341,6 @@ pub trait NodeGraphWrite {
 }
 
 impl NodeGraphRead for NodeGraph {
-    fn get_node_by_id(&self, node_id: &NodeId) -> Option<NodeEntity> {
-        self.node_manager.get_node_by_id(node_id)
-    }
-
     fn get_node_ids_by_type<T: NodeImpl + 'static>(&self) -> Vec<NodeId> {
         self.node_manager.get_node_ids_by_type::<T>()
     }

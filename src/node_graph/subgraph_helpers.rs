@@ -6,8 +6,8 @@
 //! All methods operate on the unified parent `NodeStates` and `NodeManager`.
 
 use crate::{
-    Data, DataType, EdgeId, InterfaceNodeData, NodeGraph, NodeGraphRead, NodeId, NodePath,
-    SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
+    Data, DataType, EdgeId, InterfaceNodeData, NodeGraph, NodeId, NodePath, SubGraphNode,
+    INTERFACE_NODE_DATA_DOMAIN,
 };
 
 use super::EdgeInfo;
@@ -17,7 +17,8 @@ impl NodeGraph {
 
     /// Check if a node is a SubGraphNode.
     pub fn is_subgraph_node(&self, node_id: &NodeId) -> bool {
-        self.get_node_by_id(node_id)
+        self.node_manager
+            .get_at(&NodePath::root().child(*node_id))
             .and_then(|entity| {
                 entity
                     .read()
@@ -29,7 +30,9 @@ impl NodeGraph {
 
     /// Get the display label of a SubGraphNode.
     pub fn subgraph_label(&self, node_id: &NodeId) -> Option<String> {
-        let entity = self.get_node_by_id(node_id)?;
+        let entity = self
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))?;
         let guard = entity.read().ok()?;
         let sg = guard.as_any().downcast_ref::<SubGraphNode>()?;
         Some(sg.label().to_string())
@@ -37,7 +40,7 @@ impl NodeGraph {
 
     /// Set the display label of a SubGraphNode.
     pub fn set_subgraph_label(&self, node_id: &NodeId, label: &str) -> bool {
-        let entity = match self.get_node_by_id(node_id) {
+        let entity = match self.node_manager.get_at(&NodePath::root().child(*node_id)) {
             Some(e) => e,
             None => return false,
         };
@@ -58,7 +61,9 @@ impl NodeGraph {
     ///
     /// For path-aware lookup, use `subgraph_proxy_ids_at_path`.
     pub fn subgraph_proxy_ids(&self, node_id: &NodeId) -> Option<(NodeId, NodeId)> {
-        let entity = self.get_node_by_id(node_id)?;
+        let entity = self
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))?;
         let guard = entity.read().ok()?;
         let sg = guard.as_any().downcast_ref::<SubGraphNode>()?;
         Some((sg.input_proxy_id(), sg.output_proxy_id()))

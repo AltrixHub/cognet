@@ -57,3 +57,28 @@ impl NodeGraph {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::NodeGraph;
+    use std::collections::HashSet;
+
+    /// `group_nodes` is a P3 stub; expected to return `Err` until the
+    /// transparent-SubGraph grouping path lands. This pins the contract.
+    #[test]
+    fn group_nodes_returns_unimplemented_error() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let result = graph.group_nodes(&HashSet::new(), "stub");
+        assert!(result.is_err());
+    }
+
+    /// `ungroup_node` is a P3 stub; expected to return `Err` until the
+    /// transparent-SubGraph extraction path lands. This pins the contract.
+    #[test]
+    fn ungroup_node_returns_unimplemented_error() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let dummy_id = crate::NodeId::new();
+        let result = graph.ungroup_node(dummy_id);
+        assert!(result.is_err());
+    }
+}

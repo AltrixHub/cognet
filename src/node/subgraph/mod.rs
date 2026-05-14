@@ -190,8 +190,6 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NodeGraphRead;
-
     #[test]
     fn test_subgraph_creation_via_add_subgraph_at() {
         let mut graph = NodeGraph::new().expect("Failed to create graph");
@@ -200,7 +198,9 @@ mod tests {
             .expect("Failed to create subgraph");
 
         // SubGraphNode exists in NodeManager
-        let node = graph.get_node_by_id(&sg_id).expect("Node not found");
+        let node = graph
+            .node_at_path(&NodePath::root().child(sg_id))
+            .expect("Node not found");
         let read = node.read().expect("Lock failed");
         assert_eq!(read.node_name(), "SubGraph");
         drop(read);

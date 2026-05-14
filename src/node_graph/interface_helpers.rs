@@ -13,7 +13,7 @@
 //! a non-matching domain is `Err` and leaves slots untouched.
 
 use crate::{
-    Data, DataType, InterfaceNode, InterfaceNodeData, NodeGraph, NodeGraphRead, NodeId, NodePath,
+    Data, DataType, InterfaceNode, InterfaceNodeData, NodeGraph, NodeId, NodePath,
     INTERFACE_NODE_DATA_DOMAIN,
 };
 
@@ -34,7 +34,8 @@ impl NodeGraph {
     ) -> Result<usize, String> {
         // 1. Verify target node exists AND is an InterfaceNode.
         let entity = self
-            .get_node_by_id(node_id)
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
         {
             let guard = entity.read().map_err(|e| e.to_string())?;
@@ -105,7 +106,8 @@ impl NodeGraph {
     pub fn remove_interface_port(&self, node_id: &NodeId, label: &str) -> Result<(), String> {
         // 1. Verify target node exists AND is an InterfaceNode.
         let entity = self
-            .get_node_by_id(node_id)
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
         {
             let guard = entity.read().map_err(|e| e.to_string())?;
@@ -180,7 +182,8 @@ impl NodeGraph {
     ) -> Result<(), String> {
         // 1. Verify target node.
         let entity = self
-            .get_node_by_id(node_id)
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
         {
             let guard = entity.read().map_err(|e| e.to_string())?;
