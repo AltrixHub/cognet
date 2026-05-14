@@ -11,9 +11,9 @@
 use std::{any::TypeId, sync::Arc};
 
 use crate::{
-    Data, DataType, InputSlotId, InterfaceDirection, InterfaceNode, InterfaceNodeData, NodeEntity,
-    NodeGraph, NodeId, NodeMeta, NodePath, OutputSlotId, SlotDef, SubGraphNode,
-    INTERFACE_NODE_DATA_DOMAIN,
+    Data, DataType, InputSlotId, InputSlotInfo, InterfaceDirection, InterfaceNode,
+    InterfaceNodeData, NodeEntity, NodeGraph, NodeId, NodeMeta, NodePath, OutputSlotId, SlotDef,
+    SlotInfo, SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
 };
 
 use super::node_graph_api::{extract_fields_from_data, extract_fields_from_default_value};
@@ -114,6 +114,74 @@ impl NodeGraph {
         let read = entity.read().ok()?;
         let sg = read.as_any().downcast_ref::<SubGraphNode>()?;
         Some((sg.input_proxy_id(), sg.output_proxy_id()))
+    }
+
+    // ── Path-aware slot / type queries ──
+    //
+    // Path-aware siblings of the root-only NodeId-keyed accessors in
+    // `node_graph/mod.rs`. The root variants are now thin wrappers
+    // over these.
+
+    /// Get the type name of the node at `path`. Path-aware sibling of
+    /// [`NodeGraph::node_type_name`]; the root variant is a thin
+    /// wrapper over this method.
+    pub fn node_type_name_at(&self, path: &NodePath) -> Option<&'static str> {
+        let ns = self.node_states.read().ok()?;
+        ns.get(path).map(|s| s.type_name)
+    }
+
+    /// Get the input slot count of the node at `path`. Path-aware
+    /// sibling of [`NodeGraph::input_slot_count`]; the root variant is
+    /// a thin wrapper over this method.
+    pub fn input_slot_count_at(&self, path: &NodePath) -> usize {
+        self.node_states
+            .read()
+            .ok()
+            .map(|ns| ns.input_slot_count(path))
+            .unwrap_or(0)
+    }
+
+    /// Get the output slot count of the node at `path`. Path-aware
+    /// sibling of [`NodeGraph::output_slot_count`]; the root variant
+    /// is a thin wrapper over this method.
+    pub fn output_slot_count_at(&self, path: &NodePath) -> usize {
+        self.node_states
+            .read()
+            .ok()
+            .map(|ns| ns.output_slot_count(path))
+            .unwrap_or(0)
+    }
+
+    /// Get combined info for an input slot at `path`. Path-aware
+    /// sibling of [`NodeGraph::input_slot_info`]; the root variant is
+    /// a thin wrapper over this method.
+    pub fn input_slot_info_at(&self, path: &NodePath, slot: usize) -> Option<InputSlotInfo> {
+        let ns = self.node_states.read().ok()?;
+        ns.input_slot(path, slot).map(|s| InputSlotInfo {
+            id: s.id,
+            label: s.label,
+            data_type: s.data_type,
+            default_value: s.default_value.as_ref().map(Arc::clone),
+        })
+    }
+
+    /// Get combined info for an output slot at `path`. Path-aware
+    /// sibling of [`NodeGraph::output_slot_info`]; the root variant is
+    /// a thin wrapper over this method.
+    pub fn output_slot_info_at(&self, path: &NodePath, slot: usize) -> Option<SlotInfo> {
+        let ns = self.node_states.read().ok()?;
+        ns.output_slot(path, slot).map(|s| SlotInfo {
+            label: s.label,
+            data_type: s.data_type,
+        })
+    }
+
+    /// Get the data type of an input slot at `path`. Path-aware
+    /// sibling of [`NodeGraph::input_slot_data_type`]; the root
+    /// variant is a thin wrapper over this method.
+    pub fn input_slot_data_type_at(&self, path: &NodePath, slot: usize) -> Option<DataType> {
+        let ns = self.node_states.read().ok()?;
+        ns.input_slot(path, slot).map(|s| s.data_type)
     }
 
     // ── SubGraph external slot helpers (plan-006 C17 Step 11.5c) ──
@@ -949,5 +1017,101 @@ mod tests {
             .expect("data set");
         let v = data.value::<crate::Vector3>().expect("Vector3 payload");
         assert_eq!((v.x, v.y, v.z), (9.0, 8.0, 7.0));
+    }
+
+    // ── Path-aware slot / type read APIs ──
+
+    /// Build a graph with a SubGraph containing an `Add` node and
+    /// return `(graph, add_path)`.
+    fn graph_with_subgraph_add_node() -> (crate::NodeGraph, crate::NodePath) {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let add_id = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create_node_by_name_at Add");
+        let add_path = sg_path.child(add_id);
+        (graph, add_path)
+    }
+
+    #[test]
+    fn node_type_name_at_depth_2_returns_inner_type() {
+        let (graph, add_path) = graph_with_subgraph_add_node();
+        assert_eq!(
+            graph.node_type_name_at(&add_path),
+            Some("Add"),
+            "node_type_name_at must resolve the inner node type at depth-2",
+        );
+    }
+
+    #[test]
+    fn input_slot_count_at_depth_2_returns_inner_count() {
+        let (graph, add_path) = graph_with_subgraph_add_node();
+        assert_eq!(
+            graph.input_slot_count_at(&add_path),
+            2,
+            "Add has 2 input slots at depth-2 path",
+        );
+    }
+
+    #[test]
+    fn output_slot_count_at_depth_2_returns_inner_count() {
+        let (graph, add_path) = graph_with_subgraph_add_node();
+        assert_eq!(
+            graph.output_slot_count_at(&add_path),
+            1,
+            "Add has 1 output slot at depth-2 path",
+        );
+    }
+
+    #[test]
+    fn input_slot_info_at_depth_2_returns_label() {
+        let (graph, add_path) = graph_with_subgraph_add_node();
+        let info = graph
+            .input_slot_info_at(&add_path, 0)
+            .expect("input slot 0 info");
+        assert_eq!(info.label, "A");
+        assert_eq!(info.data_type, crate::DataType::Number);
+    }
+
+    #[test]
+    fn output_slot_info_at_depth_2_returns_label() {
+        let (graph, add_path) = graph_with_subgraph_add_node();
+        let info = graph
+            .output_slot_info_at(&add_path, 0)
+            .expect("output slot 0 info");
+        assert_eq!(info.label, "Sum");
+        assert_eq!(info.data_type, crate::DataType::Number);
+    }
+
+    #[test]
+    fn input_slot_data_type_at_depth_2_returns_type() {
+        let (graph, add_path) = graph_with_subgraph_add_node();
+        assert_eq!(
+            graph.input_slot_data_type_at(&add_path, 0),
+            Some(crate::DataType::Number),
+        );
+    }
+
+    #[test]
+    fn node_type_name_root_wrapper_still_works() {
+        use crate::NodeGraphWrite;
+
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let add_id = graph
+            .create_node_by_name("Add")
+            .expect("create_node_by_name Add");
+
+        // Root-level NodeId-keyed accessor must still report the
+        // correct type name after refactoring to a thin path wrapper.
+        assert_eq!(graph.node_type_name(&add_id), Some("Add"));
+
+        // And the path-aware read at the canonical root path agrees.
+        assert_eq!(
+            graph.node_type_name_at(&crate::NodePath::root().child(add_id)),
+            Some("Add"),
+        );
     }
 }

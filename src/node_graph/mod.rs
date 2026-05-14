@@ -148,9 +148,7 @@ impl NodeGraph {
 
     /// Get the type name of a node.
     pub fn node_type_name(&self, node_id: &NodeId) -> Option<&'static str> {
-        let ns = self.node_states.read().ok()?;
-        ns.get(&NodePath::root().child(*node_id))
-            .map(|s| s.type_name)
+        self.node_type_name_at(&NodePath::root().child(*node_id))
     }
 
     /// Get the Rust TypeId of a node for type-safe identification.
@@ -223,20 +221,12 @@ impl NodeGraph {
 
     /// Get input slot count for a node.
     pub fn input_slot_count(&self, node_id: &NodeId) -> usize {
-        self.node_states
-            .read()
-            .ok()
-            .map(|ns| ns.input_slot_count(&NodePath::root().child(*node_id)))
-            .unwrap_or(0)
+        self.input_slot_count_at(&NodePath::root().child(*node_id))
     }
 
     /// Get output slot count for a node.
     pub fn output_slot_count(&self, node_id: &NodeId) -> usize {
-        self.node_states
-            .read()
-            .ok()
-            .map(|ns| ns.output_slot_count(&NodePath::root().child(*node_id)))
-            .unwrap_or(0)
+        self.output_slot_count_at(&NodePath::root().child(*node_id))
     }
 
     /// Get the label of an input slot.
@@ -248,9 +238,7 @@ impl NodeGraph {
 
     /// Get the data type of an input slot.
     pub fn input_slot_data_type(&self, node_id: &NodeId, slot: usize) -> Option<DataType> {
-        let ns = self.node_states.read().ok()?;
-        ns.input_slot(&NodePath::root().child(*node_id), slot)
-            .map(|s| s.data_type)
+        self.input_slot_data_type_at(&NodePath::root().child(*node_id), slot)
     }
 
     /// Get the default value of an input slot.
@@ -262,24 +250,12 @@ impl NodeGraph {
 
     /// Get combined info for an input slot (label + data_type + default_value).
     pub fn input_slot_info(&self, node_id: &NodeId, slot: usize) -> Option<InputSlotInfo> {
-        let ns = self.node_states.read().ok()?;
-        ns.input_slot(&NodePath::root().child(*node_id), slot)
-            .map(|s| InputSlotInfo {
-                id: s.id,
-                label: s.label,
-                data_type: s.data_type,
-                default_value: s.default_value.as_ref().map(Arc::clone),
-            })
+        self.input_slot_info_at(&NodePath::root().child(*node_id), slot)
     }
 
     /// Get combined info for an output slot (label + data_type).
     pub fn output_slot_info(&self, node_id: &NodeId, slot: usize) -> Option<SlotInfo> {
-        let ns = self.node_states.read().ok()?;
-        ns.output_slot(&NodePath::root().child(*node_id), slot)
-            .map(|s| SlotInfo {
-                label: s.label,
-                data_type: s.data_type,
-            })
+        self.output_slot_info_at(&NodePath::root().child(*node_id), slot)
     }
 
     /// Get the InputSlotId for an input slot.
