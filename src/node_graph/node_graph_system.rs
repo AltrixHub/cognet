@@ -4,6 +4,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub(crate) trait NodeGraphSystem {
     fn topological_sort(&self, target_nodes: &HashSet<NodeId>) -> Result<Vec<Vec<NodeId>>, String>;
 
+    /// Build an `Edge` value from node IDs and slot indices.
+    ///
+    /// Constructs root-level `NodePath`s for both endpoints. When the
+    /// caller has real (non-root) paths available it should construct
+    /// the `Edge` directly instead.
     fn create_edge(
         &self,
         from_node_id: &NodeId,
@@ -17,27 +22,32 @@ pub(crate) trait NodeGraphSystem {
 
 impl NodeGraphSystem for NodeGraph {
     fn topological_sort(&self, target_nodes: &HashSet<NodeId>) -> Result<Vec<Vec<NodeId>>, String> {
-        let mut in_degree = HashMap::new();
-        let mut adj_list = HashMap::new();
+        let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
+        let mut adj_list: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
 
-        for node_id in target_nodes {
+        for &node_id in target_nodes {
             in_degree.insert(node_id, 0);
             adj_list.insert(node_id, Vec::new());
         }
 
         let ns = self.node_states.read().map_err(|e| e.to_string())?;
-        for node_id in target_nodes {
-            for edge_id in ns.outgoing_edges_at(&NodePath::root().child(*node_id)) {
+        for &node_id in target_nodes {
+            for edge_id in ns.outgoing_edges_at(&NodePath::root().child(node_id)) {
                 if let Some(edge) = ns.get_edge(edge_id) {
-                    if target_nodes.contains(&edge.to_node_id) {
+                    // Planner is still NodeId-based (P3c.12 will migrate it
+                    // to NodePath). Extract the leaf ID from the path for now.
+                    let Some(to_id) = edge.to_node.leaf() else {
+                        continue;
+                    };
+                    let Some(from_id) = edge.from_node.leaf() else {
+                        continue;
+                    };
+                    if target_nodes.contains(&to_id) {
                         in_degree
-                            .entry(&edge.to_node_id)
+                            .entry(to_id)
                             .and_modify(|count| *count += 1)
                             .or_insert(1);
-                        adj_list
-                            .entry(&edge.from_node_id)
-                            .or_default()
-                            .push(edge.to_node_id);
+                        adj_list.entry(from_id).or_default().push(to_id);
                     }
                 }
             }
@@ -46,7 +56,7 @@ impl NodeGraphSystem for NodeGraph {
         let mut queue: VecDeque<NodeId> = in_degree
             .iter()
             .filter(|&(_, &deg)| deg == 0)
-            .map(|(node_id, _)| **node_id)
+            .map(|(node_id, _)| *node_id)
             .collect();
 
         let mut sorted = Vec::new();
@@ -113,10 +123,10 @@ impl NodeGraphSystem for NodeGraph {
 
         tracing::debug!("[cognet] create_edge: DONE");
         Ok(Edge {
-            from_node_id: *from_node_id,
+            from_node: NodePath::root().child(*from_node_id),
             from_output_slot_index,
             from_output_slot_id,
-            to_node_id: *to_node_id,
+            to_node: NodePath::root().child(*to_node_id),
             to_input_slot_index,
             to_input_slot_id,
         })
@@ -124,8 +134,16 @@ impl NodeGraphSystem for NodeGraph {
 
     fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
         tracing::debug!("[cognet] add_edge: START");
-        let from_node_id = edge.from_node_id;
-        let to_node_id = edge.to_node_id;
+        let from_node = edge.from_node.clone();
+        let to_node = edge.to_node.clone();
+        // For error reporting we need a NodeId. Leaf() is always Some for
+        // non-root paths; root-level nodes have a single-element path.
+        let from_node_id = from_node
+            .leaf()
+            .ok_or_else(|| "add_edge: from_node is a root path".to_string())?;
+        let to_node_id = to_node
+            .leaf()
+            .ok_or_else(|| "add_edge: to_node is a root path".to_string())?;
 
         // Clear previous errors for the target input port
         let input_target = ErrorTarget::InputPort {
@@ -139,7 +157,7 @@ impl NodeGraphSystem for NodeGraph {
             let ns = self.node_states.read().map_err(|e| e.to_string())?;
 
             // Validate from node exists
-            if ns.get(&NodePath::root().child(from_node_id)).is_none() {
+            if ns.get(&from_node).is_none() {
                 let error = GraphError::node_not_found(from_node_id);
                 let msg = error.message();
                 self.add_error(error);
@@ -147,7 +165,7 @@ impl NodeGraphSystem for NodeGraph {
             }
 
             // Validate to node exists
-            if ns.get(&NodePath::root().child(to_node_id)).is_none() {
+            if ns.get(&to_node).is_none() {
                 let error = GraphError::node_not_found(to_node_id);
                 let msg = error.message();
                 self.add_error(error);
@@ -155,10 +173,7 @@ impl NodeGraphSystem for NodeGraph {
             }
 
             // Validate output slot
-            let from_slot = match ns.output_slot(
-                &NodePath::root().child(from_node_id),
-                edge.from_output_slot_index,
-            ) {
+            let from_slot = match ns.output_slot(&from_node, edge.from_output_slot_index) {
                 Some(slot) => slot,
                 None => {
                     let error = GraphError::output_slot_not_found(
@@ -172,10 +187,7 @@ impl NodeGraphSystem for NodeGraph {
             };
 
             // Validate input slot
-            let to_slot = match ns.input_slot(
-                &NodePath::root().child(to_node_id),
-                edge.to_input_slot_index,
-            ) {
+            let to_slot = match ns.input_slot(&to_node, edge.to_input_slot_index) {
                 Some(slot) => slot,
                 None => {
                     let error =

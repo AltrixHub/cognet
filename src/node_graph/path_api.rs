@@ -2,7 +2,8 @@
 //!
 //! Provides `add_node_at`, `add_subgraph_at`, `remove_node_at`,
 //! `node_at_path`, `children_of_path`, `is_subgraph_node_at_path`,
-//! `stamp_interface_direction`, and `subgraph_proxy_ids_at_path`.
+//! `stamp_interface_direction`, `subgraph_proxy_ids_at_path`,
+//! `subgraph_external_input_slot`, and `subgraph_external_output_slot`.
 //!
 //! These replace the old `with_graph_at_path` / `internal_graph`
 //! traversal patterns.
@@ -10,8 +11,8 @@
 use std::{any::TypeId, sync::Arc};
 
 use crate::{
-    Data, InterfaceDirection, InterfaceNode, InterfaceNodeData, NodeEntity, NodeGraph, NodeId,
-    NodeMeta, NodePath, SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
+    Data, InputSlotId, InterfaceDirection, InterfaceNode, InterfaceNodeData, NodeEntity, NodeGraph,
+    NodeId, NodeMeta, NodePath, OutputSlotId, SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
 };
 
 use super::node_state::NodeStates;
@@ -111,6 +112,62 @@ impl NodeGraph {
         let read = entity.read().ok()?;
         let sg = read.as_any().downcast_ref::<SubGraphNode>()?;
         Some((sg.input_proxy_id(), sg.output_proxy_id()))
+    }
+
+    // ── SubGraph external slot helpers (plan-006 C17 Step 11.5c) ──
+
+    /// Return the `(NodePath, InputSlotId)` pair that an external edge targets
+    /// when wiring into input port `port_index` of the SubGraph at `sg_path`.
+    ///
+    /// The external input surface of a SubGraphNode is the input-direction
+    /// `InterfaceNode` at `sg_path.child(input_proxy_id)`. Each slot on that
+    /// InterfaceNode is one external input port. This helper resolves the
+    /// concrete `(path, slot_id)` pair so callers can construct `Edge` values
+    /// without having to navigate the proxy manually.
+    ///
+    /// Returns `None` if `sg_path` is not a SubGraphNode or the slot index is
+    /// out of range.
+    pub fn subgraph_external_input_slot(
+        &self,
+        sg_path: &NodePath,
+        port_index: usize,
+    ) -> Option<(NodePath, InputSlotId)> {
+        let entity = self.node_manager.get_at(sg_path)?;
+        let read = entity.read().ok()?;
+        let sg = read.as_any().downcast_ref::<SubGraphNode>()?;
+        let in_path = sg_path.child(sg.input_proxy_id());
+        drop(read);
+        let states = self.node_states.read().ok()?;
+        states
+            .input_slot(&in_path, port_index)
+            .map(|s| (in_path.clone(), s.id))
+    }
+
+    /// Return the `(NodePath, OutputSlotId)` pair that an external edge targets
+    /// when wiring out of output port `port_index` of the SubGraph at `sg_path`.
+    ///
+    /// The external output surface of a SubGraphNode is the output-direction
+    /// `InterfaceNode` at `sg_path.child(output_proxy_id)`. The *output* slots
+    /// of that InterfaceNode are the external outputs (the node tees its inputs
+    /// to those output slots). This helper resolves the concrete
+    /// `(path, slot_id)` pair.
+    ///
+    /// Returns `None` if `sg_path` is not a SubGraphNode or the slot index is
+    /// out of range.
+    pub fn subgraph_external_output_slot(
+        &self,
+        sg_path: &NodePath,
+        port_index: usize,
+    ) -> Option<(NodePath, OutputSlotId)> {
+        let entity = self.node_manager.get_at(sg_path)?;
+        let read = entity.read().ok()?;
+        let sg = read.as_any().downcast_ref::<SubGraphNode>()?;
+        let out_path = sg_path.child(sg.output_proxy_id());
+        drop(read);
+        let states = self.node_states.read().ok()?;
+        states
+            .output_slot(&out_path, port_index)
+            .map(|s| (out_path.clone(), s.id))
     }
 
     // ── Atomic node insertion ──
@@ -257,9 +314,7 @@ impl NodeGraph {
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
         for p in &all_paths {
             // Drop edges connected to this node.
-            if let Some(node_id) = p.leaf() {
-                ns.remove_edges_for_node(&node_id);
-            }
+            ns.remove_edges_for_node_at(p);
             let _ = self.remove_node_at_locked(&mut ns, p);
         }
 

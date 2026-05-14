@@ -22,7 +22,7 @@ pub use subgraph_ops::*;
 
 use crate::{
     Data, DataType, DataValue, Edge, EdgeId, ErrorTarget, GraphError, InputSlotId, NodeId,
-    SubGraphNode,
+    OutputSlotId, SubGraphNode,
 };
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -330,6 +330,27 @@ impl NodeGraph {
                 Some(ns.edges_for_output(&slot_state.id).to_vec())
             })
             .unwrap_or_default()
+    }
+
+    /// Look up the owning `(NodePath, slot_index)` for an `InputSlotId`.
+    ///
+    /// Returns `None` if the slot has been removed or was never registered.
+    /// Thin forwarding wrapper around `NodeStates::input_slot_owner`
+    /// (plan-006 C17).
+    pub fn input_slot_owner(&self, sid: &InputSlotId) -> Option<(NodePath, usize)> {
+        self.node_states.read().ok()?.input_slot_owner(sid).cloned()
+    }
+
+    /// Look up the owning `(NodePath, slot_index)` for an `OutputSlotId`.
+    ///
+    /// Thin forwarding wrapper around `NodeStates::output_slot_owner`
+    /// (plan-006 C17).
+    pub fn output_slot_owner(&self, sid: &OutputSlotId) -> Option<(NodePath, usize)> {
+        self.node_states
+            .read()
+            .ok()?
+            .output_slot_owner(sid)
+            .cloned()
     }
 
     /// Reorder an edge within its output slot's connection list.

@@ -64,6 +64,14 @@ pub(crate) struct NodeStates {
     input_slots: HashMap<(NodePath, usize), InputSlotState>,
     /// Output slot states by (NodePath, slot_index).
     output_slots: HashMap<(NodePath, usize), OutputSlotState>,
+    /// Slot-id reverse-owner map: InputSlotId → (owning NodePath, slot_index).
+    ///
+    /// Kept in lock-step with `input_slots` by every slot insertion/removal path.
+    /// Enables O(1) path lookup for edge consumers that only have a slot ID
+    /// (plan-006 C17).
+    input_slot_owner: HashMap<InputSlotId, (NodePath, usize)>,
+    /// Slot-id reverse-owner map: OutputSlotId → (owning NodePath, slot_index).
+    output_slot_owner: HashMap<OutputSlotId, (NodePath, usize)>,
     /// All edges in the graph.
     edges: HashMap<EdgeId, Edge>,
     /// Index: input slot → connected edge IDs (ordered).
@@ -103,28 +111,26 @@ impl NodeStates {
 
         // Initialize input slot states with metadata
         for (i, def) in input_defs.iter().enumerate() {
-            self.input_slots.insert(
-                (path.clone(), i),
-                InputSlotState {
-                    id: InputSlotId::new(),
-                    label: def.label,
-                    data_type: def.data_type,
-                    max_connections: def.max_connections,
-                    default_value: None,
-                },
-            );
+            let slot = InputSlotState {
+                id: InputSlotId::new(),
+                label: def.label,
+                data_type: def.data_type,
+                max_connections: def.max_connections,
+                default_value: None,
+            };
+            self.input_slot_owner.insert(slot.id, (path.clone(), i));
+            self.input_slots.insert((path.clone(), i), slot);
         }
 
         // Initialize output slot states with metadata
         for (i, def) in output_defs.iter().enumerate() {
-            self.output_slots.insert(
-                (path.clone(), i),
-                OutputSlotState {
-                    id: OutputSlotId::new(),
-                    label: def.label,
-                    data_type: def.data_type,
-                },
-            );
+            let slot = OutputSlotState {
+                id: OutputSlotId::new(),
+                label: def.label,
+                data_type: def.data_type,
+            };
+            self.output_slot_owner.insert(slot.id, (path.clone(), i));
+            self.output_slots.insert((path.clone(), i), slot);
         }
 
         // Mark the node as changed.
@@ -140,16 +146,15 @@ impl NodeStates {
         max_connections: Option<usize>,
     ) -> usize {
         let index = self.input_slot_count(path);
-        self.input_slots.insert(
-            (path.clone(), index),
-            InputSlotState {
-                id: InputSlotId::new(),
-                label,
-                data_type,
-                max_connections,
-                default_value: None,
-            },
-        );
+        let slot = InputSlotState {
+            id: InputSlotId::new(),
+            label,
+            data_type,
+            max_connections,
+            default_value: None,
+        };
+        self.input_slot_owner.insert(slot.id, (path.clone(), index));
+        self.input_slots.insert((path.clone(), index), slot);
         index
     }
 
@@ -161,14 +166,14 @@ impl NodeStates {
         data_type: DataType,
     ) -> usize {
         let index = self.output_slot_count(path);
-        self.output_slots.insert(
-            (path.clone(), index),
-            OutputSlotState {
-                id: OutputSlotId::new(),
-                label,
-                data_type,
-            },
-        );
+        let slot = OutputSlotState {
+            id: OutputSlotId::new(),
+            label,
+            data_type,
+        };
+        self.output_slot_owner
+            .insert(slot.id, (path.clone(), index));
+        self.output_slots.insert((path.clone(), index), slot);
         index
     }
 
@@ -216,20 +221,26 @@ impl NodeStates {
         if index >= count {
             return;
         }
-        // Remove the slot at index
-        self.input_slots.remove(&(path.clone(), index));
-        // Shift slots above index down by 1
+        // Remove the slot at index and tear down its reverse-owner entry.
+        if let Some(slot) = self.input_slots.remove(&(path.clone(), index)) {
+            self.input_slot_owner.remove(&slot.id);
+        }
+        // Shift slots above index down by 1, updating reverse-owner indices.
         for i in (index + 1)..count {
             if let Some(slot) = self.input_slots.remove(&(path.clone(), i)) {
+                self.input_slot_owner.insert(slot.id, (path.clone(), i - 1));
                 self.input_slots.insert((path.clone(), i - 1), slot);
             }
         }
         // Decrement to_input_slot_index on edges that reference this
         // node's higher-indexed input slots so indices stay aligned.
-        let node_id = path.leaf();
         for edge in self.edges.values_mut() {
-            if Some(edge.to_node_id) == node_id && edge.to_input_slot_index > index {
+            if edge.to_node == *path && edge.to_input_slot_index > index {
                 edge.to_input_slot_index -= 1;
+                // Update the reverse-owner index for the shifted slot.
+                if let Some(entry) = self.input_slot_owner.get_mut(&edge.to_input_slot_id) {
+                    entry.1 = edge.to_input_slot_index;
+                }
             }
         }
     }
@@ -246,20 +257,27 @@ impl NodeStates {
         if index >= count {
             return;
         }
-        // Remove the slot at index
-        self.output_slots.remove(&(path.clone(), index));
-        // Shift slots above index down by 1
+        // Remove the slot at index and tear down its reverse-owner entry.
+        if let Some(slot) = self.output_slots.remove(&(path.clone(), index)) {
+            self.output_slot_owner.remove(&slot.id);
+        }
+        // Shift slots above index down by 1, updating reverse-owner indices.
         for i in (index + 1)..count {
             if let Some(slot) = self.output_slots.remove(&(path.clone(), i)) {
+                self.output_slot_owner
+                    .insert(slot.id, (path.clone(), i - 1));
                 self.output_slots.insert((path.clone(), i - 1), slot);
             }
         }
         // Decrement from_output_slot_index on edges that reference this
         // node's higher-indexed output slots so indices stay aligned.
-        let node_id = path.leaf();
         for edge in self.edges.values_mut() {
-            if Some(edge.from_node_id) == node_id && edge.from_output_slot_index > index {
+            if edge.from_node == *path && edge.from_output_slot_index > index {
                 edge.from_output_slot_index -= 1;
+                // Update the reverse-owner index for the shifted slot.
+                if let Some(entry) = self.output_slot_owner.get_mut(&edge.from_output_slot_id) {
+                    entry.1 = edge.from_output_slot_index;
+                }
             }
         }
     }
@@ -279,17 +297,30 @@ impl NodeStates {
         // Tear down the path_index entry.
         self.path_index.remove(path);
 
-        // Remove all edges involving this node (maintains indexes).
-        // `path.leaf()` cannot be None here: remove_node is never called
-        // on the root path. A non-leaf path would silently skip edge
-        // teardown, so make the contract explicit.
-        let node_id = path
-            .leaf()
-            .expect("remove_node requires a non-root NodePath");
-        self.remove_edges_for_node(&node_id);
+        // Remove all edges involving this node.
+        self.remove_edges_for_node_at(path);
 
-        // Remove slot states
+        // Remove slot states and tear down reverse-owner entries.
+        let input_ids: Vec<InputSlotId> = self
+            .input_slots
+            .iter()
+            .filter(|((p, _), _)| p == path)
+            .map(|(_, s)| s.id)
+            .collect();
+        for id in input_ids {
+            self.input_slot_owner.remove(&id);
+        }
         self.input_slots.retain(|(p, _), _| p != path);
+
+        let output_ids: Vec<OutputSlotId> = self
+            .output_slots
+            .iter()
+            .filter(|((p, _), _)| p == path)
+            .map(|(_, s)| s.id)
+            .collect();
+        for id in output_ids {
+            self.output_slot_owner.remove(&id);
+        }
         self.output_slots.retain(|(p, _), _| p != path);
 
         self.nodes.remove(path)
@@ -324,20 +355,32 @@ impl NodeStates {
         self.output_slots.get(&(path.clone(), slot_index))
     }
 
+    /// Look up the owning `(NodePath, slot_index)` for an `InputSlotId`.
+    ///
+    /// Returns `None` if the slot has been removed or was never registered.
+    /// Used by downstream edge consumers that only have a slot ID
+    /// (plan-006 C17). Exposed as `pub` so P3c.12 modeling-side callers
+    /// can use it without touching `NodeStates` internals.
+    pub fn input_slot_owner(&self, sid: &InputSlotId) -> Option<&(NodePath, usize)> {
+        self.input_slot_owner.get(sid)
+    }
+
+    /// Look up the owning `(NodePath, slot_index)` for an `OutputSlotId`.
+    ///
+    /// Symmetric to `input_slot_owner`. Exposed as `pub` for P3c.12
+    /// modeling-side callers (plan-006 C17).
+    pub fn output_slot_owner(&self, sid: &OutputSlotId) -> Option<&(NodePath, usize)> {
+        self.output_slot_owner.get(sid)
+    }
+
     /// Get all leaf NodeIds (compatibility helper for callers that only need flat IDs).
     pub fn node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes.keys().filter_map(|p| p.leaf())
     }
 
     /// Add an edge and update lookup indexes.
-    ///
-    /// P3b note: `Edge.from_node_id` / `to_node_id` are still bare `NodeId`,
-    /// so we root-wrap here. P3c migrates `Edge` to carry `NodePath` and
-    /// removes the `NodePath::root().child(_)` calls in this method.
     pub fn add_edge(&mut self, edge_id: EdgeId, edge: Edge) {
-        // P3b: Edge.to_node_id is NodeId; root-wrap until P3c.
-        self.changed_nodes
-            .insert(NodePath::root().child(edge.to_node_id));
+        self.changed_nodes.insert(edge.to_node.clone());
         self.input_connections
             .entry(edge.to_input_slot_id)
             .or_default()
@@ -346,31 +389,24 @@ impl NodeStates {
             .entry(edge.from_output_slot_id)
             .or_default()
             .push(edge_id);
-        // P3b: Edge.from_node_id is NodeId; root-wrap until P3c.
         self.outgoing_edges
-            .entry(NodePath::root().child(edge.from_node_id))
+            .entry(edge.from_node.clone())
             .or_default()
             .push(edge_id);
         self.edges.insert(edge_id, edge);
     }
 
     /// Remove an edge and update lookup indexes.
-    ///
-    /// P3b note: Edge fields are still bare NodeIds; root-wrap removed in P3c.
     pub fn remove_edge(&mut self, edge_id: &EdgeId) -> Option<Edge> {
         if let Some(edge) = self.edges.remove(edge_id) {
-            // P3b: Edge.to_node_id is NodeId; root-wrap until P3c.
-            self.changed_nodes
-                .insert(NodePath::root().child(edge.to_node_id));
+            self.changed_nodes.insert(edge.to_node.clone());
             if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
                 connections.retain(|id| id != edge_id);
             }
             if let Some(connections) = self.output_connections.get_mut(&edge.from_output_slot_id) {
                 connections.retain(|id| id != edge_id);
             }
-            // P3b: Edge.from_node_id is NodeId; root-wrap until P3c.
-            let from_path = NodePath::root().child(edge.from_node_id);
-            if let Some(outgoing) = self.outgoing_edges.get_mut(&from_path) {
+            if let Some(outgoing) = self.outgoing_edges.get_mut(&edge.from_node) {
                 outgoing.retain(|id| id != edge_id);
             }
             Some(edge)
@@ -379,12 +415,12 @@ impl NodeStates {
         }
     }
 
-    /// Remove all edges involving a node, maintaining all indexes.
-    pub fn remove_edges_for_node(&mut self, node_id: &NodeId) {
+    /// Remove all edges involving a node at `path`, maintaining all indexes.
+    pub fn remove_edges_for_node_at(&mut self, path: &NodePath) {
         let edge_ids: Vec<EdgeId> = self
             .edges
             .iter()
-            .filter(|(_, edge)| edge.from_node_id == *node_id || edge.to_node_id == *node_id)
+            .filter(|(_, edge)| edge.from_node == *path || edge.to_node == *path)
             .map(|(id, _)| *id)
             .collect();
         for edge_id in edge_ids {
@@ -424,7 +460,7 @@ impl NodeStates {
             return false;
         };
         let slot_id = edge.from_output_slot_id;
-        let from_node_id = edge.from_node_id;
+        let from_node = edge.from_node.clone();
 
         let Some(connections) = self.output_connections.get_mut(&slot_id) else {
             return false;
@@ -437,9 +473,7 @@ impl NodeStates {
         let insert_at = new_index.min(connections.len());
         connections.insert(insert_at, id);
 
-        // P3b: Edge.from_node_id is NodeId; root-wrap until P3c.
-        self.changed_nodes
-            .insert(NodePath::root().child(from_node_id));
+        self.changed_nodes.insert(from_node);
         true
     }
 
@@ -452,7 +486,7 @@ impl NodeStates {
             return false;
         };
         let slot_id = edge.to_input_slot_id;
-        let to_node_id = edge.to_node_id;
+        let to_node = edge.to_node.clone();
 
         let Some(connections) = self.input_connections.get_mut(&slot_id) else {
             return false;
@@ -466,9 +500,7 @@ impl NodeStates {
         connections.insert(insert_at, id);
 
         // Mark the target node as changed so the graph re-executes.
-        // P3b: Edge.to_node_id is NodeId; root-wrap until P3c.
-        self.changed_nodes
-            .insert(NodePath::root().child(to_node_id));
+        self.changed_nodes.insert(to_node);
         true
     }
 
@@ -625,5 +657,97 @@ mod tests {
         let schema = ns.subgraph_external_outputs(&sg_path, out_id);
         assert_eq!(schema.len(), 1);
         assert_eq!(schema[0].0, "result");
+    }
+
+    /// Verify that `input_slot_owner` and `output_slot_owner` reverse maps
+    /// are populated on slot insertion and torn down on slot removal.
+    #[test]
+    fn slot_owner_reverse_maps_populated_and_torn_down() {
+        let mut ns = NodeStates::new();
+        let node_id = NodeId::new();
+        let path = NodePath::root().child(node_id);
+
+        ns.add_node(&path, "Test", None, None, &[], &[]);
+
+        // Add one input slot and one output slot dynamically.
+        let in_idx = ns.add_input_slot(&path, "in", DataType::Number, Some(1));
+        let out_idx = ns.add_output_slot(&path, "out", DataType::Number);
+
+        let in_sid = ns.input_slot(&path, in_idx).unwrap().id;
+        let out_sid = ns.output_slot(&path, out_idx).unwrap().id;
+
+        // Reverse maps must be populated.
+        let (in_owner_path, in_owner_idx) = ns.input_slot_owner(&in_sid).unwrap();
+        assert_eq!(*in_owner_path, path);
+        assert_eq!(*in_owner_idx, in_idx);
+
+        let (out_owner_path, out_owner_idx) = ns.output_slot_owner(&out_sid).unwrap();
+        assert_eq!(*out_owner_path, path);
+        assert_eq!(*out_owner_idx, out_idx);
+
+        // Remove the input slot; the reverse entry must be gone.
+        ns.remove_input_slot(&path, in_idx);
+        assert!(ns.input_slot_owner(&in_sid).is_none());
+
+        // Remove the output slot; the reverse entry must be gone.
+        ns.remove_output_slot(&path, out_idx);
+        assert!(ns.output_slot_owner(&out_sid).is_none());
+    }
+
+    /// Verify that static slot defs (via `add_node`) also populate reverse maps.
+    #[test]
+    fn slot_owner_populated_from_static_defs() {
+        use crate::SlotDef;
+        let mut ns = NodeStates::new();
+        let node_id = NodeId::new();
+        let path = NodePath::root().child(node_id);
+
+        let input_defs = [SlotDef {
+            label: "value",
+            data_type: DataType::Number,
+            max_connections: Some(1),
+        }];
+        let output_defs = [SlotDef {
+            label: "result",
+            data_type: DataType::Number,
+            max_connections: None,
+        }];
+
+        ns.add_node(&path, "Test", None, None, &input_defs, &output_defs);
+
+        let in_sid = ns.input_slot(&path, 0).unwrap().id;
+        let out_sid = ns.output_slot(&path, 0).unwrap().id;
+
+        assert!(ns.input_slot_owner(&in_sid).is_some());
+        assert!(ns.output_slot_owner(&out_sid).is_some());
+
+        // Verify contents.
+        let (p, i) = ns.input_slot_owner(&in_sid).unwrap();
+        assert_eq!(*p, path);
+        assert_eq!(*i, 0);
+        let (p, i) = ns.output_slot_owner(&out_sid).unwrap();
+        assert_eq!(*p, path);
+        assert_eq!(*i, 0);
+    }
+
+    /// Verify that removing a node tears down reverse-owner entries for
+    /// all its slots.
+    #[test]
+    fn remove_node_clears_slot_owner_maps() {
+        let mut ns = NodeStates::new();
+        let node_id = NodeId::new();
+        let path = NodePath::root().child(node_id);
+
+        ns.add_node(&path, "Test", None, None, &[], &[]);
+        ns.add_input_slot(&path, "i", DataType::Number, None);
+        ns.add_output_slot(&path, "o", DataType::Number);
+
+        let in_sid = ns.input_slot(&path, 0).unwrap().id;
+        let out_sid = ns.output_slot(&path, 0).unwrap().id;
+
+        ns.remove_node(&path);
+
+        assert!(ns.input_slot_owner(&in_sid).is_none());
+        assert!(ns.output_slot_owner(&out_sid).is_none());
     }
 }

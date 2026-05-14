@@ -920,8 +920,10 @@ impl NodeGraph {
                     let path = NodePath::root().child(node_id);
                     for edge_id in ns.outgoing_edges_at(&path) {
                         if let Some(edge) = ns.get_edge(edge_id) {
-                            if !affected.contains(&edge.to_node_id) {
-                                queue.push_back(edge.to_node_id);
+                            if let Some(to_id) = edge.to_node.leaf() {
+                                if !affected.contains(&to_id) {
+                                    queue.push_back(to_id);
+                                }
                             }
                         }
                     }
@@ -1026,7 +1028,7 @@ impl NodeGraph {
                         let input_count = ns.input_slot_count(&node_path);
                         let mut slot_inputs = vec![None; input_count];
                         for edge in ns.edges().values() {
-                            if edge.to_node_id == *node_id
+                            if edge.to_node.leaf().as_ref() == Some(node_id)
                                 && (edge.to_input_slot_index) < slot_inputs.len()
                             {
                                 if let Some(data) = cache.outputs.get(&edge.from_output_slot_id) {
@@ -1041,7 +1043,13 @@ impl NodeGraph {
                 }
 
                 for (edge_id, edge) in ns.edges() {
-                    if executed_node_ids.contains(&edge.from_node_id) {
+                    let Some(from_id) = edge.from_node.leaf() else {
+                        continue;
+                    };
+                    let Some(to_id) = edge.to_node.leaf() else {
+                        continue;
+                    };
+                    if executed_node_ids.contains(&from_id) {
                         let data = cache
                             .outputs
                             .get(&edge.from_output_slot_id)
@@ -1049,9 +1057,9 @@ impl NodeGraph {
                         edge_values.insert(
                             *edge_id,
                             EdgeValue {
-                                from_node: edge.from_node_id,
+                                from_node: from_id,
                                 from_slot: edge.from_output_slot_index,
-                                to_node: edge.to_node_id,
+                                to_node: to_id,
                                 to_slot: edge.to_input_slot_index,
                                 data,
                             },

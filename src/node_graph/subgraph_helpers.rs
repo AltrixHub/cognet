@@ -83,7 +83,8 @@ impl NodeGraph {
 
     /// Get all edges between nodes that are direct children of a SubGraphNode.
     ///
-    /// Returns edges whose both endpoints are children of `node_id`'s SubGraph.
+    /// Returns edges whose both endpoints are direct children of `node_id`'s
+    /// SubGraph (i.e. both `from_node` and `to_node` are `sg_path.child(_)`).
     pub fn subgraph_edges(&self, node_id: &NodeId) -> Vec<EdgeInfo> {
         let sg_path = NodePath::root().child(*node_id);
         let ns = match self.node_states.read() {
@@ -98,13 +99,22 @@ impl NodeGraph {
         ns.edges()
             .iter()
             .filter(|(_, edge)| {
-                children.contains(&edge.from_node_id) && children.contains(&edge.to_node_id)
+                // Both endpoints must be direct children of the SubGraph.
+                edge.from_node
+                    .leaf()
+                    .map(|id| children.contains(&id))
+                    .unwrap_or(false)
+                    && edge
+                        .to_node
+                        .leaf()
+                        .map(|id| children.contains(&id))
+                        .unwrap_or(false)
             })
             .map(|(id, edge)| EdgeInfo {
                 id: *id,
-                from_node: edge.from_node_id,
+                from_node: edge.from_node.clone(),
                 from_output: edge.from_output_slot_index,
-                to_node: edge.to_node_id,
+                to_node: edge.to_node.clone(),
                 to_input: edge.to_input_slot_index,
             })
             .collect()
