@@ -225,7 +225,10 @@ fn build_execution_context(
 }
 
 /// Extract field name/value pairs from a `Data` value for composite types.
-fn extract_fields_from_data(data_type: DataType, data: Option<&Data>) -> Vec<(&'static str, f64)> {
+pub(super) fn extract_fields_from_data(
+    data_type: DataType,
+    data: Option<&Data>,
+) -> Vec<(&'static str, f64)> {
     let fields = data_type.field_names();
     if fields.is_empty() {
         return Vec::new();
@@ -253,7 +256,7 @@ fn extract_fields_from_data(data_type: DataType, data: Option<&Data>) -> Vec<(&'
 }
 
 /// Extract field name/value pairs from a `DataValue` (slot default) for composite types.
-fn extract_fields_from_default_value(
+pub(super) fn extract_fields_from_default_value(
     data_type: DataType,
     default_value: Option<&DataValue>,
 ) -> Vec<(&'static str, f64)> {
@@ -427,13 +430,7 @@ impl NodeGraphWrite for NodeGraph {
     }
 
     fn update_node_data(&mut self, node_id: &NodeId, data: Data) -> Result<(), String> {
-        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-        let node_state = guard
-            .get_mut(&NodePath::root().child(*node_id))
-            .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-        node_state.data = Some(data);
-        guard.mark_changed(&NodePath::root().child(*node_id));
-        Ok(())
+        self.update_node_data_at(&NodePath::root().child(*node_id), data)
     }
 
     fn update_input_slot_default_data(
@@ -442,13 +439,7 @@ impl NodeGraphWrite for NodeGraph {
         slot_index: usize,
         data: Data,
     ) -> Result<(), String> {
-        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-        let slot = guard
-            .input_slot_mut(&NodePath::root().child(*node_id), slot_index)
-            .ok_or_else(|| format!("Input slot {} not found for node {:?}", slot_index, node_id))?;
-        slot.default_value = Some(data.into_value());
-        guard.mark_changed(&NodePath::root().child(*node_id));
-        Ok(())
+        self.update_input_slot_default_data_at(&NodePath::root().child(*node_id), slot_index, data)
     }
 
     fn update_node_data_field(
@@ -458,36 +449,12 @@ impl NodeGraphWrite for NodeGraph {
         field_name: &str,
         value: f64,
     ) -> Result<(), String> {
-        // Read current field values from existing node data
-        let current_fields: Vec<(&str, f64)> = {
-            let ns = self.node_states.read().map_err(|e| e.to_string())?;
-            let state = ns
-                .get(&NodePath::root().child(*node_id))
-                .ok_or_else(|| format!("Node with ID {:?} not found", node_id))?;
-            extract_fields_from_data(data_type, state.data.as_ref())
-        };
-
-        // Assemble new Data by replacing the target field
-        let data = data_type
-            .assemble(|f| {
-                if f == field_name {
-                    value
-                } else {
-                    current_fields
-                        .iter()
-                        .find(|(name, _)| *name == f)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0)
-                }
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Cannot assemble data for type {:?} (non-composite type)",
-                    data_type
-                )
-            })?;
-
-        self.update_node_data(node_id, data)
+        self.update_node_data_field_at(
+            &NodePath::root().child(*node_id),
+            data_type,
+            field_name,
+            value,
+        )
     }
 
     fn update_input_slot_default_field(
@@ -497,40 +464,12 @@ impl NodeGraphWrite for NodeGraph {
         field_name: &str,
         value: f64,
     ) -> Result<(), String> {
-        // Read current field values and data_type from existing slot default
-        let (data_type, current_fields) = {
-            let ns = self.node_states.read().map_err(|e| e.to_string())?;
-            let slot = ns
-                .input_slot(&NodePath::root().child(*node_id), slot_index)
-                .ok_or_else(|| {
-                    format!("Input slot {} not found for node {:?}", slot_index, node_id)
-                })?;
-            let dt = slot.data_type;
-            let fields = extract_fields_from_default_value(dt, slot.default_value.as_ref());
-            (dt, fields)
-        };
-
-        // Assemble new Data by replacing the target field
-        let data = data_type
-            .assemble(|f| {
-                if f == field_name {
-                    value
-                } else {
-                    current_fields
-                        .iter()
-                        .find(|(name, _)| *name == f)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0)
-                }
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Cannot assemble data for type {:?} (non-composite type)",
-                    data_type
-                )
-            })?;
-
-        self.update_input_slot_default_data(node_id, slot_index, data)
+        self.update_input_slot_default_field_at(
+            &NodePath::root().child(*node_id),
+            slot_index,
+            field_name,
+            value,
+        )
     }
 
     fn connect_nodes(

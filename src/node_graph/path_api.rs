@@ -11,10 +11,12 @@
 use std::{any::TypeId, sync::Arc};
 
 use crate::{
-    Data, InputSlotId, InterfaceDirection, InterfaceNode, InterfaceNodeData, NodeEntity, NodeGraph,
-    NodeId, NodeMeta, NodePath, OutputSlotId, SlotDef, SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
+    Data, DataType, InputSlotId, InterfaceDirection, InterfaceNode, InterfaceNodeData, NodeEntity,
+    NodeGraph, NodeId, NodeMeta, NodePath, OutputSlotId, SlotDef, SubGraphNode,
+    INTERFACE_NODE_DATA_DOMAIN,
 };
 
+use super::node_graph_api::{extract_fields_from_data, extract_fields_from_default_value};
 use super::node_state::NodeStates;
 
 impl NodeGraph {
@@ -350,6 +352,129 @@ impl NodeGraph {
         Ok(id)
     }
 
+    // ── Path-aware node-data / slot-default mutators (plan-007 P007c) ──
+
+    /// Replace the node-data payload at `path` and flag the path as
+    /// changed. Path-aware sibling of
+    /// [`NodeGraphWrite::update_node_data`]; the root variant is now a
+    /// thin wrapper over this method.
+    pub fn update_node_data_at(&mut self, path: &NodePath, data: Data) -> Result<(), String> {
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+        let node_state = guard
+            .get_mut(path)
+            .ok_or_else(|| format!("Node at path {} not found", path))?;
+        node_state.data = Some(data);
+        guard.mark_changed(path);
+        Ok(())
+    }
+
+    /// Replace the default value of input slot `slot_index` at `path`.
+    /// Path-aware sibling of
+    /// [`NodeGraphWrite::update_input_slot_default_data`]; the root
+    /// variant is now a thin wrapper over this method.
+    pub fn update_input_slot_default_data_at(
+        &mut self,
+        path: &NodePath,
+        slot_index: usize,
+        data: Data,
+    ) -> Result<(), String> {
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+        let slot = guard
+            .input_slot_mut(path, slot_index)
+            .ok_or_else(|| format!("Input slot {} not found at path {}", slot_index, path))?;
+        slot.default_value = Some(data.into_value());
+        guard.mark_changed(path);
+        Ok(())
+    }
+
+    /// Replace a single field of the node-data payload at `path`.
+    /// Path-aware sibling of
+    /// [`NodeGraphWrite::update_node_data_field`]; the root variant is
+    /// now a thin wrapper over this method.
+    pub fn update_node_data_field_at(
+        &mut self,
+        path: &NodePath,
+        data_type: DataType,
+        field_name: &str,
+        value: f64,
+    ) -> Result<(), String> {
+        // Read current field values from existing node data
+        let current_fields: Vec<(&str, f64)> = {
+            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+            let state = ns
+                .get(path)
+                .ok_or_else(|| format!("Node at path {} not found", path))?;
+            extract_fields_from_data(data_type, state.data.as_ref())
+        };
+
+        // Assemble new Data by replacing the target field
+        let data = data_type
+            .assemble(|f| {
+                if f == field_name {
+                    value
+                } else {
+                    current_fields
+                        .iter()
+                        .find(|(name, _)| *name == f)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0)
+                }
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Cannot assemble data for type {:?} (non-composite type)",
+                    data_type
+                )
+            })?;
+
+        self.update_node_data_at(path, data)
+    }
+
+    /// Replace a single field of the input-slot default at `path`.
+    /// Path-aware sibling of
+    /// [`NodeGraphWrite::update_input_slot_default_field`]; the root
+    /// variant is now a thin wrapper over this method.
+    pub fn update_input_slot_default_field_at(
+        &mut self,
+        path: &NodePath,
+        slot_index: usize,
+        field_name: &str,
+        value: f64,
+    ) -> Result<(), String> {
+        // Read current field values and data_type from existing slot default
+        let (data_type, current_fields) = {
+            let ns = self.node_states.read().map_err(|e| e.to_string())?;
+            let slot = ns
+                .input_slot(path, slot_index)
+                .ok_or_else(|| format!("Input slot {} not found at path {}", slot_index, path))?;
+            let dt = slot.data_type;
+            let fields = extract_fields_from_default_value(dt, slot.default_value.as_ref());
+            (dt, fields)
+        };
+
+        // Assemble new Data by replacing the target field
+        let data = data_type
+            .assemble(|f| {
+                if f == field_name {
+                    value
+                } else {
+                    current_fields
+                        .iter()
+                        .find(|(name, _)| *name == f)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0)
+                }
+            })
+            .ok_or_else(|| {
+                format!(
+                    "Cannot assemble data for type {:?} (non-composite type)",
+                    data_type
+                )
+            })?;
+
+        self.update_input_slot_default_data_at(path, slot_index, data)
+    }
+
     /// Shared NodeStates registration step for the `_at` factory
     /// dispatch paths. Resolves the static `'static` name + slot defs
     /// (from inventory when available, otherwise from the leaked
@@ -648,5 +773,181 @@ mod tests {
         assert!(graph
             .node_at_path(&crate::NodePath::root().child(returned))
             .is_some());
+    }
+
+    // ── update_*_at family tests (plan-007 P007c) ──
+
+    /// Test-only node with a `Vector3` input slot. Built-in nodes only
+    /// expose `Vector3` on *output* slots; the slot-default-field
+    /// round-trip test needs an input slot of a composite type to
+    /// exercise the assemble-from-fields path.
+    #[derive(Debug)]
+    struct Vec3InputNode;
+
+    impl crate::NodeMeta for Vec3InputNode {
+        const NAME: &'static str = "Vec3InputTestNode";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Primitive;
+        const INPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "In",
+            data_type: crate::DataType::Vector3,
+            max_connections: Some(1),
+        }];
+        const OUTPUTS: &'static [crate::SlotDef] = &[];
+    }
+
+    impl crate::NodeImpl for Vec3InputNode {
+        fn execute_sync(&self, _ctx: crate::ExecutionContext) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    crate::register_nodes!(Vec3InputNode);
+
+    #[test]
+    fn update_node_data_at_depth_2_marks_path_changed() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let v3_id = graph
+            .create_node_by_name_at(&sg_path, "Vector3")
+            .expect("create_node_by_name_at Vector3");
+        let v3_path = sg_path.child(v3_id);
+
+        // Drain any change records from creation so we observe only the
+        // mutation we are about to perform.
+        {
+            let mut ns = graph.node_states.write().expect("write ns");
+            let _ = ns.drain_changed_nodes();
+        }
+
+        let new_data =
+            crate::Data::new(crate::Vector3::new(1.0, 2.0, 3.0)).expect("Data::new Vector3");
+        graph
+            .update_node_data_at(&v3_path, new_data)
+            .expect("update_node_data_at");
+
+        // The depth-2 path is the canonical key in changed_nodes.
+        let changed = graph
+            .node_states
+            .read()
+            .expect("read ns")
+            .peek_changed_nodes();
+        assert!(
+            changed.contains(&v3_path),
+            "depth-2 path {} must appear in changed_nodes, got {:?}",
+            v3_path,
+            changed
+        );
+
+        // The data round-trips through node_data_at_path.
+        let data = graph.node_data_at_path(&v3_path).expect("data set");
+        let v = data.value::<crate::Vector3>().expect("Vector3 payload");
+        assert_eq!((v.x, v.y, v.z), (1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn update_input_slot_default_data_at_depth_2_sets_slot() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let add_id = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create_node_by_name_at Add");
+        let add_path = sg_path.child(add_id);
+
+        let new_default = crate::Data::new(11.5_f64).expect("Data::new f64");
+        graph
+            .update_input_slot_default_data_at(&add_path, 0, new_default)
+            .expect("update_input_slot_default_data_at");
+
+        let ns = graph.node_states.read().expect("read ns");
+        let slot = ns
+            .input_slot(&add_path, 0)
+            .expect("input slot 0 must exist");
+        let dv = slot
+            .default_value
+            .as_ref()
+            .expect("default_value set after update");
+        let value = dv.downcast_ref::<f64>().expect("f64 default");
+        assert_eq!(*value, 11.5);
+    }
+
+    #[test]
+    fn update_node_data_field_at_depth_2_field_round_trip() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let v3_id = graph
+            .create_node_by_name_at(&sg_path, "Vector3")
+            .expect("create_node_by_name_at Vector3");
+        let v3_path = sg_path.child(v3_id);
+
+        graph
+            .update_node_data_field_at(&v3_path, crate::DataType::Vector3, "y", 7.25)
+            .expect("update_node_data_field_at y");
+
+        let data = graph.node_data_at_path(&v3_path).expect("data set");
+        let v = data.value::<crate::Vector3>().expect("Vector3 payload");
+        // Only the targeted field changed; defaults for x/z were 0.0.
+        assert_eq!((v.x, v.y, v.z), (0.0, 7.25, 0.0));
+    }
+
+    #[test]
+    fn update_input_slot_default_field_at_depth_2_round_trip() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let n_id = graph
+            .create_node_by_name_at(&sg_path, "Vec3InputTestNode")
+            .expect("create_node_by_name_at Vec3InputTestNode");
+        let n_path = sg_path.child(n_id);
+
+        graph
+            .update_input_slot_default_field_at(&n_path, 0, "z", -4.5)
+            .expect("update_input_slot_default_field_at z");
+
+        let ns = graph.node_states.read().expect("read ns");
+        let slot = ns.input_slot(&n_path, 0).expect("input slot 0");
+        let dv = slot
+            .default_value
+            .as_ref()
+            .expect("default_value set after field update");
+        let v = dv
+            .downcast_ref::<crate::Vector3>()
+            .expect("Vector3 default value");
+        assert_eq!((v.x, v.y, v.z), (0.0, 0.0, -4.5));
+    }
+
+    #[test]
+    fn update_node_data_root_wrapper_still_works() {
+        use crate::NodeGraphWrite;
+
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let v3_id = graph
+            .create_node_by_name("Vector3")
+            .expect("create_node_by_name Vector3");
+
+        // Mutate via the root-level trait method.
+        let new_data =
+            crate::Data::new(crate::Vector3::new(9.0, 8.0, 7.0)).expect("Data::new Vector3");
+        graph
+            .update_node_data(&v3_id, new_data)
+            .expect("update_node_data root wrapper");
+
+        // Same read works through the path-aware getter, confirming the
+        // root wrapper writes to the canonical `root.child(id)` path.
+        let data = graph
+            .node_data_at_path(&crate::NodePath::root().child(v3_id))
+            .expect("data set");
+        let v = data.value::<crate::Vector3>().expect("Vector3 payload");
+        assert_eq!((v.x, v.y, v.z), (9.0, 8.0, 7.0));
     }
 }
