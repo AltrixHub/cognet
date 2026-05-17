@@ -380,7 +380,48 @@ mod subgraph_edge_alias_tests {
     //! contract so the SubGraph external port surface is a real data
     //! path (not a runtime no-op).
 
-    use crate::{DataType, NodeGraph, NodeGraphWrite, NodePath};
+    use crate::{DataType, NodeGraph, NodeGraphWrite, NodeMeta, NodePath};
+
+    /// Test-only passthrough node used by
+    /// `execute_delivers_external_number_through_subgraph_input` (and
+    /// future Phase X2 tests) to assert that an external Number value
+    /// reaches a CONSUMER node downstream of `InputProxy`. We define
+    /// our own node here (rather than reusing the built-in
+    /// `"Number Output"` sink) so the assertion targets the consumer's
+    /// own output slot — keeping the test valid in Phase X2 where the
+    /// `InterfaceNode` tee becomes a runtime no-op and values flow via
+    /// the executor's follow-through.
+    #[derive(Debug)]
+    struct NumberPassthrough;
+
+    impl crate::NodeMeta for NumberPassthrough {
+        const NAME: &'static str = "NumberPassthroughTest";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Utility;
+        const INPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "x",
+            data_type: crate::DataType::Number,
+            max_connections: Some(1),
+        }];
+        const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "x",
+            data_type: crate::DataType::Number,
+            max_connections: None,
+        }];
+        const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::None;
+    }
+
+    impl crate::NodeImpl for NumberPassthrough {
+        fn execute_sync(&self, ctx: crate::ExecutionContext) -> Result<(), String> {
+            if let Some(d) = ctx.input_values.first().and_then(|v| v.first()) {
+                ctx.output_writer
+                    .set(0, d.share())
+                    .map_err(|e| format!("NumberPassthroughTest slot 0: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+
+    crate::register_nodes!(NumberPassthrough);
 
     #[test]
     fn input_edge_to_subgraph_external_slot_is_routed_to_input_proxy() {
@@ -583,5 +624,65 @@ mod subgraph_edge_alias_tests {
         let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
         assert_eq!(edge.from_node, NodePath::root().child(num_id));
         assert_eq!(edge.to_node, NodePath::root().child(add_id));
+    }
+
+    /// End-to-end proof of Option D's contract: after `add_edge` rewrites
+    /// a Number → SubGraph external edge into a Number → InputProxy edge,
+    /// an `execute_sync()` cycle delivers the external Number's value to
+    /// a CONSUMER node (`NumberPassthroughTest`, defined above) wired
+    /// downstream of InputProxy *inside* the SubGraph. The assertion
+    /// deliberately checks the consumer's output — NOT the InterfaceNode
+    /// tee's output — so the test survives Phase X2 (where the tee
+    /// becomes a runtime no-op and values flow via
+    /// `resolve_value_through_interface`).
+    #[test]
+    fn execute_delivers_external_number_through_subgraph_input() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_input(&sg_id, "x", DataType::Number)
+            .expect("add input");
+
+        // Wire an internal consumer: InputProxy.output[0] -> consumer.input[0].
+        // The consumer's own output[0] is what we assert on.
+        let sg_path = NodePath::root().child(sg_id);
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg_id).expect("proxy ids");
+        let proxy_path = sg_path.child(input_proxy_id);
+
+        let consumer_id = graph
+            .create_node_by_name_at(&sg_path, NumberPassthrough::NAME)
+            .expect("create consumer");
+        let consumer_path = sg_path.child(consumer_id);
+        graph
+            .connect_nodes_at(&proxy_path, 0, &consumer_path, 0)
+            .expect("internal: InputProxy -> consumer");
+
+        // External: Number(7.5) -> SubGraph.external[0]
+        // (gets rewritten by add_edge to Number -> InputProxy.input[0]).
+        let num_id = graph.create_node_by_name("Number").expect("create Number");
+        graph
+            .update_node_data(&num_id, crate::Data::new(7.5_f64).expect("Data::new f64"))
+            .expect("set Number data");
+        graph
+            .connect_nodes(&num_id, 0, &sg_id, 0)
+            .expect("connect external -> SubGraph external slot");
+
+        let result = graph.execute_sync().expect("execute_sync");
+
+        let consumer_outputs = result
+            .node_outputs
+            .get(&consumer_path)
+            .expect("consumer node must appear in execution result");
+        let first = consumer_outputs
+            .first()
+            .and_then(|o| o.as_ref())
+            .expect("consumer must produce an output for slot 0");
+        let f: f64 = *first.value::<f64>().expect("Number downcast");
+        assert!(
+            (f - 7.5).abs() < 1e-9,
+            "consumer downstream of InputProxy must see external Number's 7.5; got {f}"
+        );
     }
 }
