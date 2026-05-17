@@ -5,6 +5,8 @@
 //! `internal_graph` field or `with_subgraph` / `with_subgraph_mut` pattern.
 //! All methods operate on the unified parent `NodeStates` and `NodeManager`.
 
+use std::sync::Arc;
+
 use crate::{
     Data, DataType, EdgeId, InterfaceNodeData, NodeGraph, NodeId, NodePath, SubGraphNode,
     INTERFACE_NODE_DATA_DOMAIN,
@@ -427,24 +429,115 @@ impl NodeGraph {
         Ok(index)
     }
 
-    /// Set the default value for a SubGraphNode input port.
+    /// Set the default value for a SubGraphNode input port AND mirror
+    /// the same value onto the SubGraph's `InputProxy` input slot so the
+    /// internals can read it at execute time.
+    ///
+    /// plan-010 §3.6: the SubGraphNode external slot is the wiring
+    /// surface external callers see, but `InterfaceNode`'s pass-through
+    /// tee reads from the proxy's own input slot. Without a mirror, the
+    /// default never reaches the proxy and the internals downstream of
+    /// `InputProxy.output[i]` execute with no value.
+    ///
+    /// **Atomicity**: both target slots are pre-validated to exist
+    /// before any mutation; either both are updated or `Err` is
+    /// returned with no partial state.
+    ///
+    /// **Dirty**: both the SubGraph path and the proxy path are marked
+    /// changed so the executor's dirty planning includes the internals
+    /// downstream of the proxy's output slots.
     pub fn set_subgraph_input_default(
         &self,
         node_id: &NodeId,
         input_index: usize,
         data: Data,
     ) -> Result<(), String> {
+        let (input_proxy_id, _) = self.subgraph_proxy_ids(node_id).ok_or_else(|| {
+            format!(
+                "set_subgraph_input_default: SubGraph {:?} has no input proxy (schema corruption)",
+                node_id
+            )
+        })?;
+        let sg_path = NodePath::root().child(*node_id);
+        let proxy_path = sg_path.child(input_proxy_id);
+
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        let slot = ns
-            .input_slot_mut(&NodePath::root().child(*node_id), input_index)
-            .ok_or_else(|| {
-                format!(
-                    "Input slot {} not found for node {:?}",
-                    input_index, node_id
-                )
-            })?;
-        slot.default_value = Some(data.into_value());
-        ns.mark_changed(&NodePath::root().child(*node_id));
+
+        // Pre-validate BOTH targets exist before any mutation.
+        if ns.input_slot(&sg_path, input_index).is_none() {
+            return Err(format!(
+                "set_subgraph_input_default: external slot {} missing on SubGraph {:?}",
+                input_index, node_id
+            ));
+        }
+        if ns.input_slot(&proxy_path, input_index).is_none() {
+            return Err(format!(
+                "set_subgraph_input_default: InputProxy {:?} missing slot {} \
+                 (schema mismatch with SubGraph external)",
+                input_proxy_id, input_index
+            ));
+        }
+
+        // Atomic mutate.
+        let value = data.into_value();
+        ns.input_slot_mut(&sg_path, input_index)
+            .expect("validated above")
+            .default_value = Some(Arc::clone(&value));
+        ns.input_slot_mut(&proxy_path, input_index)
+            .expect("validated above")
+            .default_value = Some(value);
+
+        // Dirty BOTH paths — see plan-010 §3.6.
+        ns.mark_changed(&sg_path);
+        ns.mark_changed(&proxy_path);
+        Ok(())
+    }
+
+    /// Clear the default value of a SubGraphNode input port (set it back
+    /// to `None`) AND clear the mirrored value on the `InputProxy` so
+    /// internals stop seeing it. Companion to
+    /// [`set_subgraph_input_default`].
+    ///
+    /// Same atomicity / dirty contract as `set_subgraph_input_default`.
+    pub fn clear_subgraph_input_default(
+        &self,
+        node_id: &NodeId,
+        input_index: usize,
+    ) -> Result<(), String> {
+        let (input_proxy_id, _) = self.subgraph_proxy_ids(node_id).ok_or_else(|| {
+            format!(
+                "clear_subgraph_input_default: SubGraph {:?} has no input proxy (schema corruption)",
+                node_id
+            )
+        })?;
+        let sg_path = NodePath::root().child(*node_id);
+        let proxy_path = sg_path.child(input_proxy_id);
+
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+
+        if ns.input_slot(&sg_path, input_index).is_none() {
+            return Err(format!(
+                "clear_subgraph_input_default: external slot {} missing on SubGraph {:?}",
+                input_index, node_id
+            ));
+        }
+        if ns.input_slot(&proxy_path, input_index).is_none() {
+            return Err(format!(
+                "clear_subgraph_input_default: InputProxy {:?} missing slot {} \
+                 (schema mismatch with SubGraph external)",
+                input_proxy_id, input_index
+            ));
+        }
+
+        ns.input_slot_mut(&sg_path, input_index)
+            .expect("validated above")
+            .default_value = None;
+        ns.input_slot_mut(&proxy_path, input_index)
+            .expect("validated above")
+            .default_value = None;
+
+        ns.mark_changed(&sg_path);
+        ns.mark_changed(&proxy_path);
         Ok(())
     }
 }
@@ -640,5 +733,141 @@ mod tests {
                 .unwrap();
             assert_eq!(slot.label, "new_name");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // plan-010 §3.6 — SubGraph external default → InputProxy mirror
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn set_subgraph_input_default_mirrors_to_input_proxy() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        graph
+            .add_subgraph_input(&sg, "x", DataType::Number)
+            .expect("add input");
+
+        let value = crate::Data::new(7.0_f64).expect("Data::new");
+        graph
+            .set_subgraph_input_default(&sg, 0, value.clone())
+            .expect("set default");
+
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg).expect("proxy ids");
+        let sg_path = crate::NodePath::root().child(sg);
+        let proxy_path = sg_path.child(input_proxy_id);
+
+        let ns = graph.node_states().read().expect("read");
+        let ext = ns.input_slot(&sg_path, 0).expect("ext slot");
+        let prx = ns.input_slot(&proxy_path, 0).expect("proxy slot");
+        assert!(ext.default_value.is_some(), "external default written");
+        assert!(prx.default_value.is_some(), "proxy default mirrored");
+    }
+
+    #[test]
+    fn clear_subgraph_input_default_clears_input_proxy_too() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        graph
+            .add_subgraph_input(&sg, "x", DataType::Number)
+            .expect("add input");
+        graph
+            .set_subgraph_input_default(&sg, 0, crate::Data::new(7.0_f64).unwrap())
+            .expect("set default");
+
+        graph
+            .clear_subgraph_input_default(&sg, 0)
+            .expect("clear default");
+
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg).expect("proxy ids");
+        let sg_path = crate::NodePath::root().child(sg);
+        let proxy_path = sg_path.child(input_proxy_id);
+        let ns = graph.node_states().read().expect("read");
+        assert!(ns.input_slot(&sg_path, 0).unwrap().default_value.is_none());
+        assert!(ns.input_slot(&proxy_path, 0).unwrap().default_value.is_none());
+    }
+
+    #[test]
+    fn set_subgraph_input_default_leaves_no_partial_state_on_proxy_slot_missing() {
+        // Corrupt the proxy slot count by removing it directly so the mirror
+        // step fails. The external slot must NOT be mutated when the mirror
+        // can't land.
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        graph
+            .add_subgraph_input(&sg, "x", DataType::Number)
+            .expect("add input");
+
+        // Snapshot the (None) external default before the corruption.
+        let sg_path = crate::NodePath::root().child(sg);
+        {
+            let ns = graph.node_states().read().expect("read");
+            assert!(ns.input_slot(&sg_path, 0).unwrap().default_value.is_none());
+        }
+
+        // Remove the proxy input slot to simulate schema corruption.
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg).expect("proxy ids");
+        let proxy_path = sg_path.child(input_proxy_id);
+        {
+            let mut ns = graph.node_states().write().expect("write");
+            ns.remove_input_slot(&proxy_path, 0);
+        }
+
+        let err = graph
+            .set_subgraph_input_default(&sg, 0, crate::Data::new(7.0_f64).unwrap())
+            .expect_err("missing proxy slot must Err");
+        assert!(err.contains("InputProxy"), "error mentions InputProxy: {err}");
+
+        // External slot must STILL be untouched.
+        let ns = graph.node_states().read().expect("read");
+        assert!(
+            ns.input_slot(&sg_path, 0).unwrap().default_value.is_none(),
+            "external slot must not be mutated when mirror fails",
+        );
+    }
+
+    /// plan-010 §3.6: after a default change, both the SubGraph path AND
+    /// the InputProxy path are marked changed so the executor's dirty
+    /// plan re-runs the proxy (and the internals downstream of its
+    /// output slots). Without proxy-side dirty marking the internal mesh
+    /// would stay stale.
+    #[test]
+    fn set_subgraph_input_default_marks_both_paths_changed() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        graph
+            .add_subgraph_input(&sg, "x", DataType::Number)
+            .expect("add input");
+
+        // Drain any pre-existing dirty set so we only observe THIS call.
+        {
+            let mut ns = graph.node_states().write().expect("write");
+            let _ = ns.drain_changed_nodes();
+        }
+
+        graph
+            .set_subgraph_input_default(&sg, 0, crate::Data::new(11.0_f64).unwrap())
+            .expect("set default");
+
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg).expect("proxy ids");
+        let sg_path = crate::NodePath::root().child(sg);
+        let proxy_path = sg_path.child(input_proxy_id);
+
+        let dirty = {
+            let mut ns = graph.node_states().write().expect("write");
+            ns.drain_changed_nodes()
+        };
+        assert!(dirty.contains(&sg_path), "sg_path must be dirty");
+        assert!(
+            dirty.contains(&proxy_path),
+            "proxy_path must be dirty (internals re-execute trigger)"
+        );
     }
 }
