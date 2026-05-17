@@ -187,8 +187,15 @@ fn build_execution_context(
             if let Some(slot_state) = ns.input_slot(path, idx) {
                 for edge_id in ns.edges_for_input(&slot_state.id) {
                     if let Some(edge) = ns.get_edge(edge_id) {
-                        if let Some(data) = cache_read.outputs.get(&edge.from_output_slot_id) {
-                            values.push(data.share());
+                        if let Some(data) = resolve_value_through_interface(
+                            &ns,
+                            &cache_read,
+                            &edge.from_node,
+                            edge.from_output_slot_index,
+                            edge.from_output_slot_id,
+                            &mut HashSet::new(),
+                        ) {
+                            values.push(data);
                         }
                     }
                 }
@@ -222,6 +229,64 @@ fn build_execution_context(
         input_values,
         output_writer,
     })
+}
+
+/// Resolve the cached output value at (`from_node`, slot), transparently
+/// following back through any `InterfaceNode` in the path so the proxy
+/// is not on the runtime data path. If the immediate source is NOT an
+/// `InterfaceNode`, returns the cache hit directly. If it IS, this looks
+/// at the InterfaceNode's *input* slot of the same index (the proxy is a
+/// 1:1 mirror) and recurses into whichever edge feeds it (or the slot's
+/// default).
+///
+/// `visited` guards against cycles through InterfaceNode chains
+/// (pathological case: a proxy that loops back through another proxy
+/// via an internal edge). On cycle detection the function returns
+/// `None`; the caller then falls back to the slot default or treats
+/// the input as absent — never recurses forever.
+fn resolve_value_through_interface(
+    ns: &crate::node_graph::node_state::NodeStates,
+    cache: &crate::ExecutionCache,
+    from_node: &NodePath,
+    from_output_slot_index: usize,
+    from_output_slot_id: crate::OutputSlotId,
+    visited: &mut HashSet<(NodePath, usize)>,
+) -> Option<Data> {
+    // Cycle guard. A pathological graph can route InterfaceNode A's
+    // input back through InterfaceNode B that feeds A. Without this
+    // the recursion blows the stack.
+    if !visited.insert((from_node.clone(), from_output_slot_index)) {
+        return None;
+    }
+    // Non-interface: take the direct cache hit.
+    let is_interface = ns
+        .get(from_node)
+        .map(|s| s.type_name == crate::node::interface::InterfaceNode::NAME)
+        .unwrap_or(false);
+    if !is_interface {
+        return cache.outputs.get(&from_output_slot_id).map(|d| d.share());
+    }
+    // Interface tee: look up the InterfaceNode's INPUT slot of the same
+    // index and recurse into its incoming edges / default.
+    let input_slot = ns.input_slot(from_node, from_output_slot_index)?;
+    for upstream_edge_id in ns.edges_for_input(&input_slot.id) {
+        if let Some(upstream_edge) = ns.get_edge(upstream_edge_id) {
+            if let Some(value) = resolve_value_through_interface(
+                ns,
+                cache,
+                &upstream_edge.from_node,
+                upstream_edge.from_output_slot_index,
+                upstream_edge.from_output_slot_id,
+                visited,
+            ) {
+                return Some(value);
+            }
+        }
+    }
+    // Fallback: the InterfaceNode's input slot default (set by the
+    // SubGraph external default mirror in `7be893a`).
+    let default_ref = input_slot.default_value.as_ref()?;
+    Data::from_any(Arc::clone(default_ref)).ok()
 }
 
 /// Extract field name/value pairs from a `Data` value for composite types.

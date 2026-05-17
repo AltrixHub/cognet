@@ -15,10 +15,10 @@
 //!
 //! ## Execution
 //!
-//! `execute_sync` is a pass-through tee: for every port `i`, the value
-//! arriving on the input slot is forwarded to the output slot at the
-//! same index. Slots without an input value produce no output for this
-//! cook. The node performs no other computation.
+//! `execute_sync` is a no-op. InterfaceNode is a schema-only boundary
+//! marker; the executor's `resolve_value_through_interface`
+//! follow-through delivers values from external sources directly to
+//! internal consumers, so no runtime tee is needed.
 //!
 //! ## Direction + locked set
 //!
@@ -67,7 +67,13 @@ pub struct InterfaceNodeData {
 /// [`InterfaceNodeData`].
 pub const INTERFACE_NODE_DATA_DOMAIN: &str = "InterfaceNodeData";
 
-/// Generic dynamic-port pass-through tee node.
+/// Schema-only SubGraph boundary marker. InterfaceNode never writes to
+/// its output cache at runtime — consumers of its output slots resolve
+/// their value via the executor's `resolve_value_through_interface`
+/// follow-through, which looks through the InterfaceNode chain to the
+/// real source. The struct exists purely as the schema-carrier for
+/// the SubGraph's external port surface (port shape, default values,
+/// locked flags).
 ///
 /// `INPUTS` and `OUTPUTS` are intentionally empty — port shape is
 /// managed at runtime via the `NodeGraph::add_interface_port` family.
@@ -83,15 +89,13 @@ impl NodeMeta for InterfaceNode {
 }
 
 impl NodeImpl for InterfaceNode {
-    fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
-        // Pass-through tee. Slots without input values are skipped —
-        // the output cache simply has no entry for that port this cook.
-        for (i, values) in ctx.input_values.iter().enumerate() {
-            let Some(data) = values.first() else { continue };
-            ctx.output_writer
-                .set(i, data.share())
-                .map_err(|e| format!("InterfaceNode tee slot {i}: {e}"))?;
-        }
+    fn execute_sync(&self, _ctx: ExecutionContext) -> Result<(), String> {
+        // Option D: InterfaceNode is a schema-only boundary. The
+        // executor's `build_execution_context` follows edges back
+        // through InterfaceNode boundaries (see
+        // `resolve_value_through_interface`), so the runtime tee is
+        // unnecessary — writing to outputs here would only duplicate
+        // a value the consumers already resolve directly.
         Ok(())
     }
 }

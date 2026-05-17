@@ -685,4 +685,74 @@ mod subgraph_edge_alias_tests {
             "consumer downstream of InputProxy must see external Number's 7.5; got {f}"
         );
     }
+
+    /// Option D contract: with InterfaceNode runtime-skipped, an internal
+    /// consumer of `InputProxy.output[i]` sees the external Number's value
+    /// even though InterfaceNode itself does NOT execute (its output cache
+    /// is never written to). This pins the executor's follow-through.
+    #[test]
+    fn internal_consumer_sees_external_value_with_interface_node_skipped() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_input(&sg_id, "x", DataType::Number)
+            .expect("add input");
+
+        let sg_path = NodePath::root().child(sg_id);
+        // Reuse the `NumberPassthrough` defined in Task X1.2 (this test
+        // module is the same `subgraph_edge_alias_tests`). The X2 contract
+        // requires a real output-producing node; "Number Output" alone
+        // would not exercise the follow-through.
+        let consumer_id = graph
+            .create_node_by_name_at(&sg_path, NumberPassthrough::NAME)
+            .expect("create consumer");
+        let consumer_path = sg_path.child(consumer_id);
+
+        // Author wiring: InputProxy.output[0] -> consumer.input[0].
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg_id).expect("proxy ids");
+        let proxy_path = sg_path.child(input_proxy_id);
+        graph
+            .connect_nodes_at(&proxy_path, 0, &consumer_path, 0)
+            .expect("internal author wiring");
+
+        // External: Number(11.0) -> SubGraph.external[0]  (rewritten to InputProxy.input[0]).
+        let num_id = graph.create_node_by_name("Number").expect("create Number");
+        graph
+            .update_node_data(&num_id, crate::Data::new(11.0_f64).expect("Data::new"))
+            .expect("set data");
+        graph
+            .connect_nodes(&num_id, 0, &sg_id, 0)
+            .expect("external edge");
+
+        let result = graph.execute_sync().expect("execute_sync");
+
+        // The InterfaceNode (InputProxy) should have NOT executed — its output
+        // entry should be absent OR its output slot value should be None (the
+        // tee is a no-op).
+        let proxy_output = result.node_outputs.get(&proxy_path);
+        assert!(
+            proxy_output.is_none_or(|outs| outs.iter().all(Option::is_none)),
+            "InterfaceNode must not produce output values at runtime; got: {:?}",
+            proxy_output
+        );
+
+        // The internal consumer should see the external Number's value
+        // (resolved through the InterfaceNode follow-through).
+        let consumer_output = result
+            .node_outputs
+            .get(&consumer_path)
+            .expect("consumer ran");
+        let first = consumer_output
+            .first()
+            .and_then(|o| o.as_ref())
+            .expect("consumer produced an output value");
+        let v: f64 = *first.value::<f64>().expect("Number downcast");
+        assert!(
+            (v - 11.0).abs() < 1e-9,
+            "internal consumer must see external Number's value via the \
+             InterfaceNode follow-through; got {v}"
+        );
+    }
 }
