@@ -522,6 +522,54 @@ mod subgraph_edge_alias_tests {
         );
     }
 
+    /// Hypothesis (symmetric to the InputProxy test): after the edge
+    /// rewrite, the edge from a SubGraph external output slot must be
+    /// stored under the OutputProxy slot's id (the live
+    /// `from_output_slot_id`), not the SubGraph external slot's id.
+    /// Otherwise `edges_for_output` for the OutputProxy slot returns
+    /// empty and the executor sees no outgoing edge from the proxy.
+    ///
+    /// This test pins the cache contract on the output side so a future
+    /// refactor that touches only the `from_*` branch of `add_edge`
+    /// cannot silently regress the cache.
+    #[test]
+    fn routed_edge_is_indexed_under_output_proxy_slot_id_not_subgraph_external() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_output(&sg_id, "y", DataType::Number)
+            .expect("add output");
+
+        let consumer_id = graph.create_node_by_name("Add").expect("create Add");
+
+        let edge_id = graph
+            .connect_nodes(&sg_id, 0, &consumer_id, 0)
+            .expect("connect SubGraph external output -> consumer");
+
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge stored");
+        let (_, output_proxy_id) = graph.subgraph_proxy_ids(&sg_id).expect("proxy ids");
+        let proxy_path = NodePath::root().child(sg_id).child(output_proxy_id);
+
+        // edge.from_node was rewritten to OutputProxy (verified by other tests).
+        assert_eq!(edge.from_node, proxy_path);
+
+        // The OutputProxy slot's id (live, looked up now) vs the edge's
+        // stored slot id.
+        let ns = graph.node_states().read().expect("read");
+        let output_proxy_slot = ns
+            .output_slot(&proxy_path, 0)
+            .expect("OutputProxy slot exists");
+        assert_eq!(
+            edge.from_output_slot_id, output_proxy_slot.id,
+            "edge's from_output_slot_id MUST match the OutputProxy slot's id; \
+             if it still points at the SubGraph external slot, \
+             edges_for_output(proxy_slot.id) returns empty and the executor \
+             sees no outgoing edge from the proxy."
+        );
+    }
+
     #[test]
     fn edges_to_non_subgraph_nodes_are_unchanged() {
         let mut graph = NodeGraph::new().expect("create graph");
