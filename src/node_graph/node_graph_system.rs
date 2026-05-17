@@ -93,7 +93,8 @@ impl NodeGraphSystem for NodeGraph {
         // InputProxy / OutputProxy InterfaceNode slots inside the
         // SubGraph. An edge whose endpoint is a SubGraph external slot
         // is transparently retargeted to the corresponding proxy slot,
-        // so the InterfaceNode tee can actually see the value at
+        // so the executor's `resolve_value_through_interface`
+        // follow-through finds the edge under the proxy slot at
         // execute time. Without this rewrite, edges to SubGraph
         // external slots are runtime no-ops (the SubGraphNode itself
         // does not execute and never reads its external slot values).
@@ -103,7 +104,7 @@ impl NodeGraphSystem for NodeGraph {
         // rewrite we MUST re-resolve them from the proxy slot, or the
         // edge gets stored under the SubGraph external slot's id and
         // `edges_for_input` for the proxy returns empty — leaving the
-        // executor with no incoming value at the proxy.
+        // follow-through with no incoming value at the proxy.
         if let Some((input_proxy_id, _)) = self.subgraph_proxy_ids_at_path(&edge.to_node) {
             let proxy_path = edge.to_node.child(input_proxy_id);
             let new_slot_id = {
