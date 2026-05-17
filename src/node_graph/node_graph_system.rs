@@ -86,8 +86,30 @@ impl NodeGraphSystem for NodeGraph {
         Ok(sorted)
     }
 
-    fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String> {
+    fn add_edge(&mut self, mut edge: Edge) -> Result<EdgeId, String> {
         tracing::debug!("[cognet] add_edge: START");
+
+        // SubGraph external slots are an alias surface for the
+        // InputProxy / OutputProxy InterfaceNode slots inside the
+        // SubGraph. An edge whose endpoint is a SubGraph external slot
+        // is transparently retargeted to the corresponding proxy slot,
+        // so the InterfaceNode tee can actually see the value at
+        // execute time. Without this rewrite, edges to SubGraph
+        // external slots are runtime no-ops (the SubGraphNode itself
+        // does not execute and never reads its external slot values).
+        //
+        // The rewrite is symmetric: input edges (`to_node = SubGraph`)
+        // are routed to the InputProxy, output edges (`from_node =
+        // SubGraph`) are routed to the OutputProxy. After rewrite, the
+        // edge is stored as if the author had wired it directly to the
+        // proxy — no special-casing remains in the executor.
+        if let Some((input_proxy_id, _)) = self.subgraph_proxy_ids_at_path(&edge.to_node) {
+            edge.to_node = edge.to_node.child(input_proxy_id);
+        }
+        if let Some((_, output_proxy_id)) = self.subgraph_proxy_ids_at_path(&edge.from_node) {
+            edge.from_node = edge.from_node.child(output_proxy_id);
+        }
+
         let from_node = edge.from_node.clone();
         let to_node = edge.to_node.clone();
         // For error reporting we need a NodeId. Leaf() is always Some for
@@ -313,6 +335,123 @@ mod path_aware_edge_tests {
         let edge_id = graph
             .connect_nodes(&num_id, 0, &add_id, 0)
             .expect("connect_nodes root");
+
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
+        assert_eq!(edge.from_node, NodePath::root().child(num_id));
+        assert_eq!(edge.to_node, NodePath::root().child(add_id));
+    }
+}
+
+#[cfg(test)]
+mod subgraph_edge_alias_tests {
+    //! Edges whose endpoint is a SubGraph external slot are transparently
+    //! retargeted to the InterfaceNode proxy. These tests pin that
+    //! contract so the SubGraph external port surface is a real data
+    //! path (not a runtime no-op).
+
+    use crate::{DataType, NodeGraph, NodeGraphWrite, NodePath};
+
+    #[test]
+    fn input_edge_to_subgraph_external_slot_is_routed_to_input_proxy() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_input(&sg_id, "height", DataType::Number)
+            .expect("add input");
+
+        // External Number node at root.
+        let num_id = graph.create_node_by_name("Number").expect("create Number");
+
+        // Author connects external Number to the SubGraph's external "height" slot.
+        let edge_id = graph
+            .connect_nodes(&num_id, 0, &sg_id, 0)
+            .expect("connect external to SubGraph external slot");
+
+        // The edge MUST be stored as targeting the InputProxy at depth 2,
+        // not the SubGraph at root.
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg_id).expect("proxy ids");
+        let expected_to = NodePath::root().child(sg_id).child(input_proxy_id);
+        assert_eq!(
+            edge.to_node, expected_to,
+            "edge target must be retargeted to InputProxy",
+        );
+        assert_eq!(edge.to_input_slot_index, 0);
+    }
+
+    #[test]
+    fn output_edge_from_subgraph_external_slot_is_routed_from_output_proxy() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_output(&sg_id, "result", DataType::Number)
+            .expect("add output");
+
+        // External consumer at root.
+        let consumer_id = graph.create_node_by_name("Add").expect("create Add");
+
+        // Author connects SubGraph external "result" output to the consumer's input.
+        let edge_id = graph
+            .connect_nodes(&sg_id, 0, &consumer_id, 0)
+            .expect("connect SubGraph external output to consumer");
+
+        // The edge MUST be stored as sourced from the OutputProxy at depth 2.
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
+        let (_, output_proxy_id) = graph.subgraph_proxy_ids(&sg_id).expect("proxy ids");
+        let expected_from = NodePath::root().child(sg_id).child(output_proxy_id);
+        assert_eq!(
+            edge.from_node, expected_from,
+            "edge source must be retargeted to OutputProxy",
+        );
+        assert_eq!(edge.from_output_slot_index, 0);
+    }
+
+    #[test]
+    fn edge_between_two_subgraphs_rewrites_both_endpoints() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_a = graph
+            .add_subgraph_at(&NodePath::root(), "A")
+            .expect("add A");
+        let sg_b = graph
+            .add_subgraph_at(&NodePath::root(), "B")
+            .expect("add B");
+        graph
+            .add_subgraph_output(&sg_a, "out", DataType::Number)
+            .expect("add A output");
+        graph
+            .add_subgraph_input(&sg_b, "in", DataType::Number)
+            .expect("add B input");
+
+        let edge_id = graph
+            .connect_nodes(&sg_a, 0, &sg_b, 0)
+            .expect("connect A.out -> B.in");
+
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
+        let (_, a_output_proxy) = graph.subgraph_proxy_ids(&sg_a).expect("A proxies");
+        let (b_input_proxy, _) = graph.subgraph_proxy_ids(&sg_b).expect("B proxies");
+        assert_eq!(
+            edge.from_node,
+            NodePath::root().child(sg_a).child(a_output_proxy)
+        );
+        assert_eq!(
+            edge.to_node,
+            NodePath::root().child(sg_b).child(b_input_proxy)
+        );
+    }
+
+    #[test]
+    fn edges_to_non_subgraph_nodes_are_unchanged() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let num_id = graph.create_node_by_name("Number").expect("num");
+        let add_id = graph.create_node_by_name("Add").expect("add");
+
+        let edge_id = graph
+            .connect_nodes(&num_id, 0, &add_id, 0)
+            .expect("connect");
 
         let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
         assert_eq!(edge.from_node, NodePath::root().child(num_id));
