@@ -98,16 +98,47 @@ impl NodeGraphSystem for NodeGraph {
         // external slots are runtime no-ops (the SubGraphNode itself
         // does not execute and never reads its external slot values).
         //
-        // The rewrite is symmetric: input edges (`to_node = SubGraph`)
-        // are routed to the InputProxy, output edges (`from_node =
-        // SubGraph`) are routed to the OutputProxy. After rewrite, the
-        // edge is stored as if the author had wired it directly to the
-        // proxy — no special-casing remains in the executor.
+        // `to_input_slot_id` / `from_output_slot_id` are pre-computed
+        // caches that index the edge in NodeStates. After the path
+        // rewrite we MUST re-resolve them from the proxy slot, or the
+        // edge gets stored under the SubGraph external slot's id and
+        // `edges_for_input` for the proxy returns empty — leaving the
+        // executor with no incoming value at the proxy.
         if let Some((input_proxy_id, _)) = self.subgraph_proxy_ids_at_path(&edge.to_node) {
-            edge.to_node = edge.to_node.child(input_proxy_id);
+            let proxy_path = edge.to_node.child(input_proxy_id);
+            let new_slot_id = {
+                let ns = self.node_states.read().map_err(|e| e.to_string())?;
+                ns.input_slot(&proxy_path, edge.to_input_slot_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "add_edge: InputProxy at {proxy_path} has no input slot \
+                             {} (SubGraph external slot exists but the proxy is missing \
+                             it — schema mismatch)",
+                            edge.to_input_slot_index
+                        )
+                    })?
+                    .id
+            };
+            edge.to_node = proxy_path;
+            edge.to_input_slot_id = new_slot_id;
         }
         if let Some((_, output_proxy_id)) = self.subgraph_proxy_ids_at_path(&edge.from_node) {
-            edge.from_node = edge.from_node.child(output_proxy_id);
+            let proxy_path = edge.from_node.child(output_proxy_id);
+            let new_slot_id = {
+                let ns = self.node_states.read().map_err(|e| e.to_string())?;
+                ns.output_slot(&proxy_path, edge.from_output_slot_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "add_edge: OutputProxy at {proxy_path} has no output slot \
+                             {} (SubGraph external slot exists but the proxy is missing \
+                             it — schema mismatch)",
+                            edge.from_output_slot_index
+                        )
+                    })?
+                    .id
+            };
+            edge.from_node = proxy_path;
+            edge.from_output_slot_id = new_slot_id;
         }
 
         let from_node = edge.from_node.clone();
@@ -440,6 +471,54 @@ mod subgraph_edge_alias_tests {
         assert_eq!(
             edge.to_node,
             NodePath::root().child(sg_b).child(b_input_proxy)
+        );
+    }
+
+    /// Hypothesis: after the edge rewrite, the edge is stored under the
+    /// SubGraph external slot's id (old `to_input_slot_id`), not the
+    /// InputProxy slot's id. `edges_for_input` therefore returns the
+    /// edge for the SubGraph external slot but EMPTY for the InputProxy
+    /// slot. The executor reads InputProxy edges and finds nothing.
+    ///
+    /// This test pins the failure: after `connect_nodes`, asking for
+    /// InputProxy.input[0]'s incoming edges should return ONE edge
+    /// (the routed one). Currently it returns zero, proving the
+    /// `to_input_slot_id` is stale.
+    #[test]
+    fn routed_edge_is_indexed_under_input_proxy_slot_id_not_subgraph_external() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_input(&sg_id, "x", DataType::Number)
+            .expect("add input");
+
+        let num_id = graph.create_node_by_name("Number").expect("create Number");
+
+        let edge_id = graph
+            .connect_nodes(&num_id, 0, &sg_id, 0)
+            .expect("connect external -> SubGraph external slot");
+
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge stored");
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg_id).expect("proxy ids");
+        let proxy_path = NodePath::root().child(sg_id).child(input_proxy_id);
+
+        // edge.to_node was rewritten to InputProxy (verified by other tests).
+        assert_eq!(edge.to_node, proxy_path);
+
+        // The InputProxy slot's id (live, looked up now) vs the edge's
+        // stored slot id.
+        let ns = graph.node_states().read().expect("read");
+        let input_proxy_slot = ns
+            .input_slot(&proxy_path, 0)
+            .expect("InputProxy slot exists");
+        assert_eq!(
+            edge.to_input_slot_id, input_proxy_slot.id,
+            "edge's to_input_slot_id MUST match the InputProxy slot's id; \
+             currently it still points at the SubGraph external slot, so \
+             edges_for_input(proxy_slot.id) returns empty and the executor \
+             sees no incoming value at the proxy."
         );
     }
 
