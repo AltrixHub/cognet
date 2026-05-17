@@ -989,7 +989,10 @@ mod tests {
             "external default written",
         );
         assert!(
-            ns.input_slot(&proxy_path, 0).unwrap().default_value.is_some(),
+            ns.input_slot(&proxy_path, 0)
+                .unwrap()
+                .default_value
+                .is_some(),
             "proxy default mirrored",
         );
     }
@@ -1023,7 +1026,10 @@ mod tests {
                 crate::Data::new(13.0_f64).expect("Data::new"),
             )
             .expect_err("mirror should Err on missing proxy slot");
-        assert!(err.contains("InputProxy"), "error mentions InputProxy: {err}");
+        assert!(
+            err.contains("InputProxy"),
+            "error mentions InputProxy: {err}"
+        );
 
         let ns = graph.node_states.read().expect("read");
         assert!(

@@ -787,7 +787,11 @@ mod tests {
         let proxy_path = sg_path.child(input_proxy_id);
         let ns = graph.node_states().read().expect("read");
         assert!(ns.input_slot(&sg_path, 0).unwrap().default_value.is_none());
-        assert!(ns.input_slot(&proxy_path, 0).unwrap().default_value.is_none());
+        assert!(ns
+            .input_slot(&proxy_path, 0)
+            .unwrap()
+            .default_value
+            .is_none());
     }
 
     #[test]
@@ -821,7 +825,10 @@ mod tests {
         let err = graph
             .set_subgraph_input_default(&sg, 0, crate::Data::new(7.0_f64).unwrap())
             .expect_err("missing proxy slot must Err");
-        assert!(err.contains("InputProxy"), "error mentions InputProxy: {err}");
+        assert!(
+            err.contains("InputProxy"),
+            "error mentions InputProxy: {err}"
+        );
 
         // External slot must STILL be untouched.
         let ns = graph.node_states().read().expect("read");
