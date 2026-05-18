@@ -1019,8 +1019,21 @@ impl NodeGraph {
                             if edge.to_node == *node_path
                                 && (edge.to_input_slot_index) < slot_inputs.len()
                             {
-                                if let Some(data) = cache.outputs.get(&edge.from_output_slot_id) {
-                                    slot_inputs[edge.to_input_slot_index] = Some(data.share());
+                                // Follow through any `InterfaceNode` proxy on
+                                // the source side. SubGraph external output
+                                // edges have `edge.from_node = OutputProxy`,
+                                // which is a runtime no-op (Phase X2) and
+                                // never writes its own output cache, so a
+                                // direct `cache.outputs.get` would miss.
+                                if let Some(data) = resolve_value_through_interface(
+                                    &ns,
+                                    &cache,
+                                    &edge.from_node,
+                                    edge.from_output_slot_index,
+                                    edge.from_output_slot_id,
+                                    &mut HashSet::new(),
+                                ) {
+                                    slot_inputs[edge.to_input_slot_index] = Some(data);
                                 }
                             }
                         }
@@ -1045,10 +1058,20 @@ impl NodeGraph {
                         let Some(to_id) = edge.to_node.leaf() else {
                             continue;
                         };
-                        let data = cache
-                            .outputs
-                            .get(&edge.from_output_slot_id)
-                            .map(|d| d.share());
+                        // Mirror the sink-input fix: an edge sourced from an
+                        // `InterfaceNode` proxy (e.g. SubGraph external
+                        // output retargeted to OutputProxy) has no direct
+                        // cache entry because the proxy is a Phase X2
+                        // runtime no-op. Resolve through the proxy so the
+                        // delivered edge value is the upstream provider's.
+                        let data = resolve_value_through_interface(
+                            &ns,
+                            &cache,
+                            &edge.from_node,
+                            edge.from_output_slot_index,
+                            edge.from_output_slot_id,
+                            &mut HashSet::new(),
+                        );
                         edge_values.insert(
                             *edge_id,
                             EdgeValue {

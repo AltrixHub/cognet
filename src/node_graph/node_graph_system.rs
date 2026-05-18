@@ -756,4 +756,68 @@ mod subgraph_edge_alias_tests {
              InterfaceNode follow-through; got {v}"
         );
     }
+
+    /// Bug fix: a `Number Output` sink (no output slots) connected to a
+    /// SubGraph external OUTPUT port must see the upstream value carried
+    /// through the OutputProxy follow-through. Before this fix,
+    /// `collect_outputs`'s sink-input branch read the cache directly with
+    /// `cache.outputs.get(edge.from_output_slot_id)`, which misses because
+    /// `OutputProxy` is a Phase X2 runtime no-op and never writes its own
+    /// output cache. The sink would then appear in `node_outputs` with
+    /// `None` for slot 0 and the UI would display "--".
+    #[test]
+    fn number_output_sink_sees_value_from_subgraph_output_via_follow_through() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_output(&sg_id, "y", DataType::Number)
+            .expect("add_subgraph_output");
+
+        let sg_path = NodePath::root().child(sg_id);
+        let (_, output_proxy_id) = graph.subgraph_proxy_ids(&sg_id).expect("proxy ids");
+        let output_proxy_path = sg_path.child(output_proxy_id);
+
+        // Internal: Number(42.0) -> OutputProxy.input[0]
+        let inner_num_id = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create internal Number");
+        graph
+            .update_node_data_at(
+                &sg_path.child(inner_num_id),
+                crate::Data::new(42.0_f64).expect("Data::new"),
+            )
+            .expect("set Number data");
+        graph
+            .connect_nodes_at(&sg_path.child(inner_num_id), 0, &output_proxy_path, 0)
+            .expect("internal: Number -> OutputProxy input");
+
+        // External: SubGraph.y -> Number Output.input[0]
+        // (the edge gets rewritten by add_edge to OutputProxy -> Number Output)
+        let sink_id = graph
+            .create_node_by_name("Number Output")
+            .expect("create Number Output sink");
+        graph
+            .connect_nodes(&sg_id, 0, &sink_id, 0)
+            .expect("external: SubGraph.y -> Number Output");
+
+        let result = graph.execute_sync().expect("execute_sync");
+
+        // The sink's node_outputs entry should carry the upstream Number's value.
+        let sink_outputs = result
+            .node_outputs
+            .get(&NodePath::root().child(sink_id))
+            .expect("Number Output sink must appear in execution result");
+        let first = sink_outputs
+            .first()
+            .and_then(|o| o.as_ref())
+            .expect("sink must have an input-derived value");
+        let v: f64 = *first.value::<f64>().expect("Number downcast");
+        assert!(
+            (v - 42.0).abs() < 1e-9,
+            "Number Output sink must see the internal Number(42.0) routed \
+             through OutputProxy follow-through; got {v}"
+        );
+    }
 }
