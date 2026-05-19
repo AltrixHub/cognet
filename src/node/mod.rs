@@ -1,4 +1,5 @@
 pub mod execution_context;
+pub mod interface;
 pub mod operators;
 pub mod outputs;
 pub mod primitives;
@@ -6,6 +7,7 @@ pub mod subgraph;
 pub mod type_info;
 
 pub use execution_context::*;
+pub use interface::*;
 pub use operators::*;
 pub use outputs::*;
 pub use primitives::*;

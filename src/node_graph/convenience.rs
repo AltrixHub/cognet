@@ -12,7 +12,7 @@ impl NodeGraph {
     pub fn node_ids(&self) -> Vec<NodeId> {
         self.node_states
             .read()
-            .map(|guard| guard.node_ids().copied().collect())
+            .map(|guard| guard.node_ids().collect())
             .unwrap_or_default()
     }
 
@@ -28,9 +28,9 @@ impl NodeGraph {
                     .iter()
                     .map(|(id, edge)| EdgeInfo {
                         id: *id,
-                        from_node: edge.from_node_id,
+                        from_node: edge.from_node.clone(),
                         from_output: edge.from_output_slot_index,
-                        to_node: edge.to_node_id,
+                        to_node: edge.to_node.clone(),
                         to_input: edge.to_input_slot_index,
                     })
                     .collect()
@@ -43,9 +43,9 @@ impl NodeGraph {
         self.node_states.read().ok().and_then(|guard| {
             guard.get_edge(edge_id).map(|edge| EdgeInfo {
                 id: *edge_id,
-                from_node: edge.from_node_id,
+                from_node: edge.from_node.clone(),
                 from_output: edge.from_output_slot_index,
-                to_node: edge.to_node_id,
+                to_node: edge.to_node.clone(),
                 to_input: edge.to_input_slot_index,
             })
         })
@@ -89,9 +89,9 @@ mod tests {
         let edges = graph.edges_info();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].id, edge_id);
-        assert_eq!(edges[0].from_node, num);
+        assert_eq!(edges[0].from_node, crate::NodePath::root().child(num));
         assert_eq!(edges[0].from_output, 0);
-        assert_eq!(edges[0].to_node, add);
+        assert_eq!(edges[0].to_node, crate::NodePath::root().child(add));
         assert_eq!(edges[0].to_input, 0);
     }
 
@@ -108,8 +108,8 @@ mod tests {
             .expect("connect nodes");
 
         let info = graph.edge_info(&edge_id).expect("edge exists");
-        assert_eq!(info.from_node, num);
-        assert_eq!(info.to_node, add);
+        assert_eq!(info.from_node, crate::NodePath::root().child(num));
+        assert_eq!(info.to_node, crate::NodePath::root().child(add));
 
         let fake_id = crate::EdgeId::new();
         assert!(graph.edge_info(&fake_id).is_none());

@@ -1,6 +1,6 @@
 //! Structured error types for the graph engine.
 
-use crate::{DataType, EdgeId, NodeId};
+use crate::{DataType, EdgeId, NodeId, NodePath};
 use std::fmt;
 
 /// Target of an error in the graph.
@@ -117,6 +117,48 @@ impl GraphError {
         Self {
             target: ErrorTarget::Node(node_id),
             kind: ErrorKind::Execution(message.into()),
+        }
+    }
+
+    /// Create an execution error addressed by a `NodePath`.
+    ///
+    /// This is the path-aware counterpart of [`Self::execution`]. It exists
+    /// so executor/planner call sites can record per-node failures without
+    /// risking a phantom `NodeId` when the path happens to be the root.
+    ///
+    /// `NodeId: Default` returns a freshly minted ULID, so a naive
+    /// `path.leaf().unwrap_or_default()` at the call site would silently
+    /// attach the error to a node that exists in no graph. Routing through
+    /// this constructor keeps that footgun out of the executor: when
+    /// `path.leaf()` is `None` we drop the per-node target, emit a warning
+    /// to the `graph` tracing target so the regression is observable, and
+    /// fall back to a graph-level `ErrorTarget::Graph` so downstream
+    /// consumers still see the message.
+    ///
+    /// `ErrorTarget` still keys per-node errors by `NodeId` rather than
+    /// `NodePath`; the remaining `path.leaf()` shim in `collect_outputs`
+    /// is tracked by `// plan-007: ErrorTarget migration TBD`.
+    pub fn execution_at_path(path: &NodePath, message: impl Into<String>) -> Self {
+        let kind = ErrorKind::Execution(message.into());
+        match path.leaf() {
+            Some(node_id) => Self {
+                target: ErrorTarget::Node(node_id),
+                kind,
+            },
+            None => {
+                tracing::warn!(
+                    target: "graph",
+                    path = %path,
+                    "[cognet] execution error recorded against root path; \
+                     attaching to ErrorTarget::Graph",
+                );
+                // plan-007: ErrorTarget migration TBD — once ErrorTarget
+                // carries a path-aware variant we can preserve full context.
+                Self {
+                    target: ErrorTarget::Graph,
+                    kind,
+                }
+            }
         }
     }
 

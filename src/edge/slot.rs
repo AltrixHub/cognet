@@ -353,6 +353,41 @@ impl Data {
         Ok(Data { value, data_type })
     }
 
+    /// Restore a `Data` from a raw `Arc<dyn Any>` plus its known
+    /// `DataType`. Use this on the snapshot-replay / slot-default
+    /// preservation path where the caller already knows the slot's
+    /// declared type but the payload has been type-erased into `Arc`.
+    ///
+    /// Unlike [`Data::from_any`] (which only handles primitives by
+    /// inspecting the `TypeId`), this variant **trusts the caller's
+    /// `data_type`** and is the canonical way to round-trip `Mesh`,
+    /// `BRep`, and `Domain(_)` payloads — the type information was
+    /// always present at the source slot, so requiring restoration to
+    /// rediscover it from the erased `Arc` is impossible without a
+    /// registry. Pass the type alongside the value instead.
+    ///
+    /// For primitive `DataType`s the call still validates that the
+    /// inner `TypeId` matches.
+    pub fn from_any_typed(
+        value: Arc<dyn Any + Send + Sync>,
+        data_type: DataType,
+    ) -> Result<Self, String> {
+        let inner_type_id = (*value).type_id();
+        match data_type {
+            DataType::Mesh | DataType::BRep | DataType::Domain(_) => {
+                // The wrapping types accept arbitrary inner types — the
+                // domain name (or Mesh/BRep marker) lives on `data_type`
+                // and survives because the caller passed it in.
+                Ok(Data { value, data_type })
+            }
+            _ if inner_type_id == data_type.type_id() => Ok(Data { value, data_type }),
+            _ => Err(format!(
+                "from_any_typed: inner type does not match declared {}",
+                data_type.type_name()
+            )),
+        }
+    }
+
     pub fn share(&self) -> Self {
         Data {
             value: Arc::clone(&self.value),
@@ -396,5 +431,52 @@ impl Data {
 
     pub fn get_type(&self) -> DataType {
         self.data_type
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct ProbeDomain(u32);
+
+    #[test]
+    fn from_any_typed_round_trips_domain_value() {
+        let original = ProbeDomain(42);
+        let d = Data::from_domain(original.clone(), "ProbeDomain");
+        let raw: Arc<dyn Any + Send + Sync> = d.share().into_value();
+
+        let restored = Data::from_any_typed(raw, DataType::Domain("ProbeDomain"))
+            .expect("restoration must succeed for Domain");
+        assert_eq!(restored.get_type(), DataType::Domain("ProbeDomain"));
+        let downcast: &ProbeDomain = restored.value().expect("downcast back to ProbeDomain");
+        assert_eq!(downcast, &original);
+    }
+
+    #[test]
+    fn from_any_typed_round_trips_mesh_value() {
+        let original = ProbeDomain(7);
+        let d = Data::from_mesh(original.clone());
+        let raw: Arc<dyn Any + Send + Sync> = d.share().into_value();
+
+        let restored = Data::from_any_typed(raw, DataType::Mesh).expect("restoration");
+        assert_eq!(restored.get_type(), DataType::Mesh);
+        let downcast: &ProbeDomain = restored.value().expect("downcast");
+        assert_eq!(downcast, &original);
+    }
+
+    #[test]
+    fn from_any_typed_validates_primitive_type_id() {
+        let d = Data::new(2.5_f64).expect("Number Data");
+        let raw: Arc<dyn Any + Send + Sync> = d.share().into_value();
+
+        // Correct primitive type passes.
+        let ok = Data::from_any_typed(Arc::clone(&raw), DataType::Number).expect("ok");
+        assert_eq!(ok.get_type(), DataType::Number);
+
+        // Lying about the type fails.
+        let err = Data::from_any_typed(raw, DataType::String).expect_err("type mismatch");
+        assert!(err.contains("does not match declared"), "got: {err}");
     }
 }

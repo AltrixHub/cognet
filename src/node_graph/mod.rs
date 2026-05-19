@@ -1,11 +1,14 @@
 pub mod convenience;
 pub mod edge_info;
 pub mod execution_cache;
+pub mod interface_helpers;
 pub mod node_graph_api;
 pub mod node_graph_system;
 pub mod node_manager;
+pub mod node_path;
 pub(crate) mod node_state;
-pub mod path_navigation;
+pub mod path_api;
+mod path_index;
 pub mod subgraph_helpers;
 pub mod subgraph_ops;
 
@@ -13,12 +16,13 @@ pub use edge_info::*;
 pub use execution_cache::*;
 pub use node_graph_api::*;
 pub use node_manager::*;
+pub use node_path::NodePath;
 pub(crate) use node_state::*;
 pub use subgraph_ops::*;
 
 use crate::{
     Data, DataType, DataValue, Edge, EdgeId, ErrorTarget, GraphError, InputSlotId, NodeId,
-    SubGraphNode,
+    OutputSlotId, SubGraphNode,
 };
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -52,9 +56,9 @@ struct Bookkeeping {
 }
 
 pub struct NodeGraph {
-    node_manager: NodeManager,
+    pub(crate) node_manager: NodeManager,
     /// Node states (type_name, data, slots) — shared with app via Arc.
-    node_states: Arc<RwLock<NodeStates>>,
+    pub(crate) node_states: Arc<RwLock<NodeStates>>,
     cache: SharedExecutionCache,
     /// Interior-mutable bookkeeping (dirty_nodes, errors, removed list).
     bookkeeping: Mutex<Bookkeeping>,
@@ -134,9 +138,6 @@ impl NodeGraph {
     }
 
     /// Mark all nodes in the graph as dirty, forcing re-execution.
-    ///
-    /// Used by SubGraphNode to ensure all internal nodes execute
-    /// after external inputs are injected into the input proxy.
     pub fn mark_all_nodes_dirty(&self) {
         if let Ok(mut ns) = self.node_states.write() {
             ns.mark_all_changed();
@@ -144,42 +145,34 @@ impl NodeGraph {
     }
 
     // ── High-level query API ──
-    // These methods provide access to node/slot/edge data without exposing
-    // the internal NodeStates structure.
 
     /// Get the type name of a node.
     pub fn node_type_name(&self, node_id: &NodeId) -> Option<&'static str> {
-        let ns = self.node_states.read().ok()?;
-        ns.get(node_id).map(|s| s.type_name)
+        self.node_type_name_at(&NodePath::root().child(*node_id))
     }
 
     /// Get the Rust TypeId of a node for type-safe identification.
     ///
     /// For SubGraphNodes with a template type, returns the template's TypeId
-    /// instead of the generic SubGraphNode TypeId. This enables callers to
-    /// identify what kind of subgraph this is (e.g., StairTemplate vs WallTemplate).
+    /// instead of the generic SubGraphNode TypeId.
     pub fn node_type_id(&self, node_id: &NodeId) -> Option<TypeId> {
-        // Check for SubGraph template TypeId first
         if let Some(template_id) = self.subgraph_template_type_id(node_id) {
             return Some(template_id);
         }
         let ns = self.node_states.read().ok()?;
-        let state = ns.get(node_id)?;
+        let state = ns.get(&NodePath::root().child(*node_id))?;
         state.rust_type_id
     }
 
     /// Set the template TypeId for a SubGraphNode.
-    ///
-    /// This associates a template type with a SubGraphNode, allowing
-    /// `node_type_id()` to return the template's TypeId instead of
-    /// the generic SubGraphNode TypeId.
     pub fn set_subgraph_template_type_id(
         &self,
         node_id: &NodeId,
         type_id: TypeId,
     ) -> Result<(), String> {
         let entity = self
-            .get_node_by_id(node_id)
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))
             .ok_or_else(|| format!("Node {:?} not found", node_id))?;
         let mut write = entity.write().map_err(|e| e.to_string())?;
         let sg = write
@@ -192,7 +185,9 @@ impl NodeGraph {
 
     /// Get the template TypeId of a SubGraphNode.
     pub fn subgraph_template_type_id(&self, node_id: &NodeId) -> Option<TypeId> {
-        let entity = self.get_node_by_id(node_id)?;
+        let entity = self
+            .node_manager
+            .get_at(&NodePath::root().child(*node_id))?;
         let read = entity.read().ok()?;
         let sg = read.as_any().downcast_ref::<SubGraphNode>()?;
         sg.template_type_id()
@@ -201,8 +196,18 @@ impl NodeGraph {
     /// Get the data value of a node.
     pub fn node_data(&self, node_id: &NodeId) -> Option<Data> {
         let ns = self.node_states.read().ok()?;
-        ns.get(node_id)
+        ns.get(&NodePath::root().child(*node_id))
             .and_then(|s| s.data.as_ref().map(|d| d.share()))
+    }
+
+    /// Get the data value of a node at the given path. Path-aware sibling of
+    /// [`node_data`](Self::node_data); needed by consumers (e.g. catalog
+    /// populate, interface-bidirectional proxy) that reference depth-2 nodes
+    /// living inside SubGraph templates.
+    pub fn node_data_at_path(&self, path: &NodePath) -> Option<Data> {
+        let ns = self.node_states.read().ok()?;
+        ns.get(path)
+            .and_then(|state| state.data.as_ref().map(|d| d.share()))
     }
 
     /// Check if a node exists.
@@ -210,83 +215,68 @@ impl NodeGraph {
         self.node_states
             .read()
             .ok()
-            .map(|ns| ns.get(node_id).is_some())
+            .map(|ns| ns.get(&NodePath::root().child(*node_id)).is_some())
             .unwrap_or(false)
     }
 
     /// Get input slot count for a node.
     pub fn input_slot_count(&self, node_id: &NodeId) -> usize {
-        self.node_states
-            .read()
-            .ok()
-            .map(|ns| ns.input_slot_count(node_id))
-            .unwrap_or(0)
+        self.input_slot_count_at(&NodePath::root().child(*node_id))
     }
 
     /// Get output slot count for a node.
     pub fn output_slot_count(&self, node_id: &NodeId) -> usize {
-        self.node_states
-            .read()
-            .ok()
-            .map(|ns| ns.output_slot_count(node_id))
-            .unwrap_or(0)
+        self.output_slot_count_at(&NodePath::root().child(*node_id))
     }
 
     /// Get the label of an input slot.
     pub fn input_slot_label(&self, node_id: &NodeId, slot: usize) -> Option<&'static str> {
         let ns = self.node_states.read().ok()?;
-        ns.input_slot(node_id, slot).map(|s| s.label)
+        ns.input_slot(&NodePath::root().child(*node_id), slot)
+            .map(|s| s.label)
     }
 
     /// Get the data type of an input slot.
     pub fn input_slot_data_type(&self, node_id: &NodeId, slot: usize) -> Option<DataType> {
-        let ns = self.node_states.read().ok()?;
-        ns.input_slot(node_id, slot).map(|s| s.data_type)
+        self.input_slot_data_type_at(&NodePath::root().child(*node_id), slot)
     }
 
     /// Get the default value of an input slot.
     pub fn input_slot_default_value(&self, node_id: &NodeId, slot: usize) -> Option<DataValue> {
         let ns = self.node_states.read().ok()?;
-        ns.input_slot(node_id, slot)
+        ns.input_slot(&NodePath::root().child(*node_id), slot)
             .and_then(|s| s.default_value.as_ref().map(Arc::clone))
     }
 
     /// Get combined info for an input slot (label + data_type + default_value).
     pub fn input_slot_info(&self, node_id: &NodeId, slot: usize) -> Option<InputSlotInfo> {
-        let ns = self.node_states.read().ok()?;
-        ns.input_slot(node_id, slot).map(|s| InputSlotInfo {
-            id: s.id,
-            label: s.label,
-            data_type: s.data_type,
-            default_value: s.default_value.as_ref().map(Arc::clone),
-        })
+        self.input_slot_info_at(&NodePath::root().child(*node_id), slot)
     }
 
     /// Get combined info for an output slot (label + data_type).
     pub fn output_slot_info(&self, node_id: &NodeId, slot: usize) -> Option<SlotInfo> {
-        let ns = self.node_states.read().ok()?;
-        ns.output_slot(node_id, slot).map(|s| SlotInfo {
-            label: s.label,
-            data_type: s.data_type,
-        })
+        self.output_slot_info_at(&NodePath::root().child(*node_id), slot)
     }
 
     /// Get the InputSlotId for an input slot.
     pub fn input_slot_id(&self, node_id: &NodeId, slot: usize) -> Option<InputSlotId> {
         let ns = self.node_states.read().ok()?;
-        ns.input_slot(node_id, slot).map(|s| s.id)
+        ns.input_slot(&NodePath::root().child(*node_id), slot)
+            .map(|s| s.id)
     }
 
     /// Get the label of an output slot.
     pub fn output_slot_label(&self, node_id: &NodeId, slot: usize) -> Option<&'static str> {
         let ns = self.node_states.read().ok()?;
-        ns.output_slot(node_id, slot).map(|s| s.label)
+        ns.output_slot(&NodePath::root().child(*node_id), slot)
+            .map(|s| s.label)
     }
 
     /// Get the data type of an output slot.
     pub fn output_slot_data_type(&self, node_id: &NodeId, slot: usize) -> Option<DataType> {
         let ns = self.node_states.read().ok()?;
-        ns.output_slot(node_id, slot).map(|s| s.data_type)
+        ns.output_slot(&NodePath::root().child(*node_id), slot)
+            .map(|s| s.data_type)
     }
 
     /// Get all edges (cloned).
@@ -310,7 +300,7 @@ impl NodeGraph {
             .read()
             .ok()
             .and_then(|ns| {
-                let slot_state = ns.input_slot(node_id, slot)?;
+                let slot_state = ns.input_slot(&NodePath::root().child(*node_id), slot)?;
                 Some(ns.edges_for_input(&slot_state.id).to_vec())
             })
             .unwrap_or_default()
@@ -322,10 +312,31 @@ impl NodeGraph {
             .read()
             .ok()
             .and_then(|ns| {
-                let slot_state = ns.output_slot(node_id, slot)?;
+                let slot_state = ns.output_slot(&NodePath::root().child(*node_id), slot)?;
                 Some(ns.edges_for_output(&slot_state.id).to_vec())
             })
             .unwrap_or_default()
+    }
+
+    /// Look up the owning `(NodePath, slot_index)` for an `InputSlotId`.
+    ///
+    /// Returns `None` if the slot has been removed or was never registered.
+    /// Thin forwarding wrapper around `NodeStates::input_slot_owner`
+    /// (plan-006 C17).
+    pub fn input_slot_owner(&self, sid: &InputSlotId) -> Option<(NodePath, usize)> {
+        self.node_states.read().ok()?.input_slot_owner(sid).cloned()
+    }
+
+    /// Look up the owning `(NodePath, slot_index)` for an `OutputSlotId`.
+    ///
+    /// Thin forwarding wrapper around `NodeStates::output_slot_owner`
+    /// (plan-006 C17).
+    pub fn output_slot_owner(&self, sid: &OutputSlotId) -> Option<(NodePath, usize)> {
+        self.node_states
+            .read()
+            .ok()?
+            .output_slot_owner(sid)
+            .cloned()
     }
 
     /// Reorder an edge within its output slot's connection list.
@@ -337,10 +348,6 @@ impl NodeGraph {
     }
 
     /// Reorder an edge within its input slot's connection list.
-    ///
-    /// Changes the position of the edge to `new_index`, affecting the order
-    /// in which multi-input values are received during execution.
-    /// Returns `true` if the reorder was successful.
     pub fn reorder_input_edge(&self, edge_id: &EdgeId, new_index: usize) -> bool {
         self.node_states
             .write()
@@ -353,7 +360,10 @@ impl NodeGraph {
         self.node_states
             .read()
             .ok()
-            .map(|ns| ns.outgoing_edges_for_node(node_id).to_vec())
+            .map(|ns| {
+                ns.outgoing_edges_at(&NodePath::root().child(*node_id))
+                    .to_vec()
+            })
             .unwrap_or_default()
     }
 
