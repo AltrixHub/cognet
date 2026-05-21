@@ -37,6 +37,13 @@ impl Vector3 {
 }
 
 /// An RGBA color value for passing color data through the graph.
+///
+/// Channels are normalized to the **0.0..=1.0 range** (graphics
+/// convention, matching WGPU / OpenGL / sRGB-float). Producers must
+/// emit values in this range; consumers that need 8-bit channels
+/// should multiply by `255.0` at the boundary. The range is not
+/// runtime-enforced — keeping the contract is the producer's
+/// responsibility.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorValue {
     pub r: f64,
@@ -46,6 +53,10 @@ pub struct ColorValue {
 }
 
 impl ColorValue {
+    /// Construct a `ColorValue`. `r`, `g`, `b`, `a` are expected to be
+    /// in the 0.0..=1.0 range (see struct docs). Out-of-range values
+    /// are passed through without clamping so callers that intentionally
+    /// over- or under-saturate (e.g. HDR producers) still work.
     pub fn new(r: f64, g: f64, b: f64, a: f64) -> Self {
         Self { r, g, b, a }
     }

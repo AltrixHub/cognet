@@ -21,11 +21,14 @@ impl NodeMeta for ColorNode {
         data_type: DataType::Color,
         max_connections: None,
     }];
+    // `ColorValue` channels are canonically 0.0..=1.0 — see the doc on
+    // `ColorValue` in `edge/slot.rs`. White = fully-opaque
+    // `(1.0, 1.0, 1.0, 1.0)`.
     const DEFAULT_VALUE: DefaultValue = DefaultValue::Color {
-        r: 255.0,
-        g: 255.0,
-        b: 255.0,
-        a: 255.0,
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
     };
 }
 
