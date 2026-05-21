@@ -184,6 +184,30 @@ impl NodeGraph {
         ns.input_slot(path, slot).map(|s| s.data_type)
     }
 
+    /// Whether an input slot should be rendered as an editable row by
+    /// downstream property inspectors. Returns `None` when the slot does
+    /// not exist; callers may treat that as visible.
+    pub fn input_slot_inspector_visible_at(&self, path: &NodePath, slot: usize) -> Option<bool> {
+        let ns = self.node_states.read().ok()?;
+        ns.input_slot(path, slot).map(|s| s.inspector_visible)
+    }
+
+    /// Override the `inspector_visible` flag of an existing input slot.
+    /// Returns `true` on success, `false` if the slot does not exist.
+    /// Used by callers that create dynamic SubGraph ports and want to
+    /// mark a subset of them as structural (hidden from Inspectors).
+    pub fn set_input_slot_inspector_visible_at(
+        &self,
+        path: &NodePath,
+        slot: usize,
+        visible: bool,
+    ) -> bool {
+        let Ok(mut ns) = self.node_states.write() else {
+            return false;
+        };
+        ns.set_input_slot_inspector_visible(path, slot, visible)
+    }
+
     // ── SubGraph external slot helpers (plan-006 C17 Step 11.5c) ──
 
     /// Return the `(NodePath, InputSlotId)` pair that an external edge targets
@@ -904,6 +928,7 @@ mod tests {
             label: "In",
             data_type: crate::DataType::Vector3,
             max_connections: Some(1),
+            inspector_visible: true,
         }];
         const OUTPUTS: &'static [crate::SlotDef] = &[];
     }

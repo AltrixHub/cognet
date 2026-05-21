@@ -93,11 +93,40 @@ impl DefaultValue {
 }
 
 /// Static definition of a slot (input or output port).
+///
+/// `inspector_visible` controls whether downstream property inspectors should
+/// render an editor for this slot. Set `false` for structural / aggregate
+/// ports whose value comes from graph topology rather than user typing
+/// (e.g. multi-input collectors, hierarchical membership ports). Default
+/// `true` (set via [`SlotDef::new`]).
 #[derive(Debug, Clone, Copy)]
 pub struct SlotDef {
     pub label: &'static str,
     pub data_type: DataType,
     pub max_connections: Option<usize>,
+    pub inspector_visible: bool,
+}
+
+impl SlotDef {
+    /// Build a slot definition with `inspector_visible: true` (default).
+    pub const fn new(
+        label: &'static str,
+        data_type: DataType,
+        max_connections: Option<usize>,
+    ) -> Self {
+        Self {
+            label,
+            data_type,
+            max_connections,
+            inspector_visible: true,
+        }
+    }
+
+    /// Set `inspector_visible` (chainable in const contexts).
+    pub const fn with_inspector_visible(mut self, visible: bool) -> Self {
+        self.inspector_visible = visible;
+        self
+    }
 }
 
 /// Trait for nodes to provide static metadata.

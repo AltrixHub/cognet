@@ -241,6 +241,13 @@ impl NodeGraph {
         self.input_slot_data_type_at(&NodePath::root().child(*node_id), slot)
     }
 
+    /// Whether an input slot should be rendered as an editable row by
+    /// downstream property inspectors. Path-aware sibling lives at
+    /// [`NodeGraph::input_slot_inspector_visible_at`].
+    pub fn input_slot_inspector_visible(&self, node_id: &NodeId, slot: usize) -> Option<bool> {
+        self.input_slot_inspector_visible_at(&NodePath::root().child(*node_id), slot)
+    }
+
     /// Get the default value of an input slot.
     pub fn input_slot_default_value(&self, node_id: &NodeId, slot: usize) -> Option<DataValue> {
         let ns = self.node_states.read().ok()?;

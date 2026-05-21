@@ -35,13 +35,27 @@ impl NodeState {
 }
 
 /// Runtime state for input slots.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct InputSlotState {
     pub id: InputSlotId,
     pub label: &'static str,
     pub data_type: DataType,
     pub max_connections: Option<usize>,
+    pub inspector_visible: bool,
     pub default_value: Option<DataValue>,
+}
+
+impl Default for InputSlotState {
+    fn default() -> Self {
+        Self {
+            id: InputSlotId::default(),
+            label: "",
+            data_type: DataType::default(),
+            max_connections: None,
+            inspector_visible: true,
+            default_value: None,
+        }
+    }
 }
 
 /// Runtime state for output slots.
@@ -116,6 +130,7 @@ impl NodeStates {
                 label: def.label,
                 data_type: def.data_type,
                 max_connections: def.max_connections,
+                inspector_visible: def.inspector_visible,
                 default_value: None,
             };
             self.input_slot_owner.insert(slot.id, (path.clone(), i));
@@ -144,6 +159,7 @@ impl NodeStates {
         label: &'static str,
         data_type: DataType,
         max_connections: Option<usize>,
+        inspector_visible: bool,
     ) -> usize {
         let index = self.input_slot_count(path);
         let slot = InputSlotState {
@@ -151,6 +167,7 @@ impl NodeStates {
             label,
             data_type,
             max_connections,
+            inspector_visible,
             default_value: None,
         };
         self.input_slot_owner.insert(slot.id, (path.clone(), index));
@@ -175,6 +192,22 @@ impl NodeStates {
             .insert(slot.id, (path.clone(), index));
         self.output_slots.insert((path.clone(), index), slot);
         index
+    }
+
+    /// Rewrite the `inspector_visible` flag of an input slot. Returns
+    /// `true` on success, `false` if the slot does not exist.
+    pub fn set_input_slot_inspector_visible(
+        &mut self,
+        path: &NodePath,
+        index: usize,
+        visible: bool,
+    ) -> bool {
+        if let Some(slot) = self.input_slots.get_mut(&(path.clone(), index)) {
+            slot.inspector_visible = visible;
+            true
+        } else {
+            false
+        }
     }
 
     /// Rewrite the label of an input slot in place. Slot index and id
@@ -632,7 +665,7 @@ mod tests {
 
         ns.add_node(&sg_path, "SubGraph", None, None, &[], &[]);
         ns.add_node(&in_path, "Interface", None, None, &[], &[]);
-        ns.add_input_slot(&in_path, "value", DataType::Number, Some(1));
+        ns.add_input_slot(&in_path, "value", DataType::Number, Some(1), true);
 
         let schema = ns.subgraph_external_inputs(&sg_path, in_id);
         assert_eq!(schema.len(), 1);
@@ -652,7 +685,7 @@ mod tests {
 
         ns.add_node(&sg_path, "SubGraph", None, None, &[], &[]);
         ns.add_node(&out_path, "Interface", None, None, &[], &[]);
-        ns.add_input_slot(&out_path, "result", DataType::Number, None);
+        ns.add_input_slot(&out_path, "result", DataType::Number, None, true);
 
         let schema = ns.subgraph_external_outputs(&sg_path, out_id);
         assert_eq!(schema.len(), 1);
@@ -670,7 +703,7 @@ mod tests {
         ns.add_node(&path, "Test", None, None, &[], &[]);
 
         // Add one input slot and one output slot dynamically.
-        let in_idx = ns.add_input_slot(&path, "in", DataType::Number, Some(1));
+        let in_idx = ns.add_input_slot(&path, "in", DataType::Number, Some(1), true);
         let out_idx = ns.add_output_slot(&path, "out", DataType::Number);
 
         let in_sid = ns.input_slot(&path, in_idx).unwrap().id;
@@ -706,11 +739,13 @@ mod tests {
             label: "value",
             data_type: DataType::Number,
             max_connections: Some(1),
+            inspector_visible: true,
         }];
         let output_defs = [SlotDef {
             label: "result",
             data_type: DataType::Number,
             max_connections: None,
+            inspector_visible: true,
         }];
 
         ns.add_node(&path, "Test", None, None, &input_defs, &output_defs);
@@ -739,7 +774,7 @@ mod tests {
         let path = NodePath::root().child(node_id);
 
         ns.add_node(&path, "Test", None, None, &[], &[]);
-        ns.add_input_slot(&path, "i", DataType::Number, None);
+        ns.add_input_slot(&path, "i", DataType::Number, None, true);
         ns.add_output_slot(&path, "o", DataType::Number);
 
         let in_sid = ns.input_slot(&path, 0).unwrap().id;

@@ -20,6 +20,7 @@ impl NodeMeta for ColorNode {
         label: "Value",
         data_type: DataType::Color,
         max_connections: None,
+        inspector_visible: true,
     }];
     // `ColorValue` channels are canonically 0.0..=1.0 — see the doc on
     // `ColorValue` in `edge/slot.rs`. White = fully-opaque

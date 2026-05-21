@@ -402,11 +402,13 @@ mod subgraph_edge_alias_tests {
             label: "x",
             data_type: crate::DataType::Number,
             max_connections: Some(1),
+            inspector_visible: true,
         }];
         const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
             label: "x",
             data_type: crate::DataType::Number,
             max_connections: None,
+            inspector_visible: true,
         }];
         const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::None;
     }

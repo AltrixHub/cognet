@@ -13,11 +13,13 @@ impl NodeMeta for MultiplyListNode {
         label: "Numbers",
         data_type: DataType::Number,
         max_connections: None,
+        inspector_visible: true,
     }];
     const OUTPUTS: &'static [SlotDef] = &[SlotDef {
         label: "Product",
         data_type: DataType::Number,
         max_connections: None,
+        inspector_visible: true,
     }];
 }
 

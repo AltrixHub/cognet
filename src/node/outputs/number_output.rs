@@ -12,6 +12,7 @@ impl NodeMeta for NumberOutput {
         label: "Value",
         data_type: DataType::Number,
         max_connections: Some(1),
+        inspector_visible: true,
     }];
     const OUTPUTS: &'static [SlotDef] = &[];
 }
