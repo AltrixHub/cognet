@@ -20,6 +20,7 @@ impl NodeMeta for Vector3Node {
         label: "Value",
         data_type: DataType::Vector3,
         max_connections: None,
+        inspector_visible: true,
     }];
     const DEFAULT_VALUE: DefaultValue = DefaultValue::Vector3 {
         x: 0.0,

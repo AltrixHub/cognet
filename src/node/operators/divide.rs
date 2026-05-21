@@ -18,17 +18,20 @@ impl NodeMeta for DivideNode {
             label: "A",
             data_type: DataType::Number,
             max_connections: Some(1),
+            inspector_visible: true,
         },
         SlotDef {
             label: "B",
             data_type: DataType::Number,
             max_connections: Some(1),
+            inspector_visible: true,
         },
     ];
     const OUTPUTS: &'static [SlotDef] = &[SlotDef {
         label: "Quotient",
         data_type: DataType::Number,
         max_connections: None,
+        inspector_visible: true,
     }];
 }
 

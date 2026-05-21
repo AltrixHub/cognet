@@ -71,7 +71,7 @@ impl NodeGraph {
         let index = {
             let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
             let node_path = NodePath::root().child(*node_id);
-            let in_idx = ns.add_input_slot(&node_path, label, data_type, Some(1));
+            let in_idx = ns.add_input_slot(&node_path, label, data_type, Some(1), true);
             let out_idx = ns.add_output_slot(&node_path, label, data_type);
             // Invariant: input and output slot indices stay in lock-step.
             assert_eq!(

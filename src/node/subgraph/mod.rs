@@ -109,10 +109,17 @@ impl SubGraphNode {
         label: &'static str,
         data_type: DataType,
         max_connections: Option<usize>,
+        inspector_visible: bool,
     ) -> Result<(), String> {
         let in_path = sg_path.child(self.input_proxy_id);
         let mut ns = graph.node_states().write().map_err(|e| e.to_string())?;
-        ns.add_input_slot(&in_path, label, data_type, max_connections);
+        ns.add_input_slot(
+            &in_path,
+            label,
+            data_type,
+            max_connections,
+            inspector_visible,
+        );
         ns.add_output_slot(&in_path, label, data_type);
         Ok(())
     }

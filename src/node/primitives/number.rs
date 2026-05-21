@@ -14,6 +14,7 @@ impl NodeMeta for NumberNode {
         label: "Value",
         data_type: DataType::Number,
         max_connections: None,
+        inspector_visible: true,
     }];
     const DEFAULT_VALUE: DefaultValue = DefaultValue::Number(10.0);
 }

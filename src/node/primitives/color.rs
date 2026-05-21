@@ -20,6 +20,7 @@ impl NodeMeta for ColorNode {
         label: "Value",
         data_type: DataType::Color,
         max_connections: None,
+        inspector_visible: true,
     }];
     const DEFAULT_VALUE: DefaultValue = DefaultValue::Color {
         r: 255.0,

@@ -14,6 +14,7 @@ impl NodeMeta for StringNode {
         label: "Value",
         data_type: DataType::String,
         max_connections: None,
+        inspector_visible: true,
     }];
     const DEFAULT_VALUE: DefaultValue = DefaultValue::String("Hello");
 }

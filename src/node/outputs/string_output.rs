@@ -12,6 +12,7 @@ impl NodeMeta for StringOutput {
         label: "Value",
         data_type: DataType::String,
         max_connections: Some(1),
+        inspector_visible: true,
     }];
     const OUTPUTS: &'static [SlotDef] = &[];
 }

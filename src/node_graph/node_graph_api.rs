@@ -1512,6 +1512,7 @@ mod sync_executor_tests {
             label: "Out",
             data_type: crate::DataType::Number,
             max_connections: None,
+            inspector_visible: true,
         }];
         const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::Number(42.0);
     }
@@ -1669,6 +1670,7 @@ mod sync_executor_tests {
                 label: "Out",
                 data_type: crate::DataType::Number,
                 max_connections: None,
+                inspector_visible: true,
             }];
             const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::Number(0.0);
         }
@@ -1720,6 +1722,7 @@ mod sync_executor_tests {
             label: "Out",
             data_type: crate::DataType::Number,
             max_connections: None,
+            inspector_visible: true,
         }];
         const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::Number(0.0);
     }
@@ -1826,6 +1829,7 @@ mod sync_executor_tests {
             label: "Out",
             data_type: crate::DataType::Number,
             max_connections: None,
+            inspector_visible: true,
         }];
         const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::Number(0.0);
     }

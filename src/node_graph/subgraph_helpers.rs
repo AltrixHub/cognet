@@ -140,10 +140,16 @@ impl NodeGraph {
         let sg_path = NodePath::root().child(*node_id);
         let in_path = sg_path.child(input_proxy_id);
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        ns.add_input_slot(&in_path, label, data_type, Some(1));
+        ns.add_input_slot(&in_path, label, data_type, Some(1), true);
         ns.add_output_slot(&in_path, label, data_type);
         // Sync external slot on parent SubGraphNode.
-        ns.add_input_slot(&NodePath::root().child(*node_id), label, data_type, None);
+        ns.add_input_slot(
+            &NodePath::root().child(*node_id),
+            label,
+            data_type,
+            None,
+            true,
+        );
         Ok(())
     }
 
@@ -213,7 +219,7 @@ impl NodeGraph {
         let sg_path = NodePath::root().child(*node_id);
         let out_path = sg_path.child(output_proxy_id);
         let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        ns.add_input_slot(&out_path, label, data_type, None);
+        ns.add_input_slot(&out_path, label, data_type, None, true);
         ns.add_output_slot(&out_path, label, data_type);
         // Sync external slot on parent SubGraphNode.
         ns.add_output_slot(&NodePath::root().child(*node_id), label, data_type);
