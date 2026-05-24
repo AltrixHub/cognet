@@ -207,10 +207,9 @@ fn build_execution_context(
                 // non-primitive type.
                 if values.is_empty() {
                     if let Some(default_ref) = slot_state.default_value.as_ref() {
-                        if let Ok(data) = Data::from_any_typed(
-                            Arc::clone(default_ref),
-                            slot_state.data_type,
-                        ) {
+                        if let Ok(data) =
+                            Data::from_any_typed(Arc::clone(default_ref), slot_state.data_type)
+                        {
                             values.push(data);
                         }
                     }
