@@ -199,10 +199,17 @@ fn build_execution_context(
                         }
                     }
                 }
-                // Default value fallback when no edges are connected
+                // Default value fallback when no edges are connected.
+                // `from_any_typed` carries the slot's declared `data_type`
+                // through type erasure so `Domain<_>` / `Mesh` / `BRep`
+                // defaults round-trip correctly. `from_any` would lose the
+                // domain tag and silently drop the default for every
+                // non-primitive type.
                 if values.is_empty() {
                     if let Some(default_ref) = slot_state.default_value.as_ref() {
-                        if let Ok(data) = Data::from_any(Arc::clone(default_ref)) {
+                        if let Ok(data) =
+                            Data::from_any_typed(Arc::clone(default_ref), slot_state.data_type)
+                        {
                             values.push(data);
                         }
                     }
@@ -285,8 +292,15 @@ fn resolve_value_through_interface(
     }
     // Fallback: the InterfaceNode's input slot default (set by the
     // SubGraph external default mirror in `7be893a`).
+    //
+    // Use `from_any_typed` so `Domain<_>` / `Mesh` / `BRep` defaults
+    // round-trip — `from_any` only inspects the inner `TypeId` and
+    // therefore cannot recover the domain tag for type-erased
+    // `Arc<dyn Any>` payloads (it returns `Err("Unsupported data
+    // type")` for every non-primitive). The slot's declared
+    // `data_type` is already on hand, so use that.
     let default_ref = input_slot.default_value.as_ref()?;
-    Data::from_any(Arc::clone(default_ref)).ok()
+    Data::from_any_typed(Arc::clone(default_ref), input_slot.data_type).ok()
 }
 
 /// Extract field name/value pairs from a `Data` value for composite types.
