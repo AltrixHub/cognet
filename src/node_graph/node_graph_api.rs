@@ -232,6 +232,7 @@ fn build_execution_context(
     let output_writer = OutputWriter::new(cache.share(), slots);
 
     Ok(ExecutionContext {
+        path: path.clone(),
         node_data,
         input_values,
         output_writer,
@@ -1392,6 +1393,7 @@ impl NodeGraph {
 #[cfg(test)]
 mod sync_executor_tests {
     use super::*;
+    use crate::utils::id::EntityId;
     use crate::{AddNode, NumberNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc as StdArc;
@@ -1861,4 +1863,78 @@ mod sync_executor_tests {
     }
 
     crate::register_nodes!(FlakySyncNode);
+
+    /// Test-only probe that reports its own `ctx.path` as a String
+    /// output — pins the contract that every executing node knows its
+    /// own hierarchical identity (consumed by callers that derive
+    /// stable per-node operation ids, e.g. revion's geolis `OpId`s).
+    #[derive(Debug)]
+    pub struct PathProbeNode;
+
+    impl crate::NodeMeta for PathProbeNode {
+        const NAME: &'static str = "PathProbe";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Primitive;
+        const INPUTS: &'static [crate::SlotDef] = &[];
+        const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "Path",
+            data_type: crate::DataType::String,
+            max_connections: None,
+            inspector_visible: true,
+        }];
+        const DEFAULT_VALUE: crate::DefaultValue = crate::DefaultValue::String("");
+    }
+
+    impl NodeImpl for PathProbeNode {
+        fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
+            let rendered = ctx.path.to_string();
+            ctx.output_writer.set(0, Data::new(rendered)?)?;
+            Ok(())
+        }
+    }
+
+    crate::register_nodes!(PathProbeNode);
+
+    fn probe_output(result: &ExecutionResult, path: &NodePath) -> String {
+        result
+            .node_outputs
+            .get(path)
+            .and_then(|slots| slots.first().cloned().flatten())
+            .and_then(|d| d.value::<String>().ok().cloned())
+            .expect("probe output present")
+    }
+
+    #[test]
+    fn execution_context_exposes_node_path_at_root() {
+        let mut graph = NodeGraph::new().unwrap();
+        let id = graph.create_node::<PathProbeNode>().unwrap();
+        let path = NodePath::root().child(id);
+
+        let r1 = graph.execute_sync().unwrap();
+        assert_eq!(probe_output(&r1, &path), path.to_string());
+
+        // Dirty the node and re-execute: the reported identity must be
+        // byte-identical across re-executions of the same node.
+        graph
+            .update_node_data(&id, Data::new("poke".to_string()).unwrap())
+            .unwrap();
+        let r2 = graph.execute_sync().unwrap();
+        assert_eq!(probe_output(&r2, &path), path.to_string());
+    }
+
+    #[test]
+    fn execution_context_exposes_node_path_inside_subgraph() {
+        let mut graph = NodeGraph::new().unwrap();
+        let root = NodePath::root();
+        let sg_id = graph.add_subgraph_at(&root, "sg").unwrap();
+        let sg_path = root.child(sg_id);
+        let probe_id = graph.create_node_by_name_at(&sg_path, "PathProbe").unwrap();
+        let probe_path = sg_path.child(probe_id);
+
+        let r = graph.execute_sync().unwrap();
+        assert_eq!(probe_output(&r, &probe_path), probe_path.to_string());
+        assert_eq!(
+            probe_output(&r, &probe_path),
+            format!("/{}/{}", sg_id.id_string(), probe_id.id_string())
+        );
+    }
 }
