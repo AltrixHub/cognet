@@ -5,13 +5,18 @@
 //! This decouples nodes from the execution cache, making them pure
 //! computation units.
 
-use crate::{Data, DataType, OutputSlotId, SharedExecutionCache};
+use crate::{Data, DataType, NodePath, OutputSlotId, SharedExecutionCache};
 
 /// Context provided to `NodeImpl::execute()`.
 ///
 /// Contains pre-resolved input values and an output writer,
 /// eliminating the need for nodes to interact with the cache directly.
 pub struct ExecutionContext {
+    /// The executing node's own hierarchical identity. Stable for the
+    /// node's lifetime (the `NodeId` segments are minted once at node
+    /// creation), so callers may derive persistent per-node identifiers
+    /// from its rendering.
+    pub path: NodePath,
     /// The node's own data (e.g., a Number node's stored value).
     pub node_data: Option<Data>,
     /// Pre-resolved input values for each input slot.
