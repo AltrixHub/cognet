@@ -1,4 +1,4 @@
-use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodePath};
+use crate::{Edge, EdgeId, ErrorTarget, GraphError, NodeGraph, NodeId, NodePath};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 pub(crate) trait NodeGraphSystem {
@@ -8,8 +8,6 @@ pub(crate) trait NodeGraphSystem {
         &self,
         target_paths: &HashSet<NodePath>,
     ) -> Result<Vec<Vec<NodePath>>, String>;
-
-    fn add_edge(&mut self, edge: Edge) -> Result<EdgeId, String>;
 }
 
 impl NodeGraphSystem for NodeGraph {
@@ -85,9 +83,20 @@ impl NodeGraphSystem for NodeGraph {
 
         Ok(sorted)
     }
+}
 
-    fn add_edge(&mut self, mut edge: Edge) -> Result<EdgeId, String> {
-        tracing::debug!("[cognet] add_edge: START");
+impl NodeGraph {
+    /// Insert a pre-built `Edge` under the caller-provided `edge_id`.
+    ///
+    /// Core edge-insertion routine: [`connect_nodes_at_with_id`] builds the
+    /// `Edge` and delegates here, and [`connect_nodes_at`] mints a fresh
+    /// `EdgeId` before doing the same. Callers that need deterministic ids
+    /// (op-log replay, save/load) hand in the id here. Runs the full slot /
+    /// type / connection-limit validation and additionally rejects an
+    /// `edge_id` that is already present, so a duplicate op cannot silently
+    /// overwrite an edge.
+    pub fn add_edge_with_id(&mut self, edge_id: EdgeId, mut edge: Edge) -> Result<EdgeId, String> {
+        tracing::debug!("[cognet] add_edge_with_id: START");
 
         // SubGraph external slots are an alias surface for the
         // InputProxy / OutputProxy InterfaceNode slots inside the
@@ -112,7 +121,7 @@ impl NodeGraphSystem for NodeGraph {
                 ns.input_slot(&proxy_path, edge.to_input_slot_index)
                     .ok_or_else(|| {
                         format!(
-                            "add_edge: InputProxy at {proxy_path} has no input slot \
+                            "add_edge_with_id: InputProxy at {proxy_path} has no input slot \
                              {} (SubGraph external slot exists but the proxy is missing \
                              it — schema mismatch)",
                             edge.to_input_slot_index
@@ -130,7 +139,7 @@ impl NodeGraphSystem for NodeGraph {
                 ns.output_slot(&proxy_path, edge.from_output_slot_index)
                     .ok_or_else(|| {
                         format!(
-                            "add_edge: OutputProxy at {proxy_path} has no output slot \
+                            "add_edge_with_id: OutputProxy at {proxy_path} has no output slot \
                              {} (SubGraph external slot exists but the proxy is missing \
                              it — schema mismatch)",
                             edge.from_output_slot_index
@@ -148,10 +157,10 @@ impl NodeGraphSystem for NodeGraph {
         // non-root paths; root-level nodes have a single-element path.
         let from_node_id = from_node
             .leaf()
-            .ok_or_else(|| "add_edge: from_node is a root path".to_string())?;
+            .ok_or_else(|| "add_edge_with_id: from_node is a root path".to_string())?;
         let to_node_id = to_node
             .leaf()
-            .ok_or_else(|| "add_edge: to_node is a root path".to_string())?;
+            .ok_or_else(|| "add_edge_with_id: to_node is a root path".to_string())?;
 
         // Clear previous errors for the target input port
         let input_target = ErrorTarget::InputPort {
@@ -235,11 +244,16 @@ impl NodeGraphSystem for NodeGraph {
             }
         }
 
-        let edge_id = EdgeId::new();
-
-        // Update NodeStates (edge storage + indexes + auto-tracks changed)
+        // Update NodeStates (edge storage + indexes + auto-tracks changed).
+        // Reject a duplicate id first so replay of a malformed op-log cannot
+        // clobber an existing edge under the same id.
         {
             let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+            if guard.get_edge(&edge_id).is_some() {
+                return Err(format!(
+                    "add_edge_with_id: edge id {edge_id:?} already exists"
+                ));
+            }
             guard.add_edge(edge_id, edge.clone());
         }
 
@@ -260,7 +274,7 @@ impl NodeGraph {
     ///
     /// Resolves the slot ids for both endpoints from `NodeStates`. The
     /// returned `Edge` is not added to the graph; pass it to
-    /// [`NodeGraphSystem::add_edge`] (or use [`connect_nodes_at`] which
+    /// [`add_edge_with_id`] (or use [`connect_nodes_at`] which
     /// does both).
     pub fn create_edge_at(
         &self,
@@ -300,11 +314,32 @@ impl NodeGraph {
     }
 
     /// Connect two nodes identified by `NodePath`. Path-aware sibling of
-    /// [`NodeGraphWrite::connect_nodes`]; builds the `Edge` via
-    /// [`create_edge_at`] and inserts it via
-    /// [`NodeGraphSystem::add_edge`].
+    /// [`NodeGraphWrite::connect_nodes`]; mints a fresh `EdgeId` and
+    /// delegates to [`connect_nodes_at_with_id`].
     pub fn connect_nodes_at(
         &mut self,
+        from_path: &NodePath,
+        from_output_slot_index: usize,
+        to_path: &NodePath,
+        to_input_slot_index: usize,
+    ) -> Result<EdgeId, String> {
+        self.connect_nodes_at_with_id(
+            EdgeId::new(),
+            from_path,
+            from_output_slot_index,
+            to_path,
+            to_input_slot_index,
+        )
+    }
+
+    /// Connect two `NodePath` endpoints under the caller-provided `edge_id`.
+    /// Id-parameterized sibling of [`connect_nodes_at`]; the no-id variant
+    /// mints a fresh id and delegates here. Same validation as
+    /// `connect_nodes_at`, and rejects a duplicate `edge_id` (see
+    /// [`add_edge_with_id`]).
+    pub fn connect_nodes_at_with_id(
+        &mut self,
+        edge_id: EdgeId,
         from_path: &NodePath,
         from_output_slot_index: usize,
         to_path: &NodePath,
@@ -319,7 +354,28 @@ impl NodeGraph {
             )
             .map_err(|e| e.to_string())?;
 
-        self.add_edge(edge)
+        self.add_edge_with_id(edge_id, edge)
+    }
+
+    /// Connect two root-level nodes under the caller-provided `edge_id`.
+    /// Root-path wrapper over [`connect_nodes_at_with_id`], mirroring how
+    /// [`NodeGraphWrite::connect_nodes`] wraps [`connect_nodes_at`]. This is
+    /// the deterministic-id entry point used by op-log replay and save/load.
+    pub fn connect_with_id(
+        &mut self,
+        edge_id: EdgeId,
+        from: NodeId,
+        from_output_slot_index: usize,
+        to: NodeId,
+        to_input_slot_index: usize,
+    ) -> Result<EdgeId, String> {
+        self.connect_nodes_at_with_id(
+            edge_id,
+            &NodePath::root().child(from),
+            from_output_slot_index,
+            &NodePath::root().child(to),
+            to_input_slot_index,
+        )
     }
 }
 
@@ -371,6 +427,48 @@ mod path_aware_edge_tests {
         let edge = graph.get_edge_by_id(&edge_id).expect("edge exists");
         assert_eq!(edge.from_node, NodePath::root().child(num_id));
         assert_eq!(edge.to_node, NodePath::root().child(add_id));
+    }
+
+    #[test]
+    fn connect_with_id_uses_given_id() {
+        use crate::EdgeId;
+
+        let mut graph = NodeGraph::new().expect("create graph");
+        let num_id = graph.create_node_by_name("Number").expect("create num");
+        let add_id = graph.create_node_by_name("Add").expect("create add");
+
+        // Caller pre-generates the id; the connect must honour it verbatim.
+        let given = EdgeId::new();
+        let returned = graph
+            .connect_with_id(given, num_id, 0, add_id, 0)
+            .expect("connect_with_id");
+
+        assert_eq!(returned, given, "connect_with_id must return the given id");
+        assert!(
+            graph.get_edge_by_id(&given).is_some(),
+            "edge must be stored under the caller-pregenerated id",
+        );
+    }
+
+    #[test]
+    fn connect_with_id_rejects_duplicate_id() {
+        use crate::EdgeId;
+
+        let mut graph = NodeGraph::new().expect("create graph");
+        let num_id = graph.create_node_by_name("Number").expect("create num");
+        let add_id = graph.create_node_by_name("Add").expect("create add");
+
+        let given = EdgeId::new();
+        graph
+            .connect_with_id(given, num_id, 0, add_id, 0)
+            .expect("first connect_with_id");
+
+        // Reusing the same id for a distinct, otherwise-valid edge must fail.
+        let err = graph.connect_with_id(given, num_id, 0, add_id, 1);
+        assert!(
+            err.is_err(),
+            "connect_with_id must reject a duplicate edge id, got {err:?}",
+        );
     }
 }
 
