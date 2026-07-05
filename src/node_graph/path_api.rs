@@ -184,6 +184,38 @@ impl NodeGraph {
         ns.input_slot(path, slot).map(|s| s.data_type)
     }
 
+    /// Get the **ordered** edge list connected to an input slot at
+    /// `path`. Path-aware sibling of
+    /// [`NodeGraph::edges_for_input_slot`]; the root variant is a thin
+    /// wrapper over this method. The order is the slot's connection
+    /// order (semantic for variable-length inputs such as polyline
+    /// points), matching [`NodeStates::edges_for_input`].
+    pub fn edges_for_input_slot_at(&self, path: &NodePath, slot: usize) -> Vec<crate::EdgeId> {
+        self.node_states
+            .read()
+            .ok()
+            .and_then(|ns| {
+                let slot_state = ns.input_slot(path, slot)?;
+                Some(ns.edges_for_input(&slot_state.id).to_vec())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get the **ordered** edge list connected from an output slot at
+    /// `path`. Path-aware sibling of
+    /// [`NodeGraph::edges_for_output_slot`]; the root variant is a
+    /// thin wrapper over this method.
+    pub fn edges_for_output_slot_at(&self, path: &NodePath, slot: usize) -> Vec<crate::EdgeId> {
+        self.node_states
+            .read()
+            .ok()
+            .and_then(|ns| {
+                let slot_state = ns.output_slot(path, slot)?;
+                Some(ns.edges_for_output(&slot_state.id).to_vec())
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether an input slot should be rendered as an editable row by
     /// downstream property inspectors. Returns `None` when the slot does
     /// not exist; callers may treat that as visible.
@@ -1420,6 +1452,68 @@ mod tests {
         assert_eq!(
             graph.input_slot_data_type_at(&add_path, 0),
             Some(crate::DataType::Number),
+        );
+    }
+
+    #[test]
+    fn edges_for_input_slot_at_depth_2_returns_connect_order() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let add_id = graph
+            .create_node_by_name_at(&sg_path, "AddList")
+            .expect("create AddList");
+        let n1 = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create Number 1");
+        let n2 = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create Number 2");
+        let add_path = sg_path.child(add_id);
+        let e1 = graph
+            .connect_nodes_at(&sg_path.child(n1), 0, &add_path, 0)
+            .expect("connect n1");
+        let e2 = graph
+            .connect_nodes_at(&sg_path.child(n2), 0, &add_path, 0)
+            .expect("connect n2");
+
+        assert_eq!(
+            graph.edges_for_input_slot_at(&add_path, 0),
+            vec![e1, e2],
+            "path-aware input-slot edge list must preserve connect order at depth-2",
+        );
+    }
+
+    #[test]
+    fn edges_for_output_slot_at_depth_2_returns_connect_order() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let num_id = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create Number");
+        let a1 = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create Add 1");
+        let a2 = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create Add 2");
+        let num_path = sg_path.child(num_id);
+        let e1 = graph
+            .connect_nodes_at(&num_path, 0, &sg_path.child(a1), 0)
+            .expect("connect a1");
+        let e2 = graph
+            .connect_nodes_at(&num_path, 0, &sg_path.child(a2), 0)
+            .expect("connect a2");
+
+        assert_eq!(
+            graph.edges_for_output_slot_at(&num_path, 0),
+            vec![e1, e2],
+            "path-aware output-slot edge list must preserve connect order at depth-2",
         );
     }
 
