@@ -1,4 +1,7 @@
 # getrandom 0.3 requires an explicit backend selection for wasm32-unknown-unknown
 # in addition to the `wasm_js` cargo feature (see Cargo.toml target dependencies).
+# Kept on 0.3 deliberately: a transitive getrandom 0.3 (ulid -> rand -> rand_core)
+# means a direct bump to 0.4 splits the graph and drops `wasm_js` from the 0.3 copy,
+# breaking the wasm backend. Revisit once rand/ulid move to getrandom 0.4.
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
