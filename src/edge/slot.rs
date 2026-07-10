@@ -208,6 +208,116 @@ impl Plane {
     }
 }
 
+/// A 4x4 affine transform (row-major), the reusable product of
+/// placement operations: compose, invert, and apply to geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transform {
+    /// Row-major matrix entries; row 3 is `[0, 0, 0, 1]` for affine
+    /// transforms.
+    pub m: [[f64; 4]; 4],
+}
+
+impl Transform {
+    #[rustfmt::skip]
+    pub fn identity() -> Self {
+        Self { m: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]}
+    }
+
+    /// The rigid transform taking `source` onto `target`:
+    /// `p → o_t + R (p - o_s)` with `R = B_t · B_sᵀ`.
+    pub fn from_frames(source: &Plane, target: &Plane) -> Self {
+        let s = [source.x_axis, source.y_axis, source.z_axis];
+        let t = [target.x_axis, target.y_axis, target.z_axis];
+        let axis = |v: Vector3, i: usize| match i {
+            0 => v.x,
+            1 => v.y,
+            _ => v.z,
+        };
+        let mut m = Self::identity().m;
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut r = 0.0;
+                for k in 0..3 {
+                    r += axis(t[k], i) * axis(s[k], j);
+                }
+                m[i][j] = r;
+            }
+        }
+        let o_s = [source.origin.x, source.origin.y, source.origin.z];
+        let o_t = [target.origin.x, target.origin.y, target.origin.z];
+        for i in 0..3 {
+            let mut r_os = 0.0;
+            for (j, os) in o_s.iter().enumerate() {
+                r_os += m[i][j] * os;
+            }
+            m[i][3] = o_t[i] - r_os;
+        }
+        Self { m }
+    }
+
+    /// `self` followed by `next` (`next · self`).
+    pub fn then(&self, next: &Transform) -> Self {
+        let mut m = [[0.0; 4]; 4];
+        for (i, row) in m.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                for k in 0..4 {
+                    *cell += next.m[i][k] * self.m[k][j];
+                }
+            }
+        }
+        Self { m }
+    }
+
+    /// Affine inverse (3x3 adjugate + translation).
+    ///
+    /// # Errors
+    ///
+    /// `Err` when the linear part is singular (determinant ~ 0).
+    pub fn inverse(&self) -> Result<Self, String> {
+        let a = &self.m;
+        let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        if det.abs() < 1e-12 {
+            return Err("Transform: singular linear part cannot be inverted".to_string());
+        }
+        let inv_det = 1.0 / det;
+        let mut inv = Self::identity().m;
+        inv[0][0] = (a[1][1] * a[2][2] - a[1][2] * a[2][1]) * inv_det;
+        inv[0][1] = (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * inv_det;
+        inv[0][2] = (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * inv_det;
+        inv[1][0] = (a[1][2] * a[2][0] - a[1][0] * a[2][2]) * inv_det;
+        inv[1][1] = (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * inv_det;
+        inv[1][2] = (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * inv_det;
+        inv[2][0] = (a[1][0] * a[2][1] - a[1][1] * a[2][0]) * inv_det;
+        inv[2][1] = (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * inv_det;
+        inv[2][2] = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * inv_det;
+        for i in 0..3 {
+            let mut t = 0.0;
+            for j in 0..3 {
+                t += inv[i][j] * a[j][3];
+            }
+            inv[i][3] = -t;
+        }
+        Ok(Self { m: inv })
+    }
+
+    /// Apply to a point.
+    pub fn apply_point(&self, p: Vector3) -> Vector3 {
+        let m = &self.m;
+        Vector3::new(
+            m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3],
+            m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
+            m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3],
+        )
+    }
+}
+
 /// Element kind of a homogeneous, flat [`DataType::List`].
 ///
 /// Nested lists are deliberately unrepresentable (decided 2026-07-10):
@@ -272,6 +382,8 @@ pub enum DataType {
     Interval,
     /// An oriented coordinate frame (origin + orthonormal axes).
     Plane,
+    /// A 4x4 affine transform.
+    Transform,
     /// A homogeneous, flat list of `ListElem` values carried as one
     /// `Data` on the wire (`Vec<T>` payload).
     List(ListElem),
@@ -297,6 +409,7 @@ impl DataType {
             DataType::Bool => "Bool",
             DataType::Interval => "Interval",
             DataType::Plane => "Plane",
+            DataType::Transform => "Transform",
             DataType::List(elem) => match elem {
                 ListElem::Number => "List<Number>",
                 ListElem::String => "List<String>",
@@ -373,6 +486,7 @@ impl DataType {
             DataType::Bool => TypeId::of::<bool>(),
             DataType::Interval => TypeId::of::<Interval>(),
             DataType::Plane => TypeId::of::<Plane>(),
+            DataType::Transform => TypeId::of::<Transform>(),
             DataType::List(elem) => match elem {
                 ListElem::Number => TypeId::of::<Vec<f64>>(),
                 ListElem::String => TypeId::of::<Vec<String>>(),
@@ -398,6 +512,7 @@ impl DataType {
             DataType::Bool => "Bool",
             DataType::Interval => "Interval",
             DataType::Plane => "Plane",
+            DataType::Transform => "Transform",
             DataType::List(_) => "List",
             DataType::BRep => "BRep",
             DataType::Domain(name) => name,
@@ -449,6 +564,9 @@ impl Serialize for Data {
             )),
             DataType::Plane => Err(serde::ser::Error::custom(
                 "Plane data type is not serializable",
+            )),
+            DataType::Transform => Err(serde::ser::Error::custom(
+                "Transform data type is not serializable",
             )),
             DataType::List(_) => Err(serde::ser::Error::custom(
                 "List data types are not serializable",
@@ -533,6 +651,7 @@ impl Data {
             t if t == TypeId::of::<bool>() => DataType::Bool,
             t if t == TypeId::of::<Interval>() => DataType::Interval,
             t if t == TypeId::of::<Plane>() => DataType::Plane,
+            t if t == TypeId::of::<Transform>() => DataType::Transform,
             t if t == TypeId::of::<Vec<f64>>() => DataType::List(ListElem::Number),
             t if t == TypeId::of::<Vec<String>>() => DataType::List(ListElem::String),
             t if t == TypeId::of::<Vec<bool>>() => DataType::List(ListElem::Bool),
@@ -827,5 +946,33 @@ mod tests {
             DataType::List(ListElem::Number),
             DataType::List(ListElem::Vector3)
         );
+    }
+
+    #[test]
+    fn transform_compose_invert_roundtrip() {
+        let source = Plane::xy(Vector3::zero());
+        let target = Plane::new(
+            Vector3::new(5.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+        )
+        .unwrap();
+        let t = Transform::from_frames(&source, &target);
+        let p = t.apply_point(Vector3::new(1.0, 0.0, 0.0));
+        // 90° CCW rotation + translate (5,0,0): (1,0,0) → (5,1,0).
+        assert!((p.x - 5.0).abs() < 1e-12 && (p.y - 1.0).abs() < 1e-12);
+
+        let inv = t.inverse().unwrap();
+        let back = inv.apply_point(p);
+        assert!((back.x - 1.0).abs() < 1e-12 && back.y.abs() < 1e-12);
+
+        let ident = t.then(&inv);
+        let q = ident.apply_point(Vector3::new(3.0, -2.0, 7.0));
+        assert!(
+            (q.x - 3.0).abs() < 1e-12 && (q.y + 2.0).abs() < 1e-12 && (q.z - 7.0).abs() < 1e-12
+        );
+
+        let data = Data::new(t).unwrap();
+        assert_eq!(data.get_type(), DataType::Transform);
     }
 }
