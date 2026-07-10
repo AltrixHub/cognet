@@ -184,6 +184,38 @@ impl NodeGraph {
         ns.input_slot(path, slot).map(|s| s.data_type)
     }
 
+    /// Get the **ordered** edge list connected to an input slot at
+    /// `path`. Path-aware sibling of
+    /// [`NodeGraph::edges_for_input_slot`]; the root variant is a thin
+    /// wrapper over this method. The order is the slot's connection
+    /// order (semantic for variable-length inputs such as polyline
+    /// points), matching [`NodeStates::edges_for_input`].
+    pub fn edges_for_input_slot_at(&self, path: &NodePath, slot: usize) -> Vec<crate::EdgeId> {
+        self.node_states
+            .read()
+            .ok()
+            .and_then(|ns| {
+                let slot_state = ns.input_slot(path, slot)?;
+                Some(ns.edges_for_input(&slot_state.id).to_vec())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get the **ordered** edge list connected from an output slot at
+    /// `path`. Path-aware sibling of
+    /// [`NodeGraph::edges_for_output_slot`]; the root variant is a
+    /// thin wrapper over this method.
+    pub fn edges_for_output_slot_at(&self, path: &NodePath, slot: usize) -> Vec<crate::EdgeId> {
+        self.node_states
+            .read()
+            .ok()
+            .and_then(|ns| {
+                let slot_state = ns.output_slot(path, slot)?;
+                Some(ns.edges_for_output(&slot_state.id).to_vec())
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether an input slot should be rendered as an editable row by
     /// downstream property inspectors. Returns `None` when the slot does
     /// not exist; callers may treat that as visible.
@@ -514,6 +546,67 @@ impl NodeGraph {
                 .input_slot_mut(ppath, slot_index)
                 .expect("validated above")
                 .default_value = Some(value);
+        }
+
+        // Dirty BOTH paths — see plan-010 §3.7.
+        guard.mark_changed(path);
+        if let Some(ppath) = proxy_path {
+            guard.mark_changed(&ppath);
+        }
+        Ok(())
+    }
+
+    /// Clear the default value of input slot `slot_index` at `path`
+    /// (reset it to `None`). Companion to
+    /// [`update_input_slot_default_data_at`](Self::update_input_slot_default_data_at)
+    /// with the same SubGraph-proxy mirror, atomicity, and dirty
+    /// contract. Added for op-log inverse support: the inverse of
+    /// setting a value over an absent prior default must reproduce
+    /// absence.
+    ///
+    /// Clearing an already-absent default is a no-op `Ok` — inverse
+    /// sequences are replayed blindly, so the clear is idempotent. A
+    /// missing slot is still a typed `Err`.
+    pub fn clear_input_slot_default_data_at(
+        &mut self,
+        path: &NodePath,
+        slot_index: usize,
+    ) -> Result<(), String> {
+        // Resolve proxy WITHOUT mutating; None = path is not a SubGraph,
+        // so the mirror is skipped (same shape as the update sibling).
+        let proxy_path = self
+            .subgraph_proxy_ids_at_path(path)
+            .map(|(input_proxy_id, _)| path.child(input_proxy_id));
+
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+
+        // Pre-validate ALL targets before mutating (atomicity invariant).
+        if guard.input_slot(path, slot_index).is_none() {
+            return Err(format!(
+                "clear_input_slot_default_data_at: slot {} not found at path {}",
+                slot_index, path
+            ));
+        }
+        if let Some(ref ppath) = proxy_path {
+            if guard.input_slot(ppath, slot_index).is_none() {
+                return Err(format!(
+                    "clear_input_slot_default_data_at: InputProxy missing slot {} \
+                     for SubGraph at {}",
+                    slot_index, path
+                ));
+            }
+        }
+
+        // Atomic mutate.
+        guard
+            .input_slot_mut(path, slot_index)
+            .expect("validated above")
+            .default_value = None;
+        if let Some(ref ppath) = proxy_path {
+            guard
+                .input_slot_mut(ppath, slot_index)
+                .expect("validated above")
+                .default_value = None;
         }
 
         // Dirty BOTH paths — see plan-010 §3.7.
@@ -1142,6 +1235,125 @@ mod tests {
         assert_eq!((v.x, v.y, v.z), (0.0, 0.0, -4.5));
     }
 
+    // ── clear_input_slot_default_data_at (op-log inverse support) ──
+
+    /// set → clear → the slot's default is `None` again and the path is
+    /// marked changed. This is the plain-node absence-restoring inverse
+    /// the app's op-log needs for `SetInputValue` over an absent prior.
+    #[test]
+    fn clear_input_slot_default_data_at_resets_default_to_none() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let add_id = graph
+            .create_node_by_name_at(&crate::NodePath::root(), "Add")
+            .expect("create Add");
+        let add_path = crate::NodePath::root().child(add_id);
+
+        graph
+            .update_input_slot_default_data_at(
+                &add_path,
+                0,
+                crate::Data::new(4.0_f64).expect("Data::new"),
+            )
+            .expect("seed default");
+        // Drain the change set so the clear's own dirty mark is visible.
+        {
+            let mut ns = graph.node_states.write().expect("write ns");
+            let _ = ns.drain_changed_nodes();
+        }
+
+        graph
+            .clear_input_slot_default_data_at(&add_path, 0)
+            .expect("clear default");
+
+        let ns = graph.node_states.read().expect("read ns");
+        assert!(
+            ns.input_slot(&add_path, 0).unwrap().default_value.is_none(),
+            "default must be None after clear",
+        );
+        assert!(
+            ns.peek_changed_nodes().contains(&add_path),
+            "clear must mark the path changed",
+        );
+    }
+
+    /// Clearing an already-absent default is a no-op `Ok` — the op-log
+    /// replays inverse sequences blindly, so an idempotent clear must
+    /// not error.
+    #[test]
+    fn clear_input_slot_default_data_at_over_absent_is_noop_ok() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let add_id = graph
+            .create_node_by_name_at(&crate::NodePath::root(), "Add")
+            .expect("create Add");
+        let add_path = crate::NodePath::root().child(add_id);
+
+        graph
+            .clear_input_slot_default_data_at(&add_path, 0)
+            .expect("clear over absent default must be Ok");
+
+        let ns = graph.node_states.read().expect("read ns");
+        assert!(
+            ns.input_slot(&add_path, 0).unwrap().default_value.is_none(),
+            "default stays None",
+        );
+    }
+
+    /// Missing slot → typed Err (mirrors the update sibling).
+    #[test]
+    fn clear_input_slot_default_data_at_errs_on_missing_slot() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let add_id = graph
+            .create_node_by_name_at(&crate::NodePath::root(), "Add")
+            .expect("create Add");
+        let add_path = crate::NodePath::root().child(add_id);
+
+        let err = graph
+            .clear_input_slot_default_data_at(&add_path, 99)
+            .expect_err("slot 99 does not exist");
+        assert!(err.contains("slot 99"), "error names the slot: {err}");
+    }
+
+    /// When the path resolves to a SubGraph node, the clear is mirrored
+    /// onto the InputProxy's input slot too (same contract as the
+    /// update sibling, plan-010 §3.7).
+    #[test]
+    fn clear_input_slot_default_data_at_mirrors_to_proxy_when_target_is_subgraph() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_input(&sg_id, "x", crate::DataType::Number)
+            .expect("add input");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        graph
+            .update_input_slot_default_data_at(
+                &sg_path,
+                0,
+                crate::Data::new(13.0_f64).expect("Data::new"),
+            )
+            .expect("seed default");
+
+        graph
+            .clear_input_slot_default_data_at(&sg_path, 0)
+            .expect("clear default");
+
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg_id).expect("proxy ids");
+        let proxy_path = sg_path.child(input_proxy_id);
+        let ns = graph.node_states.read().expect("read");
+        assert!(
+            ns.input_slot(&sg_path, 0).unwrap().default_value.is_none(),
+            "external default cleared",
+        );
+        assert!(
+            ns.input_slot(&proxy_path, 0)
+                .unwrap()
+                .default_value
+                .is_none(),
+            "proxy default cleared too",
+        );
+    }
+
     #[test]
     fn update_node_data_root_wrapper_still_works() {
         use crate::NodeGraphWrite;
@@ -1240,6 +1452,68 @@ mod tests {
         assert_eq!(
             graph.input_slot_data_type_at(&add_path, 0),
             Some(crate::DataType::Number),
+        );
+    }
+
+    #[test]
+    fn edges_for_input_slot_at_depth_2_returns_connect_order() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let add_id = graph
+            .create_node_by_name_at(&sg_path, "AddList")
+            .expect("create AddList");
+        let n1 = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create Number 1");
+        let n2 = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create Number 2");
+        let add_path = sg_path.child(add_id);
+        let e1 = graph
+            .connect_nodes_at(&sg_path.child(n1), 0, &add_path, 0)
+            .expect("connect n1");
+        let e2 = graph
+            .connect_nodes_at(&sg_path.child(n2), 0, &add_path, 0)
+            .expect("connect n2");
+
+        assert_eq!(
+            graph.edges_for_input_slot_at(&add_path, 0),
+            vec![e1, e2],
+            "path-aware input-slot edge list must preserve connect order at depth-2",
+        );
+    }
+
+    #[test]
+    fn edges_for_output_slot_at_depth_2_returns_connect_order() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let num_id = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create Number");
+        let a1 = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create Add 1");
+        let a2 = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create Add 2");
+        let num_path = sg_path.child(num_id);
+        let e1 = graph
+            .connect_nodes_at(&num_path, 0, &sg_path.child(a1), 0)
+            .expect("connect a1");
+        let e2 = graph
+            .connect_nodes_at(&num_path, 0, &sg_path.child(a2), 0)
+            .expect("connect a2");
+
+        assert_eq!(
+            graph.edges_for_output_slot_at(&num_path, 0),
+            vec![e1, e2],
+            "path-aware output-slot edge list must preserve connect order at depth-2",
         );
     }
 

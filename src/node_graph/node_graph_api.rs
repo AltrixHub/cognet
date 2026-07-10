@@ -912,6 +912,33 @@ impl NodeGraph {
             ns.peek_changed_nodes()
         };
 
+        // Net-removal filter: a node removed AND re-created under the
+        // SAME id since the last execute (e.g. one commit that replaces
+        // the whole graph with a document that reuses the live ids) is
+        // not removed — it exists now and its fresh outputs are part of
+        // this plan. Reporting it in `removed_nodes` would hand
+        // consumers an id that is simultaneously in `node_outputs` and
+        // `removed_nodes`; id-keyed stores cannot order an insertion
+        // against a removal for the same key and would evict the
+        // freshly-computed entry. The contract is therefore:
+        // `removed_nodes` only ever names ids with NO live node at plan
+        // time.
+        let removed: Vec<NodeId> = if removed.is_empty() {
+            removed
+        } else {
+            let live: HashSet<NodeId> = {
+                let ns = self
+                    .node_states
+                    .read()
+                    .map_err(|e| GraphExecutionError::PlanningFailed(e.to_string()))?;
+                ns.node_ids().collect()
+            };
+            removed
+                .into_iter()
+                .filter(|id| !live.contains(id))
+                .collect()
+        };
+
         if changed.is_empty() {
             return Ok(ExecutionPlan {
                 dirty_nodes: HashSet::new(),
@@ -1478,6 +1505,58 @@ mod sync_executor_tests {
         let (graph, _, _, add_id) = build_add_graph(7.0, 8.0);
         let result = graph.execute_sync().unwrap();
         assert_eq!(output_for(&result, add_id), 15.0);
+    }
+
+    /// A plain removal (no re-creation) is reported in `removed_nodes`.
+    #[test]
+    fn plain_removal_is_reported_in_removed_nodes() {
+        let (mut graph, a_id, _, _) = build_add_graph(1.0, 2.0);
+        graph.execute_sync().unwrap();
+
+        graph.remove_node(a_id).unwrap();
+        let result = graph.execute_sync().unwrap();
+        assert!(
+            result.removed_nodes.contains(&a_id),
+            "a removed (not re-created) node must be reported in removed_nodes"
+        );
+    }
+
+    /// Net-removal contract: a node removed AND re-created under the SAME
+    /// id between two executes is NOT reported in `removed_nodes` — it
+    /// exists at plan time and its fresh outputs are part of the result.
+    /// Without this filter an id appears in BOTH `node_outputs` and
+    /// `removed_nodes`, and id-keyed consumer stores (which cannot order
+    /// an insertion against a removal for the same key) evict the
+    /// freshly-computed entry. This is exactly the "replace the whole
+    /// graph with a document that reuses the live ids" load path.
+    #[test]
+    fn removed_then_recreated_same_id_is_not_reported_removed() {
+        let (mut graph, a_id, _, add_id) = build_add_graph(1.0, 2.0);
+        graph.execute_sync().unwrap();
+
+        // One edit cycle: remove `a` and re-create the SAME id.
+        graph.remove_node(a_id).unwrap();
+        graph
+            .create_node_by_name_at_with_id(&NodePath::root(), a_id, "Number")
+            .unwrap();
+        graph
+            .update_node_data(&a_id, Data::new(5.0_f64).unwrap())
+            .unwrap();
+        graph.connect_nodes(&a_id, 0, &add_id, 0).unwrap();
+
+        let result = graph.execute_sync().unwrap();
+        assert!(
+            !result.removed_nodes.contains(&a_id),
+            "a removed-then-recreated id must NOT be reported in removed_nodes \
+             (it is live and present in node_outputs)"
+        );
+        assert!(
+            result
+                .node_outputs
+                .contains_key(&NodePath::root().child(a_id)),
+            "the re-created node's fresh outputs must be part of the result"
+        );
+        assert_eq!(output_for(&result, add_id), 7.0);
     }
 
     #[test]
