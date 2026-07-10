@@ -121,6 +121,93 @@ impl Interval {
     }
 }
 
+/// An oriented coordinate frame: origin plus right-handed orthonormal
+/// axes — the positional currency of plane-based construction and
+/// `Orient`-style placement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Plane {
+    pub origin: Vector3,
+    pub x_axis: Vector3,
+    pub y_axis: Vector3,
+    pub z_axis: Vector3,
+}
+
+impl Plane {
+    /// Build a plane from origin + X/Y axes, deriving Z = X × Y.
+    ///
+    /// Validates that both axes are unit length and orthogonal within
+    /// `1e-9` — a skewed frame must never silently shear geometry.
+    pub fn new(origin: Vector3, x_axis: Vector3, y_axis: Vector3) -> Result<Self, String> {
+        const EPS: f64 = 1e-9;
+        let len = |v: &Vector3| (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
+        if (len(&x_axis) - 1.0).abs() > EPS || (len(&y_axis) - 1.0).abs() > EPS {
+            return Err("Plane: axes must be unit length".to_string());
+        }
+        let dot = x_axis.x * y_axis.x + x_axis.y * y_axis.y + x_axis.z * y_axis.z;
+        if dot.abs() > EPS {
+            return Err("Plane: axes must be orthogonal".to_string());
+        }
+        let z_axis = Vector3::new(
+            x_axis.y * y_axis.z - x_axis.z * y_axis.y,
+            x_axis.z * y_axis.x - x_axis.x * y_axis.z,
+            x_axis.x * y_axis.y - x_axis.y * y_axis.x,
+        );
+        Ok(Self {
+            origin,
+            x_axis,
+            y_axis,
+            z_axis,
+        })
+    }
+
+    /// World XY plane at `origin`.
+    pub fn xy(origin: Vector3) -> Self {
+        Self {
+            origin,
+            x_axis: Vector3::new(1.0, 0.0, 0.0),
+            y_axis: Vector3::new(0.0, 1.0, 0.0),
+            z_axis: Vector3::new(0.0, 0.0, 1.0),
+        }
+    }
+
+    /// Plane from origin + normal (Z axis). X/Y are derived with a
+    /// stable convention: X = normalize(world-up × Z) unless Z is
+    /// nearly vertical, in which case world-X seeds the frame.
+    ///
+    /// Errors on a zero-length normal.
+    pub fn from_normal(origin: Vector3, normal: Vector3) -> Result<Self, String> {
+        let len = (normal.x * normal.x + normal.y * normal.y + normal.z * normal.z).sqrt();
+        if len < 1e-12 {
+            return Err("Plane: normal must have non-zero length".to_string());
+        }
+        let z = Vector3::new(normal.x / len, normal.y / len, normal.z / len);
+        let seed = if z.z.abs() > 0.999 {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else {
+            Vector3::new(0.0, 0.0, 1.0)
+        };
+        // X = normalize(seed × Z), Y = Z × X.
+        let x = Vector3::new(
+            seed.y * z.z - seed.z * z.y,
+            seed.z * z.x - seed.x * z.z,
+            seed.x * z.y - seed.y * z.x,
+        );
+        let xl = (x.x * x.x + x.y * x.y + x.z * x.z).sqrt();
+        let x = Vector3::new(x.x / xl, x.y / xl, x.z / xl);
+        let y = Vector3::new(
+            z.y * x.z - z.z * x.y,
+            z.z * x.x - z.x * x.z,
+            z.x * x.y - z.y * x.x,
+        );
+        Ok(Self {
+            origin,
+            x_axis: x,
+            y_axis: y,
+            z_axis: z,
+        })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum DataType {
     #[default]
@@ -139,6 +226,8 @@ pub enum DataType {
     Bool,
     /// A one-dimensional numeric interval (`t0 ..= t1`).
     Interval,
+    /// An oriented coordinate frame (origin + orthonormal axes).
+    Plane,
     /// BRep solid geometry.
     /// Stores arbitrary BRep data as `Arc<dyn Any>` via `Data::from_brep()`.
     BRep,
@@ -160,6 +249,7 @@ impl DataType {
             DataType::Vertices => "Vertices",
             DataType::Bool => "Bool",
             DataType::Interval => "Interval",
+            DataType::Plane => "Plane",
             DataType::BRep => "BRep",
             DataType::Domain(name) => name,
         }
@@ -172,6 +262,7 @@ impl DataType {
             DataType::String,
             DataType::Bool,
             DataType::Interval,
+            DataType::Plane,
             DataType::Vector3,
             DataType::Color,
             DataType::Mesh,
@@ -225,6 +316,7 @@ impl DataType {
             DataType::Vertices => TypeId::of::<Vertices>(),
             DataType::Bool => TypeId::of::<bool>(),
             DataType::Interval => TypeId::of::<Interval>(),
+            DataType::Plane => TypeId::of::<Plane>(),
             DataType::BRep => TypeId::of::<()>(),
             DataType::Domain(_) => TypeId::of::<()>(),
         }
@@ -240,6 +332,7 @@ impl DataType {
             DataType::Vertices => "Vertices",
             DataType::Bool => "Bool",
             DataType::Interval => "Interval",
+            DataType::Plane => "Plane",
             DataType::BRep => "BRep",
             DataType::Domain(name) => name,
         }
@@ -287,6 +380,9 @@ impl Serialize for Data {
             )),
             DataType::Interval => Err(serde::ser::Error::custom(
                 "Interval data type is not serializable",
+            )),
+            DataType::Plane => Err(serde::ser::Error::custom(
+                "Plane data type is not serializable",
             )),
             DataType::Bool => {
                 let value = self
@@ -367,6 +463,7 @@ impl Data {
             t if t == TypeId::of::<Vertices>() => DataType::Vertices,
             t if t == TypeId::of::<bool>() => DataType::Bool,
             t if t == TypeId::of::<Interval>() => DataType::Interval,
+            t if t == TypeId::of::<Plane>() => DataType::Plane,
             _ => return Err(format!("Invalid DataType: {}", type_name::<T>())),
         };
 
@@ -419,6 +516,7 @@ impl Data {
             t if t == TypeId::of::<Vertices>() => DataType::Vertices,
             t if t == TypeId::of::<bool>() => DataType::Bool,
             t if t == TypeId::of::<Interval>() => DataType::Interval,
+            t if t == TypeId::of::<Plane>() => DataType::Plane,
             _ => return Err("Unsupported data type".to_string()),
         };
 
@@ -588,5 +686,44 @@ mod tests {
             .unwrap();
         let interval = data.value::<Interval>().unwrap();
         assert!((interval.t0 - 1.0).abs() < 1e-12 && (interval.t1 - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn plane_data_roundtrip_and_validation() {
+        let plane = Plane::new(
+            Vector3::new(1.0, 2.0, 3.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        )
+        .unwrap();
+        assert!((plane.z_axis.z - 1.0).abs() < 1e-12);
+        let data = Data::new(plane).unwrap();
+        assert_eq!(data.get_type(), DataType::Plane);
+        assert!(data.value::<Plane>().is_ok());
+
+        // Non-unit / non-orthogonal axes are rejected.
+        assert!(Plane::new(
+            Vector3::zero(),
+            Vector3::new(2.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        )
+        .is_err());
+        assert!(Plane::new(
+            Vector3::zero(),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn plane_from_normal_builds_an_orthonormal_frame() {
+        let plane = Plane::from_normal(Vector3::zero(), Vector3::new(0.0, 0.0, 2.0)).unwrap();
+        let dot_xy = plane.x_axis.x * plane.y_axis.x
+            + plane.x_axis.y * plane.y_axis.y
+            + plane.x_axis.z * plane.y_axis.z;
+        assert!(dot_xy.abs() < 1e-9);
+        assert!((plane.z_axis.z - 1.0).abs() < 1e-9);
+        assert!(Plane::from_normal(Vector3::zero(), Vector3::zero()).is_err());
     }
 }
