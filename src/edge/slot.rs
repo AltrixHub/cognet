@@ -239,23 +239,23 @@ impl Transform {
             _ => v.z,
         };
         let mut m = Self::identity().m;
-        for i in 0..3 {
-            for j in 0..3 {
+        for (i, row) in m.iter_mut().take(3).enumerate() {
+            for (j, cell) in row.iter_mut().take(3).enumerate() {
                 let mut r = 0.0;
                 for k in 0..3 {
                     r += axis(t[k], i) * axis(s[k], j);
                 }
-                m[i][j] = r;
+                *cell = r;
             }
         }
         let o_s = [source.origin.x, source.origin.y, source.origin.z];
         let o_t = [target.origin.x, target.origin.y, target.origin.z];
-        for i in 0..3 {
+        for (row, ot) in m.iter_mut().zip(o_t) {
             let mut r_os = 0.0;
             for (j, os) in o_s.iter().enumerate() {
-                r_os += m[i][j] * os;
+                r_os += row[j] * os;
             }
-            m[i][3] = o_t[i] - r_os;
+            row[3] = ot - r_os;
         }
         Self { m }
     }
@@ -297,12 +297,12 @@ impl Transform {
         inv[2][0] = (a[1][0] * a[2][1] - a[1][1] * a[2][0]) * inv_det;
         inv[2][1] = (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * inv_det;
         inv[2][2] = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * inv_det;
-        for i in 0..3 {
+        for row in inv.iter_mut().take(3) {
             let mut t = 0.0;
-            for j in 0..3 {
-                t += inv[i][j] * a[j][3];
+            for (j, a_row) in a.iter().take(3).enumerate() {
+                t += row[j] * a_row[3];
             }
-            inv[i][3] = -t;
+            row[3] = -t;
         }
         Ok(Self { m: inv })
     }
