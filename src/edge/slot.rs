@@ -75,6 +75,52 @@ impl Vertices {
     }
 }
 
+/// A one-dimensional numeric interval `t0 ..= t1` — the first-class
+/// "Domain" of parametric workflows (curve parameters, remapping).
+/// `t0 > t1` (decreasing) is allowed; consumers that need an ordered
+/// span use [`Interval::min`] / [`Interval::max`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Interval {
+    pub t0: f64,
+    pub t1: f64,
+}
+
+impl Interval {
+    pub fn new(t0: f64, t1: f64) -> Self {
+        Self { t0, t1 }
+    }
+
+    /// Signed length (`t1 - t0`).
+    pub fn length(&self) -> f64 {
+        self.t1 - self.t0
+    }
+
+    pub fn min(&self) -> f64 {
+        self.t0.min(self.t1)
+    }
+
+    pub fn max(&self) -> f64 {
+        self.t0.max(self.t1)
+    }
+
+    /// Whether `t` lies within the interval (inclusive, order-agnostic).
+    pub fn contains(&self, t: f64) -> bool {
+        t >= self.min() && t <= self.max()
+    }
+
+    /// Map `t` from this interval into `target`, preserving the
+    /// normalized position. A zero-length source maps everything to
+    /// `target.t0`.
+    pub fn remap(&self, t: f64, target: &Interval) -> f64 {
+        let len = self.length();
+        if len.abs() < f64::EPSILON {
+            return target.t0;
+        }
+        let normalized = (t - self.t0) / len;
+        target.t0 + normalized * target.length()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum DataType {
     #[default]
@@ -91,6 +137,8 @@ pub enum DataType {
     Vertices,
     /// A boolean value.
     Bool,
+    /// A one-dimensional numeric interval (`t0 ..= t1`).
+    Interval,
     /// BRep solid geometry.
     /// Stores arbitrary BRep data as `Arc<dyn Any>` via `Data::from_brep()`.
     BRep,
@@ -111,6 +159,7 @@ impl DataType {
             DataType::Color => "Color",
             DataType::Vertices => "Vertices",
             DataType::Bool => "Bool",
+            DataType::Interval => "Interval",
             DataType::BRep => "BRep",
             DataType::Domain(name) => name,
         }
@@ -122,6 +171,7 @@ impl DataType {
             DataType::Number,
             DataType::String,
             DataType::Bool,
+            DataType::Interval,
             DataType::Vector3,
             DataType::Color,
             DataType::Mesh,
@@ -135,6 +185,7 @@ impl DataType {
         match self {
             DataType::Vector3 => &["x", "y", "z"],
             DataType::Color => &["r", "g", "b", "a"],
+            DataType::Interval => &["t0", "t1"],
             _ => &[],
         }
     }
@@ -156,6 +207,9 @@ impl DataType {
                 read_field("a"),
             ))
             .ok(),
+            DataType::Interval => {
+                Data::new(Interval::new(read_field("t0"), read_field("t1"))).ok()
+            }
             _ => None,
         }
     }
@@ -170,6 +224,7 @@ impl DataType {
             DataType::Color => TypeId::of::<ColorValue>(),
             DataType::Vertices => TypeId::of::<Vertices>(),
             DataType::Bool => TypeId::of::<bool>(),
+            DataType::Interval => TypeId::of::<Interval>(),
             DataType::BRep => TypeId::of::<()>(),
             DataType::Domain(_) => TypeId::of::<()>(),
         }
@@ -184,6 +239,7 @@ impl DataType {
             DataType::Color => "Color",
             DataType::Vertices => "Vertices",
             DataType::Bool => "Bool",
+            DataType::Interval => "Interval",
             DataType::BRep => "BRep",
             DataType::Domain(name) => name,
         }
@@ -228,6 +284,9 @@ impl Serialize for Data {
             )),
             DataType::Vertices => Err(serde::ser::Error::custom(
                 "Vertices data type is not serializable",
+            )),
+            DataType::Interval => Err(serde::ser::Error::custom(
+                "Interval data type is not serializable",
             )),
             DataType::Bool => {
                 let value = self
@@ -307,6 +366,7 @@ impl Data {
             t if t == TypeId::of::<ColorValue>() => DataType::Color,
             t if t == TypeId::of::<Vertices>() => DataType::Vertices,
             t if t == TypeId::of::<bool>() => DataType::Bool,
+            t if t == TypeId::of::<Interval>() => DataType::Interval,
             _ => return Err(format!("Invalid DataType: {}", type_name::<T>())),
         };
 
@@ -358,6 +418,7 @@ impl Data {
             t if t == TypeId::of::<ColorValue>() => DataType::Color,
             t if t == TypeId::of::<Vertices>() => DataType::Vertices,
             t if t == TypeId::of::<bool>() => DataType::Bool,
+            t if t == TypeId::of::<Interval>() => DataType::Interval,
             _ => return Err("Unsupported data type".to_string()),
         };
 
@@ -489,5 +550,43 @@ mod tests {
         // Lying about the type fails.
         let err = Data::from_any_typed(raw, DataType::String).expect_err("type mismatch");
         assert!(err.contains("does not match declared"), "got: {err}");
+    }
+
+    #[test]
+    fn interval_data_roundtrip_and_type_inference() {
+        let data = Data::new(Interval::new(2.0, 6.0)).unwrap();
+        assert_eq!(data.get_type(), DataType::Interval);
+        let interval = data.value::<Interval>().unwrap();
+        assert!((interval.length() - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn interval_remap_preserves_normalized_position() {
+        let source = Interval::new(0.0, 10.0);
+        let target = Interval::new(100.0, 200.0);
+        assert!((source.remap(2.5, &target) - 125.0).abs() < 1e-12);
+        // Decreasing target flips direction.
+        let flipped = Interval::new(1.0, 0.0);
+        assert!((source.remap(2.5, &flipped) - 0.75).abs() < 1e-12);
+        // Zero-length source collapses to target start.
+        let zero = Interval::new(3.0, 3.0);
+        assert!((zero.remap(3.0, &target) - 100.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn interval_contains_is_order_agnostic() {
+        assert!(Interval::new(5.0, 1.0).contains(2.0));
+        assert!(!Interval::new(5.0, 1.0).contains(6.0));
+    }
+
+    #[test]
+    fn interval_assembles_from_fields() {
+        let dt = DataType::Interval;
+        assert_eq!(dt.field_names(), &["t0", "t1"]);
+        let data = dt
+            .assemble(|f| if f == "t0" { 1.0 } else { 4.0 })
+            .unwrap();
+        let interval = data.value::<Interval>().unwrap();
+        assert!((interval.t0 - 1.0).abs() < 1e-12 && (interval.t1 - 4.0).abs() < 1e-12);
     }
 }
