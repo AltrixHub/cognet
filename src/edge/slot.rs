@@ -208,6 +208,50 @@ impl Plane {
     }
 }
 
+/// Element kind of a homogeneous, flat [`DataType::List`].
+///
+/// Nested lists are deliberately unrepresentable (decided 2026-07-10):
+/// the engine stays "one execution per node, one value per wire" —
+/// iteration lives inside nodes, and there are no GH-style data trees.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ListElem {
+    Number,
+    String,
+    Bool,
+    Vector3,
+    Color,
+    Interval,
+    Plane,
+}
+
+/// Types that can be list elements (maps a Rust payload type to its
+/// [`ListElem`] tag for `Data::from_list`).
+pub trait ListElement: std::any::Any + Send + Sync {
+    const ELEM: ListElem;
+}
+
+impl ListElement for f64 {
+    const ELEM: ListElem = ListElem::Number;
+}
+impl ListElement for String {
+    const ELEM: ListElem = ListElem::String;
+}
+impl ListElement for bool {
+    const ELEM: ListElem = ListElem::Bool;
+}
+impl ListElement for Vector3 {
+    const ELEM: ListElem = ListElem::Vector3;
+}
+impl ListElement for ColorValue {
+    const ELEM: ListElem = ListElem::Color;
+}
+impl ListElement for Interval {
+    const ELEM: ListElem = ListElem::Interval;
+}
+impl ListElement for Plane {
+    const ELEM: ListElem = ListElem::Plane;
+}
+
 #[derive(Debug, PartialEq, Eq, Default, Clone, Copy)]
 pub enum DataType {
     #[default]
@@ -228,6 +272,9 @@ pub enum DataType {
     Interval,
     /// An oriented coordinate frame (origin + orthonormal axes).
     Plane,
+    /// A homogeneous, flat list of `ListElem` values carried as one
+    /// `Data` on the wire (`Vec<T>` payload).
+    List(ListElem),
     /// BRep solid geometry.
     /// Stores arbitrary BRep data as `Arc<dyn Any>` via `Data::from_brep()`.
     BRep,
@@ -250,6 +297,15 @@ impl DataType {
             DataType::Bool => "Bool",
             DataType::Interval => "Interval",
             DataType::Plane => "Plane",
+            DataType::List(elem) => match elem {
+                ListElem::Number => "List<Number>",
+                ListElem::String => "List<String>",
+                ListElem::Bool => "List<Bool>",
+                ListElem::Vector3 => "List<Vector3>",
+                ListElem::Color => "List<Color>",
+                ListElem::Interval => "List<Interval>",
+                ListElem::Plane => "List<Plane>",
+            },
             DataType::BRep => "BRep",
             DataType::Domain(name) => name,
         }
@@ -263,6 +319,8 @@ impl DataType {
             DataType::Bool,
             DataType::Interval,
             DataType::Plane,
+            DataType::List(ListElem::Number),
+            DataType::List(ListElem::Vector3),
             DataType::Vector3,
             DataType::Color,
             DataType::Mesh,
@@ -298,9 +356,7 @@ impl DataType {
                 read_field("a"),
             ))
             .ok(),
-            DataType::Interval => {
-                Data::new(Interval::new(read_field("t0"), read_field("t1"))).ok()
-            }
+            DataType::Interval => Data::new(Interval::new(read_field("t0"), read_field("t1"))).ok(),
             _ => None,
         }
     }
@@ -317,6 +373,15 @@ impl DataType {
             DataType::Bool => TypeId::of::<bool>(),
             DataType::Interval => TypeId::of::<Interval>(),
             DataType::Plane => TypeId::of::<Plane>(),
+            DataType::List(elem) => match elem {
+                ListElem::Number => TypeId::of::<Vec<f64>>(),
+                ListElem::String => TypeId::of::<Vec<String>>(),
+                ListElem::Bool => TypeId::of::<Vec<bool>>(),
+                ListElem::Vector3 => TypeId::of::<Vec<Vector3>>(),
+                ListElem::Color => TypeId::of::<Vec<ColorValue>>(),
+                ListElem::Interval => TypeId::of::<Vec<Interval>>(),
+                ListElem::Plane => TypeId::of::<Vec<Plane>>(),
+            },
             DataType::BRep => TypeId::of::<()>(),
             DataType::Domain(_) => TypeId::of::<()>(),
         }
@@ -333,6 +398,7 @@ impl DataType {
             DataType::Bool => "Bool",
             DataType::Interval => "Interval",
             DataType::Plane => "Plane",
+            DataType::List(_) => "List",
             DataType::BRep => "BRep",
             DataType::Domain(name) => name,
         }
@@ -383,6 +449,9 @@ impl Serialize for Data {
             )),
             DataType::Plane => Err(serde::ser::Error::custom(
                 "Plane data type is not serializable",
+            )),
+            DataType::List(_) => Err(serde::ser::Error::custom(
+                "List data types are not serializable",
             )),
             DataType::Bool => {
                 let value = self
@@ -464,6 +533,13 @@ impl Data {
             t if t == TypeId::of::<bool>() => DataType::Bool,
             t if t == TypeId::of::<Interval>() => DataType::Interval,
             t if t == TypeId::of::<Plane>() => DataType::Plane,
+            t if t == TypeId::of::<Vec<f64>>() => DataType::List(ListElem::Number),
+            t if t == TypeId::of::<Vec<String>>() => DataType::List(ListElem::String),
+            t if t == TypeId::of::<Vec<bool>>() => DataType::List(ListElem::Bool),
+            t if t == TypeId::of::<Vec<Vector3>>() => DataType::List(ListElem::Vector3),
+            t if t == TypeId::of::<Vec<ColorValue>>() => DataType::List(ListElem::Color),
+            t if t == TypeId::of::<Vec<Interval>>() => DataType::List(ListElem::Interval),
+            t if t == TypeId::of::<Vec<Plane>>() => DataType::List(ListElem::Plane),
             _ => return Err(format!("Invalid DataType: {}", type_name::<T>())),
         };
 
@@ -506,6 +582,14 @@ impl Data {
         }
     }
 
+    /// Create a homogeneous list value (`DataType::List(T::ELEM)`).
+    pub fn from_list<T: ListElement>(values: Vec<T>) -> Self {
+        Data {
+            value: Arc::new(values),
+            data_type: DataType::List(T::ELEM),
+        }
+    }
+
     pub fn from_any(value: Arc<dyn Any + Send + Sync>) -> Result<Self, String> {
         let type_id = (*value).type_id();
         let data_type = match type_id {
@@ -517,6 +601,8 @@ impl Data {
             t if t == TypeId::of::<bool>() => DataType::Bool,
             t if t == TypeId::of::<Interval>() => DataType::Interval,
             t if t == TypeId::of::<Plane>() => DataType::Plane,
+            t if t == TypeId::of::<Vec<f64>>() => DataType::List(ListElem::Number),
+            t if t == TypeId::of::<Vec<Vector3>>() => DataType::List(ListElem::Vector3),
             _ => return Err("Unsupported data type".to_string()),
         };
 
@@ -681,9 +767,7 @@ mod tests {
     fn interval_assembles_from_fields() {
         let dt = DataType::Interval;
         assert_eq!(dt.field_names(), &["t0", "t1"]);
-        let data = dt
-            .assemble(|f| if f == "t0" { 1.0 } else { 4.0 })
-            .unwrap();
+        let data = dt.assemble(|f| if f == "t0" { 1.0 } else { 4.0 }).unwrap();
         let interval = data.value::<Interval>().unwrap();
         assert!((interval.t0 - 1.0).abs() < 1e-12 && (interval.t1 - 4.0).abs() < 1e-12);
     }
@@ -725,5 +809,23 @@ mod tests {
         assert!(dot_xy.abs() < 1e-9);
         assert!((plane.z_axis.z - 1.0).abs() < 1e-9);
         assert!(Plane::from_normal(Vector3::zero(), Vector3::zero()).is_err());
+    }
+
+    #[test]
+    fn list_data_is_typed_by_element() {
+        let numbers = Data::from_list(vec![1.0, 2.0, 3.0]);
+        assert_eq!(numbers.get_type(), DataType::List(ListElem::Number));
+        assert_eq!(numbers.value::<Vec<f64>>().unwrap().len(), 3);
+        // Element-typed read is enforced.
+        assert!(numbers.value::<Vec<bool>>().is_err());
+
+        let points = Data::new(vec![Vector3::zero()]).unwrap();
+        assert_eq!(points.get_type(), DataType::List(ListElem::Vector3));
+
+        // Different element kinds are different wire types.
+        assert_ne!(
+            DataType::List(ListElem::Number),
+            DataType::List(ListElem::Vector3)
+        );
     }
 }
