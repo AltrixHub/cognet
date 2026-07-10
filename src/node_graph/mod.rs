@@ -301,28 +301,18 @@ impl NodeGraph {
         ns.get_edge(edge_id).cloned()
     }
 
-    /// Get edges connected to an input slot by (node_id, slot_index).
+    /// Get edges connected to an input slot by (node_id, slot_index)
+    /// (ordered). Thin wrapper over
+    /// [`edges_for_input_slot_at`](Self::edges_for_input_slot_at).
     pub fn edges_for_input_slot(&self, node_id: &NodeId, slot: usize) -> Vec<EdgeId> {
-        self.node_states
-            .read()
-            .ok()
-            .and_then(|ns| {
-                let slot_state = ns.input_slot(&NodePath::root().child(*node_id), slot)?;
-                Some(ns.edges_for_input(&slot_state.id).to_vec())
-            })
-            .unwrap_or_default()
+        self.edges_for_input_slot_at(&NodePath::root().child(*node_id), slot)
     }
 
-    /// Get edges connected from a specific output slot (ordered).
+    /// Get edges connected from a specific output slot (ordered). Thin
+    /// wrapper over
+    /// [`edges_for_output_slot_at`](Self::edges_for_output_slot_at).
     pub fn edges_for_output_slot(&self, node_id: &NodeId, slot: usize) -> Vec<EdgeId> {
-        self.node_states
-            .read()
-            .ok()
-            .and_then(|ns| {
-                let slot_state = ns.output_slot(&NodePath::root().child(*node_id), slot)?;
-                Some(ns.edges_for_output(&slot_state.id).to_vec())
-            })
-            .unwrap_or_default()
+        self.edges_for_output_slot_at(&NodePath::root().child(*node_id), slot)
     }
 
     /// Look up the owning `(NodePath, slot_index)` for an `InputSlotId`.

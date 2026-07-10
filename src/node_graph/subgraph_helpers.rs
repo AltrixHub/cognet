@@ -153,6 +153,37 @@ impl NodeGraph {
         Ok(())
     }
 
+    /// Insert an input port on a SubGraphNode at `index`, shifting
+    /// higher-indexed ports up. Index-parameterized sibling of
+    /// [`Self::add_subgraph_input`] (`index == count` appends); used to
+    /// restore a removed port at its original position (op-log undo).
+    /// Returns `Err` when `index` exceeds the current port count.
+    pub fn insert_subgraph_input_at(
+        &self,
+        node_id: &NodeId,
+        index: usize,
+        label: &'static str,
+        data_type: DataType,
+    ) -> Result<(), String> {
+        let (input_proxy_id, _) = self
+            .subgraph_proxy_ids(node_id)
+            .ok_or_else(|| format!("Node {:?} is not a SubGraphNode", node_id))?;
+        let sg_path = NodePath::root().child(*node_id);
+        let in_path = sg_path.child(input_proxy_id);
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+        let count = ns.input_slot_count(&in_path);
+        if index > count {
+            return Err(format!(
+                "insert_subgraph_input_at: index {index} out of range (count {count})"
+            ));
+        }
+        ns.insert_input_slot_at(&in_path, index, label, data_type, Some(1), true);
+        ns.insert_output_slot_at(&in_path, index, label, data_type);
+        // Sync external slot on parent SubGraphNode.
+        ns.insert_input_slot_at(&sg_path, index, label, data_type, None, true);
+        Ok(())
+    }
+
     /// Remove an input port from a SubGraphNode by index.
     pub fn remove_subgraph_input(&self, node_id: &NodeId, index: usize) -> Result<(), String> {
         let (input_proxy_id, _) = self
@@ -223,6 +254,36 @@ impl NodeGraph {
         ns.add_output_slot(&out_path, label, data_type);
         // Sync external slot on parent SubGraphNode.
         ns.add_output_slot(&NodePath::root().child(*node_id), label, data_type);
+        Ok(())
+    }
+
+    /// Insert an output port on a SubGraphNode at `index`, shifting
+    /// higher-indexed ports up. Index-parameterized sibling of
+    /// [`Self::add_subgraph_output`]; see
+    /// [`Self::insert_subgraph_input_at`] for the range contract.
+    pub fn insert_subgraph_output_at(
+        &self,
+        node_id: &NodeId,
+        index: usize,
+        label: &'static str,
+        data_type: DataType,
+    ) -> Result<(), String> {
+        let (_, output_proxy_id) = self
+            .subgraph_proxy_ids(node_id)
+            .ok_or_else(|| format!("Node {:?} is not a SubGraphNode", node_id))?;
+        let sg_path = NodePath::root().child(*node_id);
+        let out_path = sg_path.child(output_proxy_id);
+        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+        let count = ns.input_slot_count(&out_path);
+        if index > count {
+            return Err(format!(
+                "insert_subgraph_output_at: index {index} out of range (count {count})"
+            ));
+        }
+        ns.insert_input_slot_at(&out_path, index, label, data_type, None, true);
+        ns.insert_output_slot_at(&out_path, index, label, data_type);
+        // Sync external slot on parent SubGraphNode.
+        ns.insert_output_slot_at(&sg_path, index, label, data_type);
         Ok(())
     }
 
@@ -300,6 +361,44 @@ impl NodeGraph {
         data_type: DataType,
     ) -> Result<(), String> {
         self.add_subgraph_output(node_id, label, data_type)?;
+        let (_, output_proxy_id) = self
+            .subgraph_proxy_ids(node_id)
+            .ok_or("Node is not a SubGraphNode")?;
+        let sg_path = NodePath::root().child(*node_id);
+        let out_path = sg_path.child(output_proxy_id);
+        append_locked_label_at(self, &out_path, label)?;
+        Ok(())
+    }
+
+    /// Insert a **locked** input port on a SubGraphNode at `index`.
+    /// Locked sibling of [`Self::insert_subgraph_input_at`].
+    pub fn insert_subgraph_input_locked_at(
+        &self,
+        node_id: &NodeId,
+        index: usize,
+        label: &'static str,
+        data_type: DataType,
+    ) -> Result<(), String> {
+        self.insert_subgraph_input_at(node_id, index, label, data_type)?;
+        let (input_proxy_id, _) = self
+            .subgraph_proxy_ids(node_id)
+            .ok_or("Node is not a SubGraphNode")?;
+        let sg_path = NodePath::root().child(*node_id);
+        let in_path = sg_path.child(input_proxy_id);
+        append_locked_label_at(self, &in_path, label)?;
+        Ok(())
+    }
+
+    /// Insert a **locked** output port on a SubGraphNode at `index`.
+    /// Locked sibling of [`Self::insert_subgraph_output_at`].
+    pub fn insert_subgraph_output_locked_at(
+        &self,
+        node_id: &NodeId,
+        index: usize,
+        label: &'static str,
+        data_type: DataType,
+    ) -> Result<(), String> {
+        self.insert_subgraph_output_at(node_id, index, label, data_type)?;
         let (_, output_proxy_id) = self
             .subgraph_proxy_ids(node_id)
             .ok_or("Node is not a SubGraphNode")?;
@@ -881,6 +980,213 @@ mod tests {
         assert!(
             dirty.contains(&proxy_path),
             "proxy_path must be dirty (internals re-execute trigger)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // insert_subgraph_input_at / insert_subgraph_output_at
+    // (index-parameterized port revival for op-log undo)
+    // -----------------------------------------------------------------
+
+    /// Ordered input-slot labels of the node at `path`.
+    fn input_labels_at(graph: &crate::NodeGraph, path: &crate::NodePath) -> Vec<&'static str> {
+        let ns = graph.node_states().read().expect("read");
+        let count = ns.input_slot_count(path);
+        (0..count)
+            .map(|i| ns.input_slot(path, i).expect("slot").label)
+            .collect()
+    }
+
+    /// Ordered output-slot labels of the node at `path`.
+    fn output_labels_at(graph: &crate::NodeGraph, path: &crate::NodePath) -> Vec<&'static str> {
+        let ns = graph.node_states().read().expect("read");
+        let count = ns.output_slot_count(path);
+        (0..count)
+            .map(|i| ns.output_slot(path, i).expect("slot").label)
+            .collect()
+    }
+
+    /// Removing the MIDDLE input port and re-inserting it at its old
+    /// index must restore the original ordered label list on the parent
+    /// SubGraphNode AND on both proxy slot lists.
+    #[test]
+    fn insert_subgraph_input_at_restores_middle_position() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        for label in ["a", "b", "c"] {
+            graph
+                .add_subgraph_input(&sg, label, DataType::Number)
+                .expect("add input");
+        }
+
+        graph.remove_subgraph_input(&sg, 1).expect("remove middle");
+        graph
+            .insert_subgraph_input_at(&sg, 1, "b", DataType::Number)
+            .expect("insert at 1");
+
+        let sg_path = crate::NodePath::root().child(sg);
+        let (input_proxy_id, _) = graph.subgraph_proxy_ids(&sg).expect("proxy ids");
+        let in_path = sg_path.child(input_proxy_id);
+        assert_eq!(input_labels_at(&graph, &sg_path), vec!["a", "b", "c"]);
+        assert_eq!(input_labels_at(&graph, &in_path), vec!["a", "b", "c"]);
+        assert_eq!(output_labels_at(&graph, &in_path), vec!["a", "b", "c"]);
+    }
+
+    /// Inserting below an occupied slot must shift the edges wired to
+    /// higher slots up so they keep pointing at the same logical port.
+    #[test]
+    fn insert_subgraph_input_at_shifts_higher_slot_edges_up() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        for label in ["a", "b"] {
+            graph
+                .add_subgraph_input(&sg, label, DataType::Number)
+                .expect("add input");
+        }
+        let feeder = graph
+            .create_node::<crate::NumberNode>()
+            .expect("create feeder");
+        let edge = graph.connect_nodes(&feeder, 0, &sg, 1).expect("wire b");
+
+        // Remove "a" (index 0): b's edge index decrements to 0.
+        graph.remove_subgraph_input(&sg, 0).expect("remove a");
+        // Re-insert "a" at 0: b's edge index must shift back to 1.
+        graph
+            .insert_subgraph_input_at(&sg, 0, "a", DataType::Number)
+            .expect("insert at 0");
+
+        let ns = graph.node_states().read().expect("read");
+        let e = ns.get_edge(&edge).expect("edge survives");
+        assert_eq!(
+            e.to_input_slot_index, 1,
+            "edge into 'b' must follow its slot back up to index 1"
+        );
+    }
+
+    /// Out-of-range index is rejected with Err; index == count appends.
+    #[test]
+    fn insert_subgraph_input_at_validates_index() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        graph
+            .add_subgraph_input(&sg, "a", DataType::Number)
+            .expect("add input");
+
+        let err = graph
+            .insert_subgraph_input_at(&sg, 2, "x", DataType::Number)
+            .expect_err("index 2 > count 1 must Err");
+        assert!(err.contains("out of range"), "unexpected error: {err}");
+
+        graph
+            .insert_subgraph_input_at(&sg, 1, "b", DataType::Number)
+            .expect("index == count appends");
+        let sg_path = crate::NodePath::root().child(sg);
+        assert_eq!(input_labels_at(&graph, &sg_path), vec!["a", "b"]);
+    }
+
+    /// Output-side mirror of the middle-position restore.
+    #[test]
+    fn insert_subgraph_output_at_restores_middle_position() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        for label in ["a", "b", "c"] {
+            graph
+                .add_subgraph_output(&sg, label, DataType::Number)
+                .expect("add output");
+        }
+
+        graph.remove_subgraph_output(&sg, 1).expect("remove middle");
+        graph
+            .insert_subgraph_output_at(&sg, 1, "b", DataType::Number)
+            .expect("insert at 1");
+
+        let sg_path = crate::NodePath::root().child(sg);
+        let (_, output_proxy_id) = graph.subgraph_proxy_ids(&sg).expect("proxy ids");
+        let out_path = sg_path.child(output_proxy_id);
+        assert_eq!(output_labels_at(&graph, &sg_path), vec!["a", "b", "c"]);
+        assert_eq!(input_labels_at(&graph, &out_path), vec!["a", "b", "c"]);
+        assert_eq!(output_labels_at(&graph, &out_path), vec!["a", "b", "c"]);
+    }
+
+    /// Output-side edge shift mirror: an external edge from the
+    /// SubGraph's higher output slot follows its slot up on insert.
+    #[test]
+    fn insert_subgraph_output_at_shifts_higher_slot_edges_up() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        for label in ["a", "b"] {
+            graph
+                .add_subgraph_output(&sg, label, DataType::Number)
+                .expect("add output");
+        }
+        let sink = graph.create_node::<crate::AddNode>().expect("create sink");
+        let edge = graph.connect_nodes(&sg, 1, &sink, 0).expect("wire b out");
+
+        graph.remove_subgraph_output(&sg, 0).expect("remove a");
+        graph
+            .insert_subgraph_output_at(&sg, 0, "a", DataType::Number)
+            .expect("insert at 0");
+
+        let ns = graph.node_states().read().expect("read");
+        let e = ns.get_edge(&edge).expect("edge survives");
+        assert_eq!(
+            e.from_output_slot_index, 1,
+            "edge from 'b' must follow its slot back up to index 1"
+        );
+    }
+
+    /// Locked insert variants stamp `InterfaceNodeData.locked` exactly
+    /// like the append-style `add_subgraph_*_locked`.
+    #[test]
+    fn insert_subgraph_port_locked_at_stamps_lock() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Test")
+            .expect("create subgraph");
+        graph
+            .add_subgraph_input(&sg, "a", DataType::Number)
+            .expect("add input");
+        graph
+            .add_subgraph_output(&sg, "x", DataType::Number)
+            .expect("add output");
+
+        graph
+            .insert_subgraph_input_locked_at(&sg, 0, "mand_in", DataType::Number)
+            .expect("locked input insert");
+        graph
+            .insert_subgraph_output_locked_at(&sg, 0, "mand_out", DataType::Number)
+            .expect("locked output insert");
+
+        let sg_path = crate::NodePath::root().child(sg);
+        assert_eq!(input_labels_at(&graph, &sg_path), vec!["mand_in", "a"]);
+        assert_eq!(output_labels_at(&graph, &sg_path), vec!["mand_out", "x"]);
+
+        let (in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sg).expect("proxy ids");
+        let locked_of = |proxy: crate::NodeId| {
+            let ns = graph.node_states().read().expect("read");
+            ns.get(&sg_path.child(proxy))
+                .and_then(|s| s.data.as_ref())
+                .and_then(|d| d.value::<crate::InterfaceNodeData>().ok().cloned())
+                .map(|d| d.locked)
+                .unwrap_or_default()
+        };
+        assert!(
+            locked_of(in_proxy).contains("mand_in"),
+            "input lock stamped"
+        );
+        assert!(
+            locked_of(out_proxy).contains("mand_out"),
+            "output lock stamped"
         );
     }
 }
