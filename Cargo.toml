@@ -13,12 +13,16 @@ version = "0.1.0"
 [lib]
 crate-type = ["rlib"]
 
+# Standalone package: stop cargo's workspace discovery from walking up into
+# a host repo when this checkout lives inside another repo's worktree container.
+[workspace]
+
 [dependencies]
 futures = "0.3.31"
 inventory = "0.3.19"
 rayon = "1.10"
 serde = {version = "1.0", features = ["derive"]}
-strum = "0.27.0"
+strum = "0.28.0"
 thiserror = "2.0.11"
 tracing = "0.1.41"
 ulid = "1.2.0"

@@ -194,6 +194,96 @@ impl NodeStates {
         index
     }
 
+    /// Insert a dynamic input slot at `index`, shifting higher-indexed
+    /// slots up. Mirror of [`Self::remove_input_slot`], used to restore
+    /// a removed slot at its original position (op-log undo).
+    ///
+    /// Edges referencing this node's input slots at `index` or above
+    /// have their `to_input_slot_index` incremented so they keep
+    /// pointing at the same logical slot. `index` is clamped to the
+    /// current count (clamped insert == append); public `NodeGraph`
+    /// wrappers validate the range and return `Err` before calling in.
+    pub fn insert_input_slot_at(
+        &mut self,
+        path: &NodePath,
+        index: usize,
+        label: &'static str,
+        data_type: DataType,
+        max_connections: Option<usize>,
+        inspector_visible: bool,
+    ) -> usize {
+        let count = self.input_slot_count(path);
+        let index = index.min(count);
+        // Shift slots [index..count) up by 1, top-down, updating
+        // reverse-owner indices.
+        for i in (index..count).rev() {
+            if let Some(slot) = self.input_slots.remove(&(path.clone(), i)) {
+                self.input_slot_owner.insert(slot.id, (path.clone(), i + 1));
+                self.input_slots.insert((path.clone(), i + 1), slot);
+            }
+        }
+        let slot = InputSlotState {
+            id: InputSlotId::new(),
+            label,
+            data_type,
+            max_connections,
+            inspector_visible,
+            default_value: None,
+        };
+        self.input_slot_owner.insert(slot.id, (path.clone(), index));
+        self.input_slots.insert((path.clone(), index), slot);
+        // Increment to_input_slot_index on edges referencing shifted
+        // slots so indices stay aligned (mirror of remove's decrement).
+        for edge in self.edges.values_mut() {
+            if edge.to_node == *path && edge.to_input_slot_index >= index {
+                edge.to_input_slot_index += 1;
+                if let Some(entry) = self.input_slot_owner.get_mut(&edge.to_input_slot_id) {
+                    entry.1 = edge.to_input_slot_index;
+                }
+            }
+        }
+        index
+    }
+
+    /// Insert a dynamic output slot at `index`, shifting higher-indexed
+    /// slots up. Mirror of [`Self::remove_output_slot`]; see
+    /// [`Self::insert_input_slot_at`] for the shift / edge-remap
+    /// contract.
+    pub fn insert_output_slot_at(
+        &mut self,
+        path: &NodePath,
+        index: usize,
+        label: &'static str,
+        data_type: DataType,
+    ) -> usize {
+        let count = self.output_slot_count(path);
+        let index = index.min(count);
+        for i in (index..count).rev() {
+            if let Some(slot) = self.output_slots.remove(&(path.clone(), i)) {
+                self.output_slot_owner
+                    .insert(slot.id, (path.clone(), i + 1));
+                self.output_slots.insert((path.clone(), i + 1), slot);
+            }
+        }
+        let slot = OutputSlotState {
+            id: OutputSlotId::new(),
+            label,
+            data_type,
+        };
+        self.output_slot_owner
+            .insert(slot.id, (path.clone(), index));
+        self.output_slots.insert((path.clone(), index), slot);
+        for edge in self.edges.values_mut() {
+            if edge.from_node == *path && edge.from_output_slot_index >= index {
+                edge.from_output_slot_index += 1;
+                if let Some(entry) = self.output_slot_owner.get_mut(&edge.from_output_slot_id) {
+                    entry.1 = edge.from_output_slot_index;
+                }
+            }
+        }
+        index
+    }
+
     /// Rewrite the `inspector_visible` flag of an input slot. Returns
     /// `true` on success, `false` if the slot does not exist.
     pub fn set_input_slot_inspector_visible(
