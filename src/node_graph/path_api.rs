@@ -492,6 +492,30 @@ impl NodeGraph {
         Ok(())
     }
 
+    /// Clear the node-data payload at `path` (reset it to `None`) and
+    /// flag the path as changed. Companion to
+    /// [`update_node_data_at`](Self::update_node_data_at) with the same
+    /// path resolution and dirty contract, so a cleared node re-executes
+    /// exactly like an updated one.
+    ///
+    /// Added for op-log inverse support: the inverse of setting node data
+    /// over an absent prior payload must reproduce absence, which
+    /// `update_node_data_at` cannot express (its `Data` argument is
+    /// non-optional).
+    ///
+    /// Clearing an already-absent payload is a no-op `Ok` — inverse
+    /// sequences are replayed blindly, so the clear is idempotent. A
+    /// missing node is still a typed `Err` (same contract as the setter).
+    pub fn clear_node_data_at(&mut self, path: &NodePath) -> Result<(), String> {
+        let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
+        let node_state = guard
+            .get_mut(path)
+            .ok_or_else(|| format!("Node at path {} not found", path))?;
+        node_state.data = None;
+        guard.mark_changed(path);
+        Ok(())
+    }
+
     /// Replace the default value of input slot `slot_index` at `path`.
     /// Path-aware sibling of
     /// [`NodeGraphWrite::update_input_slot_default_data`]; the root
@@ -1076,6 +1100,90 @@ mod tests {
         let data = graph.node_data_at_path(&v3_path).expect("data set");
         let v = data.value::<crate::Vector3>().expect("Vector3 payload");
         assert_eq!((v.x, v.y, v.z), (1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn clear_node_data_at_depth_2_removes_data_and_marks_path_changed() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let v3_id = graph
+            .create_node_by_name_at(&sg_path, "Vector3")
+            .expect("create_node_by_name_at Vector3");
+        let v3_path = sg_path.child(v3_id);
+
+        let data = crate::Data::new(crate::Vector3::new(1.0, 2.0, 3.0)).expect("Data::new Vector3");
+        graph
+            .update_node_data_at(&v3_path, data)
+            .expect("update_node_data_at");
+
+        // Drain the change records from creation + the update so we
+        // observe only the clear.
+        {
+            let mut ns = graph.node_states.write().expect("write ns");
+            let _ = ns.drain_changed_nodes();
+        }
+
+        graph
+            .clear_node_data_at(&v3_path)
+            .expect("clear_node_data_at");
+
+        // Same dirty contract as update: the depth-2 path is the
+        // canonical key in changed_nodes, so the cleared node re-executes.
+        let changed = graph
+            .node_states
+            .read()
+            .expect("read ns")
+            .peek_changed_nodes();
+        assert!(
+            changed.contains(&v3_path),
+            "depth-2 path {} must appear in changed_nodes, got {:?}",
+            v3_path,
+            changed
+        );
+
+        assert!(
+            graph.node_data_at_path(&v3_path).is_none(),
+            "node_data must be absent after clear_node_data_at",
+        );
+    }
+
+    /// Inverse sequences are replayed blindly, so clearing an
+    /// already-absent payload must be an idempotent `Ok`.
+    #[test]
+    fn clear_node_data_at_is_idempotent_when_data_already_absent() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let v3_id = graph
+            .create_node_by_name_at(&crate::NodePath::root(), "Vector3")
+            .expect("create_node_by_name_at Vector3");
+        let v3_path = crate::NodePath::root().child(v3_id);
+
+        graph
+            .clear_node_data_at(&v3_path)
+            .expect("first clear_node_data_at");
+        graph
+            .clear_node_data_at(&v3_path)
+            .expect("clearing an already-absent payload is a no-op Ok");
+
+        assert!(graph.node_data_at_path(&v3_path).is_none());
+    }
+
+    /// A missing node is a typed `Err`, not a silent no-op — same
+    /// contract as `update_node_data_at`.
+    #[test]
+    fn clear_node_data_at_errors_on_unknown_path() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let missing = crate::NodePath::root().child(crate::NodeId::new());
+
+        let err = graph
+            .clear_node_data_at(&missing)
+            .expect_err("unknown path must be an Err");
+        assert!(
+            err.contains("not found"),
+            "error must name the missing node, got {err}",
+        );
     }
 
     /// plan-010 §3.7: when the path resolves to a SubGraph node, the
