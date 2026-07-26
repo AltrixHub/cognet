@@ -971,13 +971,13 @@ mod tests {
         let ns = graph.node_states.read().expect("read node_states");
         assert_eq!(
             ns.input_slot_count(&add_path),
-            2,
-            "Add should have 2 input slots at depth-2 path",
+            <crate::AddNode as crate::NodeMeta>::INPUTS.len(),
+            "Add's inputs should be recovered from the inventory entry",
         );
         assert_eq!(
             ns.output_slot_count(&add_path),
-            1,
-            "Add should have 1 output slot at depth-2 path",
+            <crate::AddNode as crate::NodeMeta>::OUTPUTS.len(),
+            "Add's outputs should be recovered from the inventory entry",
         );
     }
 
@@ -1519,8 +1519,8 @@ mod tests {
         let (graph, add_path) = graph_with_subgraph_add_node();
         assert_eq!(
             graph.input_slot_count_at(&add_path),
-            2,
-            "Add has 2 input slots at depth-2 path",
+            <crate::AddNode as crate::NodeMeta>::INPUTS.len(),
+            "the depth-2 path reports the inner Add's own input count",
         );
     }
 
@@ -1529,8 +1529,8 @@ mod tests {
         let (graph, add_path) = graph_with_subgraph_add_node();
         assert_eq!(
             graph.output_slot_count_at(&add_path),
-            1,
-            "Add has 1 output slot at depth-2 path",
+            <crate::AddNode as crate::NodeMeta>::OUTPUTS.len(),
+            "the depth-2 path reports the inner Add's own output count",
         );
     }
 
