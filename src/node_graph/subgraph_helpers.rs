@@ -87,39 +87,56 @@ impl NodeGraph {
     ///
     /// Returns edges whose both endpoints are direct children of `node_id`'s
     /// SubGraph (i.e. both `from_node` and `to_node` are `sg_path.child(_)`).
+    ///
+    /// Ordering contract: edges are enumerated per destination child (in
+    /// child creation order), per input slot, in that slot's CONNECTION
+    /// order (`edges_for_input` preserves connect order). A consumer that
+    /// replays these edges into another graph therefore reproduces every
+    /// multi-connection slot's ordering exactly. A sweep over the
+    /// `HashMap<EdgeId, Edge>` store would yield hash order and scramble
+    /// multi-connection slots (e.g. a polygon's vertex suppliers).
     pub fn subgraph_edges(&self, node_id: &NodeId) -> Vec<EdgeInfo> {
         let sg_path = NodePath::root().child(*node_id);
         let ns = match self.node_states.read() {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
-        let children: std::collections::HashSet<NodeId> = ns
-            .path_index_children_of(&sg_path)
-            .iter()
-            .copied()
-            .collect();
-        ns.edges()
-            .iter()
-            .filter(|(_, edge)| {
-                // Both endpoints must be direct children of the SubGraph.
-                edge.from_node
-                    .leaf()
-                    .map(|id| children.contains(&id))
-                    .unwrap_or(false)
-                    && edge
-                        .to_node
+        let ordered_children: Vec<NodeId> = ns.path_index_children_of(&sg_path).to_vec();
+        let children: std::collections::HashSet<NodeId> =
+            ordered_children.iter().copied().collect();
+        let mut result = Vec::new();
+        for child in &ordered_children {
+            let child_path = sg_path.child(*child);
+            let slot_count = ns.input_slot_count(&child_path);
+            for idx in 0..slot_count {
+                let Some(slot) = ns.input_slot(&child_path, idx) else {
+                    continue;
+                };
+                for edge_id in ns.edges_for_input(&slot.id) {
+                    let Some(edge) = ns.get_edge(edge_id) else {
+                        continue;
+                    };
+                    // The destination is this child by construction; the
+                    // source must also be a direct child of the SubGraph.
+                    let from_inside = edge
+                        .from_node
                         .leaf()
                         .map(|id| children.contains(&id))
-                        .unwrap_or(false)
-            })
-            .map(|(id, edge)| EdgeInfo {
-                id: *id,
-                from_node: edge.from_node.clone(),
-                from_output: edge.from_output_slot_index,
-                to_node: edge.to_node.clone(),
-                to_input: edge.to_input_slot_index,
-            })
-            .collect()
+                        .unwrap_or(false);
+                    if !from_inside {
+                        continue;
+                    }
+                    result.push(EdgeInfo {
+                        id: *edge_id,
+                        from_node: edge.from_node.clone(),
+                        from_output: edge.from_output_slot_index,
+                        to_node: edge.to_node.clone(),
+                        to_input: edge.to_input_slot_index,
+                    });
+                }
+            }
+        }
+        result
     }
 
     // === SubGraph port management ===
@@ -1187,6 +1204,45 @@ mod tests {
         assert!(
             locked_of(out_proxy).contains("mand_out"),
             "output lock stamped"
+        );
+    }
+
+    #[test]
+    fn subgraph_edges_preserve_per_slot_connection_order() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Order")
+            .expect("create subgraph");
+        let sg_path = crate::NodePath::root().child(sg);
+
+        let sink = graph
+            .create_node_by_name_at(&sg_path, "AddList")
+            .expect("create AddList sink");
+        let sink_path = sg_path.child(sink);
+
+        // Connect eight suppliers in a known order; with eight edges in
+        // one multi-connection slot, a hash-order enumeration virtually
+        // never matches the connect order, so this pins the contract.
+        let mut suppliers = Vec::new();
+        for _ in 0..8 {
+            let n = graph
+                .create_node_by_name_at(&sg_path, "Number")
+                .expect("create Number supplier");
+            graph
+                .connect_nodes_at(&sg_path.child(n), 0, &sink_path, 0)
+                .expect("connect supplier");
+            suppliers.push(n);
+        }
+
+        let into_sink: Vec<crate::NodeId> = graph
+            .subgraph_edges(&sg)
+            .into_iter()
+            .filter(|e| e.to_node.leaf() == Some(sink))
+            .map(|e| e.from_node.leaf().expect("leaf"))
+            .collect();
+        assert_eq!(
+            into_sink, suppliers,
+            "subgraph_edges must enumerate a multi-connection slot's edges in connect order"
         );
     }
 }
