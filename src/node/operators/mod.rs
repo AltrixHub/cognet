@@ -1,5 +1,6 @@
 pub mod add;
 pub mod add_list;
+pub mod broadcast;
 pub mod divide;
 pub mod divide_list;
 pub mod multiply;
