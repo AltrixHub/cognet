@@ -94,6 +94,10 @@ pub(crate) struct NodeStates {
     output_connections: HashMap<OutputSlotId, Vec<EdgeId>>,
     /// Index: source node → outgoing edge IDs (NodePath-keyed).
     outgoing_edges: HashMap<NodePath, Vec<EdgeId>>,
+    /// Index: sink node → incoming edge IDs (NodePath-keyed). The mirror
+    /// of `outgoing_edges`; lets "who feeds this node?" be answered in
+    /// O(degree) instead of a scan over every input slot in the graph.
+    incoming_edges: HashMap<NodePath, Vec<EdgeId>>,
     /// Nodes changed since last drain (NodePath-keyed for deferred dirty tracking).
     changed_nodes: HashSet<NodePath>,
     /// Hierarchical index: parent NodePath → direct children NodeIds.
@@ -516,6 +520,10 @@ impl NodeStates {
             .entry(edge.from_node.clone())
             .or_default()
             .push(edge_id);
+        self.incoming_edges
+            .entry(edge.to_node.clone())
+            .or_default()
+            .push(edge_id);
         self.edges.insert(edge_id, edge);
     }
 
@@ -531,6 +539,9 @@ impl NodeStates {
             }
             if let Some(outgoing) = self.outgoing_edges.get_mut(&edge.from_node) {
                 outgoing.retain(|id| id != edge_id);
+            }
+            if let Some(incoming) = self.incoming_edges.get_mut(&edge.to_node) {
+                incoming.retain(|id| id != edge_id);
             }
             Some(edge)
         } else {
@@ -625,6 +636,14 @@ impl NodeStates {
         // Mark the target node as changed so the graph re-executes.
         self.changed_nodes.insert(to_node);
         true
+    }
+
+    /// Get incoming edge IDs into a node.
+    pub fn incoming_edges_at(&self, path: &NodePath) -> &[EdgeId] {
+        self.incoming_edges
+            .get(path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get outgoing edge IDs from a node.

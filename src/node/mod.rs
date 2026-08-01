@@ -14,7 +14,7 @@ pub use primitives::*;
 pub use subgraph::*;
 pub use type_info::*;
 
-use crate::{impl_entity_id, AsAny, NodeManager};
+use crate::{impl_entity_id, AsAny, Data, NodeManager};
 use std::{any::Any, fmt::Debug, future::Future, pin::Pin};
 
 impl_entity_id!(NodeId);
@@ -45,6 +45,69 @@ pub enum NodeExecutionKind {
     /// I/O-bound. Must yield to an async runtime via the future returned
     /// from `prepare_async`.
     AsyncIo,
+}
+
+/// Whether a node takes part in **value-based execution cutoff**.
+///
+/// The executor's dirty plan is pure reachability: everything downstream
+/// of a changed node is replanned. Reachability cannot know that a node
+/// re-ran and produced the *same* values as last time, so an unchanged
+/// result still drags its whole downstream cone through a re-execution.
+///
+/// A node that opts in lets the executor answer that question. After the
+/// node runs, the executor hands it the outputs cached BEFORE the run and
+/// the ones now in the cache, and asks
+/// [`NodeImpl::outputs_equivalent`]. When the answer is "equivalent", the
+/// node is not recorded as changed, and every planned node whose inputs
+/// all come from unchanged nodes is skipped for this pass — not executed,
+/// absent from [`crate::ExecutionResult::node_outputs`], and left with its
+/// cached outputs (still valid) and its clean dirty state intact.
+///
+/// # Default is off — on purpose
+///
+/// [`OutputCutoff::Disabled`] is the default, and it reproduces the
+/// reachability-only behaviour exactly: an executed node always counts as
+/// changed. Opting in is a per-node decision because the equality test is
+/// only worth its cost where a node is a genuine value boundary (a
+/// fan-in whose result is stable for most inputs, a filter that forwards
+/// its input untouched). Forcing a deep comparison of large payloads on
+/// every node would cost more than the re-execution it saves.
+///
+/// # What an opt-in promises
+///
+/// - **True equivalence.** `outputs_equivalent` must be reflexive,
+///   symmetric and transitive, and "equivalent" must mean *no downstream
+///   node can observe a difference*. Anything weaker (a tolerance, a
+///   subset comparison, a hash with collisions) turns into stale
+///   downstream values that no later execution will repair, because the
+///   skipped nodes are never marked dirty again.
+/// - **The outputs are the whole story.** Only nodes whose output slots
+///   fully determine what downstream sees may opt in. A node that
+///   forwards values by another route — notably
+///   [`crate::InterfaceNode`], whose consumers resolve through it rather
+///   than from its (never written) cache — must stay `Disabled`.
+/// - **Cheap.** The comparison runs on every execution of the node, so it
+///   must be cheaper than the downstream cone it can prune.
+///
+/// # Fail-open
+///
+/// Everything the executor cannot decide runs the node: a directly-dirty
+/// node (structural change, node-data update, edge change) always
+/// executes, a node with any changed upstream always executes, a node
+/// whose upstream cannot be resolved always executes, and a node that
+/// FAILED counts as changed so its downstream re-runs. Cutoff can only
+/// ever remove work that provably has no observable effect.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputCutoff {
+    /// Executing this node always counts as "outputs changed"; its
+    /// downstream cone always re-runs. Default — identical to the
+    /// behaviour before value-based cutoff existed.
+    #[default]
+    Disabled,
+    /// After each run the executor calls
+    /// [`NodeImpl::outputs_equivalent`] with the previous and current
+    /// outputs; an equivalent result stops propagation at this node.
+    Enabled,
 }
 
 /// `'static` boxed future returned by [`NodeImpl::prepare_async`].
@@ -91,6 +154,33 @@ pub trait NodeImpl: Debug + Send + Sync + AsAny {
              `execution_kind() == NodeExecutionKind::AsyncIo` and implement `prepare_async`",
             std::any::type_name::<Self>()
         ))
+    }
+
+    /// Whether this node takes part in value-based execution cutoff.
+    ///
+    /// Default is [`OutputCutoff::Disabled`] — executing the node always
+    /// counts as a change. Override to [`OutputCutoff::Enabled`] *and*
+    /// implement [`NodeImpl::outputs_equivalent`] to let an unchanged
+    /// result prune the downstream cone. Read the [`OutputCutoff`] docs
+    /// before opting in: an equality that is not a true equivalence
+    /// leaves permanently stale downstream values.
+    fn output_cutoff(&self) -> OutputCutoff {
+        OutputCutoff::Disabled
+    }
+
+    /// Are the outputs this node just produced equivalent to the ones it
+    /// had before the run?
+    ///
+    /// Called only when [`NodeImpl::output_cutoff`] is
+    /// [`OutputCutoff::Enabled`]. Both slices are indexed by output slot
+    /// index and are the same length as the node's output slot list; a
+    /// slot with no cached value (never written, or evicted) is `None`.
+    ///
+    /// Returning `true` means "no downstream node can observe a
+    /// difference" and lets the executor skip this node's downstream cone.
+    /// Returning `false` is always safe — it is the default behaviour.
+    fn outputs_equivalent(&self, _previous: &[Option<Data>], _current: &[Option<Data>]) -> bool {
+        false
     }
 
     /// Async preparation entry point for `AsyncIo` nodes.
