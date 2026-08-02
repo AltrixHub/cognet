@@ -295,6 +295,30 @@ impl NodeGraph {
             .unwrap_or_default()
     }
 
+    /// The graph's structural generation — a monotone counter that moves
+    /// whenever the graph's SHAPE changes.
+    ///
+    /// "Shape" is everything a topology query can observe: which nodes
+    /// exist, which slots they carry (count, order, label, data type,
+    /// default value) and which edges connect them. Node *data* writes
+    /// (`update_node_data*`) and execution do NOT move it — they change
+    /// what a node computes, never how the graph is wired.
+    ///
+    /// This is the identity a consumer caches a graph-shaped projection
+    /// against: read it, build the projection, and rebuild only once the
+    /// value has moved. The counter is conservative — a mutation that
+    /// happens to leave the shape identical still bumps it — so a stale
+    /// cache is impossible and a redundant rebuild is merely wasted work.
+    ///
+    /// Returns `0` on a poisoned state lock, which reads as "the shape
+    /// may have changed" for any cache that stored a non-zero value.
+    pub fn structure_generation(&self) -> u64 {
+        self.node_states
+            .read()
+            .map(|ns| ns.structure_generation())
+            .unwrap_or(0)
+    }
+
     /// Get an edge by ID.
     pub fn get_edge_by_id(&self, edge_id: &EdgeId) -> Option<Edge> {
         let ns = self.node_states.read().ok()?;
@@ -374,6 +398,62 @@ impl NodeGraph {
 
 #[cfg(test)]
 mod tests {
+    use crate::{Data, NodeGraph, NodePath};
+
     #[test]
     fn test_execute() {}
+
+    /// The contract [`NodeGraph::structure_generation`] promises: it
+    /// moves on wiring changes and stands still on data writes and
+    /// execution. A projection cache keyed on it is only correct if BOTH
+    /// halves hold.
+    #[test]
+    fn structure_generation_moves_only_on_shape_changes() {
+        let mut graph = NodeGraph::new().expect("create graph");
+        let start = graph.structure_generation();
+
+        let sg = graph
+            .add_subgraph_at(&NodePath::root(), "SG")
+            .expect("add subgraph");
+        let after_node = graph.structure_generation();
+        assert!(after_node > start, "creating a node must move the counter");
+
+        let sg_path = NodePath::root().child(sg);
+        let a = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create Number a");
+        let b = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create Add b");
+        let after_children = graph.structure_generation();
+        assert!(after_children > after_node);
+
+        graph
+            .connect_nodes_at(&sg_path.child(a), 0, &sg_path.child(b), 0)
+            .expect("connect a → b");
+        let after_edge = graph.structure_generation();
+        assert!(after_edge > after_children, "an edge must move the counter");
+
+        // Data writes and execution leave the shape alone.
+        graph
+            .update_node_data_at(&sg_path.child(a), Data::new(7.0_f64).expect("number"))
+            .expect("write node data");
+        assert_eq!(
+            graph.structure_generation(),
+            after_edge,
+            "a node-data write must NOT move the counter",
+        );
+        graph.execute_sync().expect("execute");
+        assert_eq!(
+            graph.structure_generation(),
+            after_edge,
+            "execution must NOT move the counter",
+        );
+
+        graph.remove_node_at(&sg_path.child(b)).expect("remove b");
+        assert!(
+            graph.structure_generation() > after_edge,
+            "removing a node must move the counter",
+        );
+    }
 }

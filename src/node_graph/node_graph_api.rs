@@ -1347,26 +1347,34 @@ impl NodeGraph {
                     if output_count == 0 {
                         let input_count = ns.input_slot_count(node_path);
                         let mut slot_inputs = vec![None; input_count];
-                        for edge in ns.edges().values() {
-                            if edge.to_node == *node_path
-                                && (edge.to_input_slot_index) < slot_inputs.len()
-                            {
-                                // Follow through any `InterfaceNode` proxy on
-                                // the source side. SubGraph external output
-                                // edges have `edge.from_node = OutputProxy`,
-                                // which is a runtime no-op (Phase X2) and
-                                // never writes its own output cache, so a
-                                // direct `cache.outputs.get` would miss.
-                                if let Some(data) = resolve_value_through_interface(
-                                    &ns,
-                                    &cache,
-                                    &edge.from_node,
-                                    edge.from_output_slot_index,
-                                    edge.from_output_slot_id,
-                                    &mut HashSet::new(),
-                                ) {
-                                    slot_inputs[edge.to_input_slot_index] = Some(data);
-                                }
+                        // Read the sink's OWN incoming edges through the
+                        // reverse index — the mirror of the outgoing walk
+                        // below. Filtering every edge in the graph here
+                        // made one executed sink cost a pass over the
+                        // whole project, i.e. an `O(sinks x E)` term on
+                        // every execute.
+                        for edge_id in ns.incoming_edges_at(node_path) {
+                            let Some(edge) = ns.get_edge(edge_id) else {
+                                continue;
+                            };
+                            if edge.to_input_slot_index >= slot_inputs.len() {
+                                continue;
+                            }
+                            // Follow through any `InterfaceNode` proxy on
+                            // the source side. SubGraph external output
+                            // edges have `edge.from_node = OutputProxy`,
+                            // which is a runtime no-op (Phase X2) and
+                            // never writes its own output cache, so a
+                            // direct `cache.outputs.get` would miss.
+                            if let Some(data) = resolve_value_through_interface(
+                                &ns,
+                                &cache,
+                                &edge.from_node,
+                                edge.from_output_slot_index,
+                                edge.from_output_slot_id,
+                                &mut HashSet::new(),
+                            ) {
+                                slot_inputs[edge.to_input_slot_index] = Some(data);
                             }
                         }
                         node_outputs.insert(node_path.clone(), slot_inputs);

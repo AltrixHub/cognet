@@ -109,11 +109,37 @@ pub(crate) struct NodeStates {
     changed_nodes: HashSet<NodePath>,
     /// Hierarchical index: parent NodePath → direct children NodeIds.
     path_index: PathIndex,
+    /// Monotone counter bumped by every mutation that changes the
+    /// graph's SHAPE — nodes, slots (count, order, label, type) and
+    /// edges. See [`NodeStates::structure_generation`].
+    structure_generation: u64,
 }
 
 impl NodeStates {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The graph's structural generation: a monotone counter bumped by
+    /// every mutation that changes the graph's SHAPE.
+    ///
+    /// "Shape" is everything a topology query can observe: which nodes
+    /// exist, which slots they carry (count, order, label, data type,
+    /// default value) and which edges connect them. Node *data* writes
+    /// and dirty-marking are deliberately NOT counted — they change what
+    /// a node computes, never how the graph is wired.
+    ///
+    /// Consumers cache graph-shaped projections (membership maps, owner
+    /// maps, port lookups) against this value and rebuild only when it
+    /// moves.
+    pub fn structure_generation(&self) -> u64 {
+        self.structure_generation
+    }
+
+    /// Record one structural mutation. Every `&mut self` method that
+    /// changes the graph's shape calls this exactly once.
+    fn bump_structure(&mut self) {
+        self.structure_generation = self.structure_generation.wrapping_add(1);
     }
 
     /// Add a new node with slot metadata from `SlotDef` arrays.
@@ -126,6 +152,7 @@ impl NodeStates {
         input_defs: &[SlotDef],
         output_defs: &[SlotDef],
     ) {
+        self.bump_structure();
         // Register in path_index so subtree walks can find this node.
         self.path_index.insert(path);
 
@@ -183,6 +210,7 @@ impl NodeStates {
         inspector_visible: bool,
     ) -> usize {
         let index = self.input_slot_count(path);
+        self.bump_structure();
         let slot = InputSlotState {
             id: InputSlotId::new(),
             label,
@@ -203,6 +231,7 @@ impl NodeStates {
         label: &'static str,
         data_type: DataType,
     ) -> usize {
+        self.bump_structure();
         let index = self.output_slot_count(path);
         let slot = OutputSlotState {
             id: OutputSlotId::new(),
@@ -237,6 +266,7 @@ impl NodeStates {
         inspector_visible: bool,
     ) -> usize {
         let index = index.min(self.input_slot_count(path));
+        self.bump_structure();
         let slot = InputSlotState {
             id: InputSlotId::new(),
             label,
@@ -272,6 +302,7 @@ impl NodeStates {
         data_type: DataType,
     ) -> usize {
         let index = index.min(self.output_slot_count(path));
+        self.bump_structure();
         let slot = OutputSlotState {
             id: OutputSlotId::new(),
             label,
@@ -335,6 +366,7 @@ impl NodeStates {
         index: usize,
         visible: bool,
     ) -> bool {
+        self.bump_structure();
         if let Some(slot) = self
             .input_slots
             .get_mut(path)
@@ -355,6 +387,7 @@ impl NodeStates {
         index: usize,
         label: &'static str,
     ) -> bool {
+        self.bump_structure();
         if let Some(slot) = self
             .input_slots
             .get_mut(path)
@@ -375,6 +408,7 @@ impl NodeStates {
         index: usize,
         label: &'static str,
     ) -> bool {
+        self.bump_structure();
         if let Some(slot) = self
             .output_slots
             .get_mut(path)
@@ -395,6 +429,7 @@ impl NodeStates {
     /// calling this — surviving edges keep their `to_input_slot_id`,
     /// only the index is adjusted.
     pub fn remove_input_slot(&mut self, path: &NodePath, index: usize) {
+        self.bump_structure();
         // Remove the slot at index (shifting the rest down) and tear
         // down its reverse-owner entry.
         let Some(slots) = self.input_slots.get_mut(path) else {
@@ -423,6 +458,7 @@ impl NodeStates {
     /// calling this — surviving edges keep their `from_output_slot_id`,
     /// only the index is adjusted.
     pub fn remove_output_slot(&mut self, path: &NodePath, index: usize) {
+        self.bump_structure();
         // Remove the slot at index (shifting the rest down) and tear
         // down its reverse-owner entry.
         let Some(slots) = self.output_slots.get_mut(path) else {
@@ -455,6 +491,7 @@ impl NodeStates {
 
     /// Remove a node, its slot states, and all connected edges.
     pub fn remove_node(&mut self, path: &NodePath) -> Option<NodeState> {
+        self.bump_structure();
         // Tear down the path_index entry.
         self.path_index.remove(path);
 
@@ -493,6 +530,7 @@ impl NodeStates {
         path: &NodePath,
         slot_index: usize,
     ) -> Option<&mut InputSlotState> {
+        self.bump_structure();
         self.input_slots.get_mut(path)?.get_mut(slot_index)
     }
 
@@ -526,6 +564,7 @@ impl NodeStates {
 
     /// Add an edge and update lookup indexes.
     pub fn add_edge(&mut self, edge_id: EdgeId, edge: Edge) {
+        self.bump_structure();
         self.changed_nodes.insert(edge.to_node.clone());
         self.input_connections
             .entry(edge.to_input_slot_id)
@@ -548,6 +587,7 @@ impl NodeStates {
 
     /// Remove an edge and update lookup indexes.
     pub fn remove_edge(&mut self, edge_id: &EdgeId) -> Option<Edge> {
+        self.bump_structure();
         if let Some(edge) = self.edges.remove(edge_id) {
             self.changed_nodes.insert(edge.to_node.clone());
             if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
@@ -570,6 +610,7 @@ impl NodeStates {
 
     /// Remove all edges involving a node at `path`, maintaining all indexes.
     pub fn remove_edges_for_node_at(&mut self, path: &NodePath) {
+        self.bump_structure();
         let edge_ids: Vec<EdgeId> = self
             .edges
             .iter()
@@ -609,6 +650,7 @@ impl NodeStates {
 
     /// Reorder an edge within its output slot's connection list.
     pub fn reorder_output_edge(&mut self, edge_id: &EdgeId, new_index: usize) -> bool {
+        self.bump_structure();
         let Some(edge) = self.edges.get(edge_id) else {
             return false;
         };
@@ -635,6 +677,7 @@ impl NodeStates {
     /// Moves the edge from its current position to `new_index`.
     /// Returns `true` if the reorder was successful.
     pub fn reorder_input_edge(&mut self, edge_id: &EdgeId, new_index: usize) -> bool {
+        self.bump_structure();
         let Some(edge) = self.edges.get(edge_id) else {
             return false;
         };
