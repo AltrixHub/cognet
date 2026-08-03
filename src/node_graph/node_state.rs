@@ -74,10 +74,17 @@ pub(crate) type SharedNodeStates = Arc<RwLock<NodeStates>>;
 pub(crate) struct NodeStates {
     /// Node data by NodePath.
     nodes: HashMap<NodePath, NodeState>,
-    /// Input slot states by (NodePath, slot_index).
-    input_slots: HashMap<(NodePath, usize), InputSlotState>,
-    /// Output slot states by (NodePath, slot_index).
-    output_slots: HashMap<(NodePath, usize), OutputSlotState>,
+    /// Input slot states per node, in slot order.
+    ///
+    /// The `Vec` position IS the slot index, so a node's slots are
+    /// contiguous `0..len` by construction and the count is `Vec::len` —
+    /// O(1), independent of how many nodes the graph holds. A flat
+    /// `(NodePath, usize)`-keyed map cannot answer "how many slots does
+    /// this node have?" without scanning every slot in the graph, which
+    /// makes any per-node sweep quadratic.
+    input_slots: HashMap<NodePath, Vec<InputSlotState>>,
+    /// Output slot states per node, in slot order. See [`Self::input_slots`].
+    output_slots: HashMap<NodePath, Vec<OutputSlotState>>,
     /// Slot-id reverse-owner map: InputSlotId → (owning NodePath, slot_index).
     ///
     /// Kept in lock-step with `input_slots` by every slot insertion/removal path.
@@ -94,15 +101,45 @@ pub(crate) struct NodeStates {
     output_connections: HashMap<OutputSlotId, Vec<EdgeId>>,
     /// Index: source node → outgoing edge IDs (NodePath-keyed).
     outgoing_edges: HashMap<NodePath, Vec<EdgeId>>,
+    /// Index: sink node → incoming edge IDs (NodePath-keyed). The mirror
+    /// of `outgoing_edges`; lets "who feeds this node?" be answered in
+    /// O(degree) instead of a scan over every input slot in the graph.
+    incoming_edges: HashMap<NodePath, Vec<EdgeId>>,
     /// Nodes changed since last drain (NodePath-keyed for deferred dirty tracking).
     changed_nodes: HashSet<NodePath>,
     /// Hierarchical index: parent NodePath → direct children NodeIds.
     path_index: PathIndex,
+    /// Monotone counter bumped by every mutation that changes the
+    /// graph's SHAPE — nodes, slots (count, order, label, type) and
+    /// edges. See [`NodeStates::structure_generation`].
+    structure_generation: u64,
 }
 
 impl NodeStates {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The graph's structural generation: a monotone counter bumped by
+    /// every mutation that changes the graph's SHAPE.
+    ///
+    /// "Shape" is everything a topology query can observe: which nodes
+    /// exist, which slots they carry (count, order, label, data type,
+    /// default value) and which edges connect them. Node *data* writes
+    /// and dirty-marking are deliberately NOT counted — they change what
+    /// a node computes, never how the graph is wired.
+    ///
+    /// Consumers cache graph-shaped projections (membership maps, owner
+    /// maps, port lookups) against this value and rebuild only when it
+    /// moves.
+    pub fn structure_generation(&self) -> u64 {
+        self.structure_generation
+    }
+
+    /// Record one structural mutation. Every `&mut self` method that
+    /// changes the graph's shape calls this exactly once.
+    fn bump_structure(&mut self) {
+        self.structure_generation = self.structure_generation.wrapping_add(1);
     }
 
     /// Add a new node with slot metadata from `SlotDef` arrays.
@@ -115,6 +152,7 @@ impl NodeStates {
         input_defs: &[SlotDef],
         output_defs: &[SlotDef],
     ) {
+        self.bump_structure();
         // Register in path_index so subtree walks can find this node.
         self.path_index.insert(path);
 
@@ -124,29 +162,39 @@ impl NodeStates {
         );
 
         // Initialize input slot states with metadata
-        for (i, def) in input_defs.iter().enumerate() {
-            let slot = InputSlotState {
-                id: InputSlotId::new(),
-                label: def.label,
-                data_type: def.data_type,
-                max_connections: def.max_connections,
-                inspector_visible: def.inspector_visible,
-                default_value: None,
-            };
-            self.input_slot_owner.insert(slot.id, (path.clone(), i));
-            self.input_slots.insert((path.clone(), i), slot);
-        }
+        let inputs: Vec<InputSlotState> = input_defs
+            .iter()
+            .enumerate()
+            .map(|(i, def)| {
+                let slot = InputSlotState {
+                    id: InputSlotId::new(),
+                    label: def.label,
+                    data_type: def.data_type,
+                    max_connections: def.max_connections,
+                    inspector_visible: def.inspector_visible,
+                    default_value: None,
+                };
+                self.input_slot_owner.insert(slot.id, (path.clone(), i));
+                slot
+            })
+            .collect();
+        self.input_slots.insert(path.clone(), inputs);
 
         // Initialize output slot states with metadata
-        for (i, def) in output_defs.iter().enumerate() {
-            let slot = OutputSlotState {
-                id: OutputSlotId::new(),
-                label: def.label,
-                data_type: def.data_type,
-            };
-            self.output_slot_owner.insert(slot.id, (path.clone(), i));
-            self.output_slots.insert((path.clone(), i), slot);
-        }
+        let outputs: Vec<OutputSlotState> = output_defs
+            .iter()
+            .enumerate()
+            .map(|(i, def)| {
+                let slot = OutputSlotState {
+                    id: OutputSlotId::new(),
+                    label: def.label,
+                    data_type: def.data_type,
+                };
+                self.output_slot_owner.insert(slot.id, (path.clone(), i));
+                slot
+            })
+            .collect();
+        self.output_slots.insert(path.clone(), outputs);
 
         // Mark the node as changed.
         self.changed_nodes.insert(path.clone());
@@ -162,6 +210,7 @@ impl NodeStates {
         inspector_visible: bool,
     ) -> usize {
         let index = self.input_slot_count(path);
+        self.bump_structure();
         let slot = InputSlotState {
             id: InputSlotId::new(),
             label,
@@ -171,7 +220,7 @@ impl NodeStates {
             default_value: None,
         };
         self.input_slot_owner.insert(slot.id, (path.clone(), index));
-        self.input_slots.insert((path.clone(), index), slot);
+        self.input_slots.entry(path.clone()).or_default().push(slot);
         index
     }
 
@@ -182,6 +231,7 @@ impl NodeStates {
         label: &'static str,
         data_type: DataType,
     ) -> usize {
+        self.bump_structure();
         let index = self.output_slot_count(path);
         let slot = OutputSlotState {
             id: OutputSlotId::new(),
@@ -190,7 +240,10 @@ impl NodeStates {
         };
         self.output_slot_owner
             .insert(slot.id, (path.clone(), index));
-        self.output_slots.insert((path.clone(), index), slot);
+        self.output_slots
+            .entry(path.clone())
+            .or_default()
+            .push(slot);
         index
     }
 
@@ -212,16 +265,8 @@ impl NodeStates {
         max_connections: Option<usize>,
         inspector_visible: bool,
     ) -> usize {
-        let count = self.input_slot_count(path);
-        let index = index.min(count);
-        // Shift slots [index..count) up by 1, top-down, updating
-        // reverse-owner indices.
-        for i in (index..count).rev() {
-            if let Some(slot) = self.input_slots.remove(&(path.clone(), i)) {
-                self.input_slot_owner.insert(slot.id, (path.clone(), i + 1));
-                self.input_slots.insert((path.clone(), i + 1), slot);
-            }
-        }
+        let index = index.min(self.input_slot_count(path));
+        self.bump_structure();
         let slot = InputSlotState {
             id: InputSlotId::new(),
             label,
@@ -230,16 +275,16 @@ impl NodeStates {
             inspector_visible,
             default_value: None,
         };
-        self.input_slot_owner.insert(slot.id, (path.clone(), index));
-        self.input_slots.insert((path.clone(), index), slot);
+        self.input_slots
+            .entry(path.clone())
+            .or_default()
+            .insert(index, slot);
+        self.reindex_input_slot_owners(path, index);
         // Increment to_input_slot_index on edges referencing shifted
         // slots so indices stay aligned (mirror of remove's decrement).
         for edge in self.edges.values_mut() {
             if edge.to_node == *path && edge.to_input_slot_index >= index {
                 edge.to_input_slot_index += 1;
-                if let Some(entry) = self.input_slot_owner.get_mut(&edge.to_input_slot_id) {
-                    entry.1 = edge.to_input_slot_index;
-                }
             }
         }
         index
@@ -256,32 +301,61 @@ impl NodeStates {
         label: &'static str,
         data_type: DataType,
     ) -> usize {
-        let count = self.output_slot_count(path);
-        let index = index.min(count);
-        for i in (index..count).rev() {
-            if let Some(slot) = self.output_slots.remove(&(path.clone(), i)) {
-                self.output_slot_owner
-                    .insert(slot.id, (path.clone(), i + 1));
-                self.output_slots.insert((path.clone(), i + 1), slot);
-            }
-        }
+        let index = index.min(self.output_slot_count(path));
+        self.bump_structure();
         let slot = OutputSlotState {
             id: OutputSlotId::new(),
             label,
             data_type,
         };
-        self.output_slot_owner
-            .insert(slot.id, (path.clone(), index));
-        self.output_slots.insert((path.clone(), index), slot);
+        self.output_slots
+            .entry(path.clone())
+            .or_default()
+            .insert(index, slot);
+        self.reindex_output_slot_owners(path, index);
         for edge in self.edges.values_mut() {
             if edge.from_node == *path && edge.from_output_slot_index >= index {
                 edge.from_output_slot_index += 1;
-                if let Some(entry) = self.output_slot_owner.get_mut(&edge.from_output_slot_id) {
-                    entry.1 = edge.from_output_slot_index;
-                }
             }
         }
         index
+    }
+
+    /// Rewrite `input_slot_owner` for every slot of `path` from `from`
+    /// onward, read straight off the authoritative slot `Vec`.
+    ///
+    /// The `Vec` position IS the slot index, so this is the single place
+    /// that restates it into the reverse-owner map after an insert or a
+    /// remove shifted positions.
+    fn reindex_input_slot_owners(&mut self, path: &NodePath, from: usize) {
+        let entries: Vec<(InputSlotId, usize)> =
+            self.input_slots.get(path).map_or_else(Vec::new, |slots| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .map(|(index, slot)| (slot.id, index))
+                    .collect()
+            });
+        for (id, index) in entries {
+            self.input_slot_owner.insert(id, (path.clone(), index));
+        }
+    }
+
+    /// Output-side mirror of [`Self::reindex_input_slot_owners`].
+    fn reindex_output_slot_owners(&mut self, path: &NodePath, from: usize) {
+        let entries: Vec<(OutputSlotId, usize)> =
+            self.output_slots.get(path).map_or_else(Vec::new, |slots| {
+                slots
+                    .iter()
+                    .enumerate()
+                    .skip(from)
+                    .map(|(index, slot)| (slot.id, index))
+                    .collect()
+            });
+        for (id, index) in entries {
+            self.output_slot_owner.insert(id, (path.clone(), index));
+        }
     }
 
     /// Rewrite the `inspector_visible` flag of an input slot. Returns
@@ -292,7 +366,12 @@ impl NodeStates {
         index: usize,
         visible: bool,
     ) -> bool {
-        if let Some(slot) = self.input_slots.get_mut(&(path.clone(), index)) {
+        self.bump_structure();
+        if let Some(slot) = self
+            .input_slots
+            .get_mut(path)
+            .and_then(|slots| slots.get_mut(index))
+        {
             slot.inspector_visible = visible;
             true
         } else {
@@ -308,7 +387,12 @@ impl NodeStates {
         index: usize,
         label: &'static str,
     ) -> bool {
-        if let Some(slot) = self.input_slots.get_mut(&(path.clone(), index)) {
+        self.bump_structure();
+        if let Some(slot) = self
+            .input_slots
+            .get_mut(path)
+            .and_then(|slots| slots.get_mut(index))
+        {
             slot.label = label;
             true
         } else {
@@ -324,7 +408,12 @@ impl NodeStates {
         index: usize,
         label: &'static str,
     ) -> bool {
-        if let Some(slot) = self.output_slots.get_mut(&(path.clone(), index)) {
+        self.bump_structure();
+        if let Some(slot) = self
+            .output_slots
+            .get_mut(path)
+            .and_then(|slots| slots.get_mut(index))
+        {
             slot.label = label;
             true
         } else {
@@ -340,30 +429,23 @@ impl NodeStates {
     /// calling this — surviving edges keep their `to_input_slot_id`,
     /// only the index is adjusted.
     pub fn remove_input_slot(&mut self, path: &NodePath, index: usize) {
-        let count = self.input_slot_count(path);
-        if index >= count {
+        self.bump_structure();
+        // Remove the slot at index (shifting the rest down) and tear
+        // down its reverse-owner entry.
+        let Some(slots) = self.input_slots.get_mut(path) else {
+            return;
+        };
+        if index >= slots.len() {
             return;
         }
-        // Remove the slot at index and tear down its reverse-owner entry.
-        if let Some(slot) = self.input_slots.remove(&(path.clone(), index)) {
-            self.input_slot_owner.remove(&slot.id);
-        }
-        // Shift slots above index down by 1, updating reverse-owner indices.
-        for i in (index + 1)..count {
-            if let Some(slot) = self.input_slots.remove(&(path.clone(), i)) {
-                self.input_slot_owner.insert(slot.id, (path.clone(), i - 1));
-                self.input_slots.insert((path.clone(), i - 1), slot);
-            }
-        }
+        let removed = slots.remove(index);
+        self.input_slot_owner.remove(&removed.id);
+        self.reindex_input_slot_owners(path, index);
         // Decrement to_input_slot_index on edges that reference this
         // node's higher-indexed input slots so indices stay aligned.
         for edge in self.edges.values_mut() {
             if edge.to_node == *path && edge.to_input_slot_index > index {
                 edge.to_input_slot_index -= 1;
-                // Update the reverse-owner index for the shifted slot.
-                if let Some(entry) = self.input_slot_owner.get_mut(&edge.to_input_slot_id) {
-                    entry.1 = edge.to_input_slot_index;
-                }
             }
         }
     }
@@ -376,47 +458,40 @@ impl NodeStates {
     /// calling this — surviving edges keep their `from_output_slot_id`,
     /// only the index is adjusted.
     pub fn remove_output_slot(&mut self, path: &NodePath, index: usize) {
-        let count = self.output_slot_count(path);
-        if index >= count {
+        self.bump_structure();
+        // Remove the slot at index (shifting the rest down) and tear
+        // down its reverse-owner entry.
+        let Some(slots) = self.output_slots.get_mut(path) else {
+            return;
+        };
+        if index >= slots.len() {
             return;
         }
-        // Remove the slot at index and tear down its reverse-owner entry.
-        if let Some(slot) = self.output_slots.remove(&(path.clone(), index)) {
-            self.output_slot_owner.remove(&slot.id);
-        }
-        // Shift slots above index down by 1, updating reverse-owner indices.
-        for i in (index + 1)..count {
-            if let Some(slot) = self.output_slots.remove(&(path.clone(), i)) {
-                self.output_slot_owner
-                    .insert(slot.id, (path.clone(), i - 1));
-                self.output_slots.insert((path.clone(), i - 1), slot);
-            }
-        }
+        let removed = slots.remove(index);
+        self.output_slot_owner.remove(&removed.id);
+        self.reindex_output_slot_owners(path, index);
         // Decrement from_output_slot_index on edges that reference this
         // node's higher-indexed output slots so indices stay aligned.
         for edge in self.edges.values_mut() {
             if edge.from_node == *path && edge.from_output_slot_index > index {
                 edge.from_output_slot_index -= 1;
-                // Update the reverse-owner index for the shifted slot.
-                if let Some(entry) = self.output_slot_owner.get_mut(&edge.from_output_slot_id) {
-                    entry.1 = edge.from_output_slot_index;
-                }
             }
         }
     }
 
-    /// Count input slots for a node.
+    /// Count input slots for a node — O(1), one hash lookup.
     pub fn input_slot_count(&self, path: &NodePath) -> usize {
-        self.input_slots.keys().filter(|(p, _)| p == path).count()
+        self.input_slots.get(path).map_or(0, Vec::len)
     }
 
-    /// Count output slots for a node.
+    /// Count output slots for a node — O(1), one hash lookup.
     pub fn output_slot_count(&self, path: &NodePath) -> usize {
-        self.output_slots.keys().filter(|(p, _)| p == path).count()
+        self.output_slots.get(path).map_or(0, Vec::len)
     }
 
     /// Remove a node, its slot states, and all connected edges.
     pub fn remove_node(&mut self, path: &NodePath) -> Option<NodeState> {
+        self.bump_structure();
         // Tear down the path_index entry.
         self.path_index.remove(path);
 
@@ -424,27 +499,12 @@ impl NodeStates {
         self.remove_edges_for_node_at(path);
 
         // Remove slot states and tear down reverse-owner entries.
-        let input_ids: Vec<InputSlotId> = self
-            .input_slots
-            .iter()
-            .filter(|((p, _), _)| p == path)
-            .map(|(_, s)| s.id)
-            .collect();
-        for id in input_ids {
-            self.input_slot_owner.remove(&id);
+        for slot in self.input_slots.remove(path).unwrap_or_default() {
+            self.input_slot_owner.remove(&slot.id);
         }
-        self.input_slots.retain(|(p, _), _| p != path);
-
-        let output_ids: Vec<OutputSlotId> = self
-            .output_slots
-            .iter()
-            .filter(|((p, _), _)| p == path)
-            .map(|(_, s)| s.id)
-            .collect();
-        for id in output_ids {
-            self.output_slot_owner.remove(&id);
+        for slot in self.output_slots.remove(path).unwrap_or_default() {
+            self.output_slot_owner.remove(&slot.id);
         }
-        self.output_slots.retain(|(p, _), _| p != path);
 
         self.nodes.remove(path)
     }
@@ -461,7 +521,7 @@ impl NodeStates {
 
     /// Get input slot state.
     pub fn input_slot(&self, path: &NodePath, slot_index: usize) -> Option<&InputSlotState> {
-        self.input_slots.get(&(path.clone(), slot_index))
+        self.input_slots.get(path)?.get(slot_index)
     }
 
     /// Get mutable input slot state.
@@ -470,12 +530,13 @@ impl NodeStates {
         path: &NodePath,
         slot_index: usize,
     ) -> Option<&mut InputSlotState> {
-        self.input_slots.get_mut(&(path.clone(), slot_index))
+        self.bump_structure();
+        self.input_slots.get_mut(path)?.get_mut(slot_index)
     }
 
     /// Get output slot state.
     pub fn output_slot(&self, path: &NodePath, slot_index: usize) -> Option<&OutputSlotState> {
-        self.output_slots.get(&(path.clone(), slot_index))
+        self.output_slots.get(path)?.get(slot_index)
     }
 
     /// Look up the owning `(NodePath, slot_index)` for an `InputSlotId`.
@@ -503,6 +564,7 @@ impl NodeStates {
 
     /// Add an edge and update lookup indexes.
     pub fn add_edge(&mut self, edge_id: EdgeId, edge: Edge) {
+        self.bump_structure();
         self.changed_nodes.insert(edge.to_node.clone());
         self.input_connections
             .entry(edge.to_input_slot_id)
@@ -516,11 +578,16 @@ impl NodeStates {
             .entry(edge.from_node.clone())
             .or_default()
             .push(edge_id);
+        self.incoming_edges
+            .entry(edge.to_node.clone())
+            .or_default()
+            .push(edge_id);
         self.edges.insert(edge_id, edge);
     }
 
     /// Remove an edge and update lookup indexes.
     pub fn remove_edge(&mut self, edge_id: &EdgeId) -> Option<Edge> {
+        self.bump_structure();
         if let Some(edge) = self.edges.remove(edge_id) {
             self.changed_nodes.insert(edge.to_node.clone());
             if let Some(connections) = self.input_connections.get_mut(&edge.to_input_slot_id) {
@@ -532,6 +599,9 @@ impl NodeStates {
             if let Some(outgoing) = self.outgoing_edges.get_mut(&edge.from_node) {
                 outgoing.retain(|id| id != edge_id);
             }
+            if let Some(incoming) = self.incoming_edges.get_mut(&edge.to_node) {
+                incoming.retain(|id| id != edge_id);
+            }
             Some(edge)
         } else {
             None
@@ -540,6 +610,7 @@ impl NodeStates {
 
     /// Remove all edges involving a node at `path`, maintaining all indexes.
     pub fn remove_edges_for_node_at(&mut self, path: &NodePath) {
+        self.bump_structure();
         let edge_ids: Vec<EdgeId> = self
             .edges
             .iter()
@@ -579,6 +650,7 @@ impl NodeStates {
 
     /// Reorder an edge within its output slot's connection list.
     pub fn reorder_output_edge(&mut self, edge_id: &EdgeId, new_index: usize) -> bool {
+        self.bump_structure();
         let Some(edge) = self.edges.get(edge_id) else {
             return false;
         };
@@ -605,6 +677,7 @@ impl NodeStates {
     /// Moves the edge from its current position to `new_index`.
     /// Returns `true` if the reorder was successful.
     pub fn reorder_input_edge(&mut self, edge_id: &EdgeId, new_index: usize) -> bool {
+        self.bump_structure();
         let Some(edge) = self.edges.get(edge_id) else {
             return false;
         };
@@ -625,6 +698,14 @@ impl NodeStates {
         // Mark the target node as changed so the graph re-executes.
         self.changed_nodes.insert(to_node);
         true
+    }
+
+    /// Get incoming edge IDs into a node.
+    pub fn incoming_edges_at(&self, path: &NodePath) -> &[EdgeId] {
+        self.incoming_edges
+            .get(path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get outgoing edge IDs from a node.

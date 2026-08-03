@@ -1,3 +1,46 @@
+//! Graph execution: planning, scheduling and result collection.
+//!
+//! # How a pass runs
+//!
+//! 1. **Plan** (`build_execution_plan`) — snapshot the
+//!    directly-dirty *seed* set (nodes marked changed by a structural
+//!    edit, a node-data update or an edge change), BFS-close it over
+//!    outgoing edges, and topologically sort the closure into levels.
+//!    The dirty set is peeked, not drained, so a rejected plan stays
+//!    re-runnable.
+//! 2. **Validate** — reject a sync plan that reaches an `AsyncIo` node.
+//! 3. **Drain** — from here on, failures are per-node results, not a
+//!    graph-level error.
+//! 4. **Execute** level by level (rayon in [`ExecutionMode::Parallel`],
+//!    the calling thread in [`ExecutionMode::Sequential`]).
+//! 5. **Collect** the outputs, edge values and errors of the nodes that
+//!    actually ran.
+//!
+//! # Value-based execution cutoff
+//!
+//! The plan is reachability-only, so a node that re-runs and produces the
+//! *same* values as last time would still drag its whole downstream cone
+//! through a pointless re-execution. [`crate::OutputCutoff`] lets a node
+//! opt into being asked. During step 4 the executor keeps a
+//! `ChangeFrontier`: a planned node runs when it is directly dirty, or
+//! when at least one of its upstream sources produced changed outputs
+//! this pass. After an opted-in node runs, its cached-before and
+//! cached-after outputs are compared via
+//! [`crate::NodeImpl::outputs_equivalent`]; an equivalent result keeps it
+//! out of the frontier and its downstream cone is skipped.
+//!
+//! A skipped node is **not executed, not collected, and not dirty**: its
+//! cached outputs are still valid, so consumers that hold the previous
+//! [`ExecutionResult`] are already correct, and nothing re-marks it for a
+//! later pass. Only failures re-mark (`restore_dirty_for_failed`).
+//!
+//! Cutoff is **off by default** — [`crate::OutputCutoff::Disabled`] makes
+//! an executed node always count as changed, which is exactly the
+//! behaviour before cutoff existed — and every undecidable case **fails
+//! open** (executes). Read the [`crate::OutputCutoff`] docs before opting
+//! a node in: the equality must be a true equivalence, because a skipped
+//! node is never revisited to repair a wrong answer.
+
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -10,8 +53,8 @@ use std::any::TypeId;
 use crate::{
     node_graph_system::NodeGraphSystem, BoxNodeFuture, ColorValue, Data, DataType, DataValue, Edge,
     EdgeId, ErrorTarget, ExecutionContext, GraphError, NodeEntity, NodeExecutionKind, NodeGraph,
-    NodeId, NodeImpl, NodeMeta, NodePath, OutputWriter, SharedExecutionCache, SharedNodeStates,
-    Vector3,
+    NodeId, NodeImpl, NodeMeta, NodePath, OutputCutoff, OutputWriter, SharedExecutionCache,
+    SharedNodeStates, Vector3,
 };
 
 /// Typed error returned by `NodeGraph::execute_sync` and `execute_async`.
@@ -62,16 +105,24 @@ impl std::error::Error for GraphExecutionError {}
 /// it, so a `RequiresAsyncExecution` rejection leaves the graph
 /// re-executable from the same dirty state.
 struct ExecutionPlan {
-    /// Snapshot of node paths that were dirty when the plan was built.
-    /// The executor drains the underlying `NodeStates::changed_nodes`
-    /// only after API validation succeeds.
+    /// The directly-dirty seed set the plan was grown from: nodes marked
+    /// changed by a structural edit, a node-data update or an edge
+    /// change. These always execute — value-based cutoff only ever
+    /// prunes nodes reached transitively.
+    seed_nodes: HashSet<NodePath>,
+    /// Snapshot of node paths that were dirty when the plan was built —
+    /// the downstream closure of `seed_nodes`. The executor drains the
+    /// underlying `NodeStates::changed_nodes` only after API validation
+    /// succeeds.
     dirty_nodes: HashSet<NodePath>,
     /// Topologically grouped node levels — same-level nodes have no
     /// data dependencies on each other and may run in parallel.
     levels: Vec<Vec<NodePath>>,
-    /// Flattened executed-node list in topological order, for output
-    /// collection.
-    executed_node_paths: Vec<NodePath>,
+    /// Flattened planned-node list in topological order. Value-based
+    /// cutoff may skip a subset of these at run time, so the executor
+    /// collects outputs from the nodes it actually ran, not from this
+    /// list.
+    planned_node_paths: Vec<NodePath>,
     /// Removed nodes drained from bookkeeping at plan time (they don't
     /// participate in execution but are reported in `ExecutionResult`).
     /// Removal bookkeeping is id-keyed (the Remove API takes a
@@ -81,8 +132,155 @@ struct ExecutionPlan {
 
 impl ExecutionPlan {
     fn is_empty(&self) -> bool {
-        self.executed_node_paths.is_empty()
+        self.planned_node_paths.is_empty()
     }
+}
+
+/// Value-based execution cutoff bookkeeping for one execution pass.
+///
+/// The dirty plan is reachability-only: it names every node downstream of
+/// a change. This tracker narrows that to the nodes whose inputs actually
+/// moved, by recording which nodes produced *changed* outputs as the
+/// levels are executed. A planned node runs when it is directly dirty, or
+/// when at least one of its upstream sources is in the changed set.
+///
+/// Nodes that do not opt into [`OutputCutoff::Enabled`] are always
+/// recorded as changed after they run, so a graph of default nodes
+/// executes exactly the plan — the behaviour before cutoff existed.
+///
+/// # SubGraph boundaries are looked through
+///
+/// [`crate::InterfaceNode`] is one node carrying ALL of a SubGraph's
+/// external ports, and it is a runtime no-op: consumers resolve their
+/// value THROUGH it (`resolve_value_through_interface`), never from its
+/// cache. Treating it as an ordinary source would collapse every port
+/// into a single change signal — one changed external input would mark
+/// every node inside the SubGraph as having a changed upstream, and no
+/// cutoff inside a SubGraph could ever fire. So the frontier resolves an
+/// interface source exactly the way the value resolver does: back through
+/// the proxy's input slot of the same index to whatever really feeds it.
+///
+/// Every undecidable case fails open (executes). See [`OutputCutoff`].
+struct ChangeFrontier {
+    /// Directly-dirty nodes: they execute no matter what their upstreams
+    /// did.
+    seed: HashSet<NodePath>,
+    /// Nodes whose outputs changed during this pass; the propagation
+    /// front the skip test consults.
+    changed: HashSet<NodePath>,
+}
+
+impl ChangeFrontier {
+    fn new(seed: HashSet<NodePath>) -> Self {
+        Self {
+            seed,
+            changed: HashSet::new(),
+        }
+    }
+
+    /// Whether `path` must run in this pass.
+    ///
+    /// True when the node is directly dirty, when any upstream source is
+    /// in the changed set, or when its upstream topology cannot be
+    /// resolved (fail open). A node with no incoming edges at all can
+    /// only be in the plan as a seed, but is executed anyway if it
+    /// somehow is not — an unexecuted source node would be a silent
+    /// hole in the result.
+    fn must_execute(
+        &self,
+        path: &NodePath,
+        ns: &crate::node_graph::node_state::NodeStates,
+    ) -> bool {
+        if self.seed.contains(path) {
+            return true;
+        }
+        let incoming = ns.incoming_edges_at(path);
+        if incoming.is_empty() {
+            return true;
+        }
+        incoming.iter().any(|edge_id| {
+            // An edge id with no edge behind it: the topology is not
+            // trustworthy for a skip decision.
+            ns.get_edge(edge_id).is_none_or(|edge| {
+                self.source_changed(
+                    ns,
+                    &edge.from_node,
+                    edge.from_output_slot_index,
+                    &mut HashSet::new(),
+                )
+            })
+        })
+    }
+
+    /// Did the value delivered on (`from_node`, `slot_index`) change in
+    /// this pass?
+    ///
+    /// The mirror image of `resolve_value_through_interface`: for an
+    /// ordinary node the answer is membership in the changed set; for an
+    /// [`crate::InterfaceNode`] the proxy is not the source, so the walk
+    /// continues through the proxy's input slot of the SAME index into
+    /// whatever feeds it.
+    ///
+    /// `visited` guards the same pathological proxy loop the value
+    /// resolver guards — only the interface walk can loop, so the set is
+    /// touched (and therefore allocated) only once a proxy is actually
+    /// in the path. A revisit means the topology cannot be decided,
+    /// which fails open.
+    fn source_changed(
+        &self,
+        ns: &crate::node_graph::node_state::NodeStates,
+        from_node: &NodePath,
+        from_output_slot_index: usize,
+        visited: &mut HashSet<(NodePath, usize)>,
+    ) -> bool {
+        let is_interface = ns
+            .get(from_node)
+            .map(|s| s.type_name == crate::node::interface::InterfaceNode::NAME)
+            .unwrap_or(false);
+        if !is_interface {
+            return self.changed.contains(from_node);
+        }
+        if !visited.insert((from_node.clone(), from_output_slot_index)) {
+            return true;
+        }
+        // A directly-dirty proxy may forward something different for any
+        // reason the frontier cannot see from here — a slot default
+        // edited, a port added, an incoming edge re-wired. Do not try to
+        // be clever about which port it was.
+        if self.seed.contains(from_node) {
+            return true;
+        }
+        let Some(input_slot) = ns.input_slot(from_node, from_output_slot_index) else {
+            return true;
+        };
+        let upstream_edges = ns.edges_for_input(&input_slot.id);
+        if upstream_edges.is_empty() {
+            // The proxy forwards its slot default. A default only moves
+            // by an edit that marks the proxy itself dirty, which the
+            // seed check above already caught.
+            return false;
+        }
+        upstream_edges.iter().any(|edge_id| {
+            ns.get_edge(edge_id).is_none_or(|edge| {
+                self.source_changed(ns, &edge.from_node, edge.from_output_slot_index, visited)
+            })
+        })
+    }
+
+    /// Record that `path` produced outputs downstream must see.
+    fn mark_changed(&mut self, path: NodePath) {
+        self.changed.insert(path);
+    }
+}
+
+/// Outcome of one node run, as the cutoff tracker needs to see it.
+struct NodeRun {
+    path: NodePath,
+    result: Result<(), String>,
+    /// `false` only when the node opted into [`OutputCutoff::Enabled`]
+    /// and reported its fresh outputs equivalent to the cached previous
+    /// ones. A failure always reports `true` (fail open).
+    outputs_changed: bool,
 }
 
 /// Execution event for progress tracking during graph execution.
@@ -623,6 +821,32 @@ fn validate_async_in_sync_plan(
     }
 }
 
+/// Snapshot the cached output values of `path`, indexed by output slot.
+///
+/// Used by value-based cutoff to hand an opted-in node its "before" and
+/// "after" pictures. A slot with no cache entry (never written, or
+/// evicted) reads as `None`, which makes a first run compare unequal
+/// against anything the node writes — the fail-open direction.
+fn snapshot_outputs(
+    path: &NodePath,
+    shared_cache: &SharedExecutionCache,
+    shared_node_states: &SharedNodeStates,
+) -> Vec<Option<Data>> {
+    let Ok(ns) = shared_node_states.read() else {
+        return Vec::new();
+    };
+    let Ok(cache) = shared_cache.read() else {
+        return Vec::new();
+    };
+    (0..ns.output_slot_count(path))
+        .map(|idx| {
+            ns.output_slot(path, idx)
+                .and_then(|slot| cache.outputs.get(&slot.id))
+                .map(|data| data.share())
+        })
+        .collect()
+}
+
 /// Execute a single node synchronously.
 ///
 /// Locks the nodes map only long enough to clone out the node entity, then
@@ -634,15 +858,22 @@ fn validate_async_in_sync_plan(
 ///
 /// Wraps execution in `catch_unwind` so a single node panic does not abort
 /// the surrounding rayon level.
+///
+/// When the node opts into [`OutputCutoff::Enabled`], its cached outputs
+/// are snapshotted before the run and compared against the post-run cache
+/// via [`NodeImpl::outputs_equivalent`]; the verdict rides back on
+/// [`NodeRun::outputs_changed`]. Default nodes pay nothing for this — no
+/// snapshot is taken and the run always reports "changed".
 fn execute_node_sync(
     path: NodePath,
     shared_nodes: &crate::SharedNodes,
     shared_cache: &SharedExecutionCache,
     shared_node_states: &SharedNodeStates,
     on_progress: &(dyn Fn(ExecutionEvent) + Send + Sync),
-) -> (NodePath, Result<(), String>) {
+) -> NodeRun {
     on_progress(ExecutionEvent::Started(path.clone()));
 
+    let mut outputs_changed = true;
     let result: Result<(), String> = {
         let entity = {
             let nodes_guard = match shared_nodes.lock() {
@@ -652,15 +883,40 @@ fn execute_node_sync(
                         path.clone(),
                         "Lock poisoned".to_string(),
                     ));
-                    return (path, Err("Lock poisoned".to_string()));
+                    return NodeRun {
+                        path,
+                        result: Err("Lock poisoned".to_string()),
+                        outputs_changed: true,
+                    };
                 }
             };
             nodes_guard.get(&path).map(Arc::clone)
         };
 
         let Some(node_entity) = entity else {
+            // No entity to run: nothing was written, so nothing changed.
+            // Treated as changed anyway — a missing entity is a broken
+            // graph, not a value-stability claim.
             on_progress(ExecutionEvent::Completed(path.clone()));
-            return (path, Ok(()));
+            return NodeRun {
+                path,
+                result: Ok(()),
+                outputs_changed: true,
+            };
+        };
+
+        let cutoff = {
+            let node_read = match node_entity.read() {
+                Ok(r) => r,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            node_read.output_cutoff()
+        };
+        let previous_outputs = match cutoff {
+            OutputCutoff::Enabled => {
+                Some(snapshot_outputs(&path, shared_cache, shared_node_states))
+            }
+            OutputCutoff::Disabled => None,
         };
 
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -676,7 +932,7 @@ fn execute_node_sync(
             // before the next level starts.
         }));
 
-        match panic_result {
+        let result = match panic_result {
             Ok(res) => res,
             Err(panic_payload) => {
                 let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
@@ -688,7 +944,19 @@ fn execute_node_sync(
                 };
                 Err(msg)
             }
+        };
+
+        // A failed node's outputs are indeterminate: keep propagating.
+        if let (Some(previous), Ok(())) = (previous_outputs, &result) {
+            let current = snapshot_outputs(&path, shared_cache, shared_node_states);
+            let node_read = match node_entity.read() {
+                Ok(r) => r,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            outputs_changed = !node_read.outputs_equivalent(&previous, &current);
         }
+
+        result
     };
 
     match &result {
@@ -696,7 +964,11 @@ fn execute_node_sync(
         Err(msg) => on_progress(ExecutionEvent::Failed(path.clone(), msg.clone())),
     }
 
-    (path, result)
+    NodeRun {
+        path,
+        result,
+        outputs_changed,
+    }
 }
 
 impl NodeGraph {
@@ -941,12 +1213,15 @@ impl NodeGraph {
 
         if changed.is_empty() {
             return Ok(ExecutionPlan {
+                seed_nodes: HashSet::new(),
                 dirty_nodes: HashSet::new(),
                 levels: Vec::new(),
-                executed_node_paths: Vec::new(),
+                planned_node_paths: Vec::new(),
                 removed_nodes: removed,
             });
         }
+
+        let seed_nodes = changed.clone();
 
         let dirty_nodes: HashSet<NodePath> = {
             let ns = self
@@ -973,15 +1248,16 @@ impl NodeGraph {
             .topological_sort(&dirty_nodes)
             .map_err(GraphExecutionError::PlanningFailed)?;
 
-        let executed_node_paths: Vec<NodePath> = levels
+        let planned_node_paths: Vec<NodePath> = levels
             .iter()
             .flat_map(|level| level.iter().cloned())
             .collect();
 
         Ok(ExecutionPlan {
+            seed_nodes,
             dirty_nodes,
             levels,
-            executed_node_paths,
+            planned_node_paths,
             removed_nodes: removed,
         })
     }
@@ -996,7 +1272,11 @@ impl NodeGraph {
     /// executes directly — there is no internal-graph recursion to inspect.
     fn validate_for_sync(&self, plan: &ExecutionPlan) -> Result<(), GraphExecutionError> {
         let shared_nodes = self.node_manager.nodes();
-        validate_async_in_sync_plan(&plan.executed_node_paths, &shared_nodes)
+        // Validated over the PLANNED set, not the eventually-executed
+        // one: the rejection must be decidable before anything runs, and
+        // rejecting a plan that value-based cutoff might have skipped
+        // past is the conservative direction.
+        validate_async_in_sync_plan(&plan.planned_node_paths, &shared_nodes)
     }
 
     /// Validate that the plan can run on the asynchronous kernel.
@@ -1032,11 +1312,21 @@ impl NodeGraph {
         }
     }
 
-    /// Collect outputs/edge_values/errors for the executed plan.
-    fn collect_outputs(&self, plan: &ExecutionPlan) -> ExecutionResult {
+    /// Collect outputs/edge_values/errors for the nodes that actually
+    /// ran.
+    ///
+    /// `executed_node_paths` is the subset of `plan.planned_node_paths`
+    /// the executor did not skip via value-based cutoff. Skipped nodes
+    /// are deliberately absent from the result: their cached outputs are
+    /// unchanged, so re-publishing them would only make consumers redo
+    /// work for values they already hold.
+    fn collect_outputs(
+        &self,
+        plan: &ExecutionPlan,
+        executed_node_paths: &[NodePath],
+    ) -> ExecutionResult {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
-        let executed_node_paths = &plan.executed_node_paths;
 
         let mut node_outputs: HashMap<NodePath, Vec<Option<Data>>> = HashMap::new();
         let mut edge_values: HashMap<EdgeId, EdgeValue> = HashMap::new();
@@ -1057,26 +1347,34 @@ impl NodeGraph {
                     if output_count == 0 {
                         let input_count = ns.input_slot_count(node_path);
                         let mut slot_inputs = vec![None; input_count];
-                        for edge in ns.edges().values() {
-                            if edge.to_node == *node_path
-                                && (edge.to_input_slot_index) < slot_inputs.len()
-                            {
-                                // Follow through any `InterfaceNode` proxy on
-                                // the source side. SubGraph external output
-                                // edges have `edge.from_node = OutputProxy`,
-                                // which is a runtime no-op (Phase X2) and
-                                // never writes its own output cache, so a
-                                // direct `cache.outputs.get` would miss.
-                                if let Some(data) = resolve_value_through_interface(
-                                    &ns,
-                                    &cache,
-                                    &edge.from_node,
-                                    edge.from_output_slot_index,
-                                    edge.from_output_slot_id,
-                                    &mut HashSet::new(),
-                                ) {
-                                    slot_inputs[edge.to_input_slot_index] = Some(data);
-                                }
+                        // Read the sink's OWN incoming edges through the
+                        // reverse index — the mirror of the outgoing walk
+                        // below. Filtering every edge in the graph here
+                        // made one executed sink cost a pass over the
+                        // whole project, i.e. an `O(sinks x E)` term on
+                        // every execute.
+                        for edge_id in ns.incoming_edges_at(node_path) {
+                            let Some(edge) = ns.get_edge(edge_id) else {
+                                continue;
+                            };
+                            if edge.to_input_slot_index >= slot_inputs.len() {
+                                continue;
+                            }
+                            // Follow through any `InterfaceNode` proxy on
+                            // the source side. SubGraph external output
+                            // edges have `edge.from_node = OutputProxy`,
+                            // which is a runtime no-op (Phase X2) and
+                            // never writes its own output cache, so a
+                            // direct `cache.outputs.get` would miss.
+                            if let Some(data) = resolve_value_through_interface(
+                                &ns,
+                                &cache,
+                                &edge.from_node,
+                                edge.from_output_slot_index,
+                                edge.from_output_slot_id,
+                                &mut HashSet::new(),
+                            ) {
+                                slot_inputs[edge.to_input_slot_index] = Some(data);
                             }
                         }
                         node_outputs.insert(node_path.clone(), slot_inputs);
@@ -1189,10 +1487,27 @@ impl NodeGraph {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
 
+        let mut frontier = ChangeFrontier::new(plan.seed_nodes.clone());
+        let mut executed_node_paths: Vec<NodePath> =
+            Vec::with_capacity(plan.planned_node_paths.len());
         let mut failed_paths: HashSet<NodePath> = HashSet::new();
         for level_nodes in &plan.levels {
-            let level_vec: Vec<NodePath> = level_nodes.clone();
-            let level_results: Vec<(NodePath, Result<(), String>)> = match mode {
+            // Value-based cutoff: a planned node whose inputs all come
+            // from nodes that did not change this pass is skipped —
+            // not executed, not collected, cache and dirty state
+            // untouched. Both scheduling modes take the same decision;
+            // only the dispatch of the survivors differs.
+            let level_vec: Vec<NodePath> = match self.node_states.read() {
+                Ok(ns) => level_nodes
+                    .iter()
+                    .filter(|path| frontier.must_execute(path, &ns))
+                    .cloned()
+                    .collect(),
+                // Unreadable node states: no basis for a skip decision,
+                // so run the whole level (fail open).
+                Err(_) => level_nodes.clone(),
+            };
+            let level_results: Vec<NodeRun> = match mode {
                 ExecutionMode::Sequential => level_vec
                     .into_iter()
                     .map(|path| {
@@ -1219,21 +1534,26 @@ impl NodeGraph {
                     .collect(),
             };
 
-            for (path, res) in level_results {
-                if let Err(msg) = res {
-                    self.add_error(GraphError::execution_at_path(&path, msg));
-                    failed_paths.insert(path);
+            for run in level_results {
+                if run.outputs_changed {
+                    frontier.mark_changed(run.path.clone());
                 }
+                if let Err(msg) = run.result {
+                    self.add_error(GraphError::execution_at_path(&run.path, msg));
+                    failed_paths.insert(run.path.clone());
+                }
+                executed_node_paths.push(run.path);
             }
         }
 
         // Per plan-14c §Dirty-State Rule, failures must preserve enough
         // dirty state for a later retry. Re-mark every failed node as
         // changed so the next `execute_*` call replans from the same
-        // failure point. Successful nodes stay clean.
+        // failure point. Successful nodes stay clean — and so do skipped
+        // ones, which never ran and whose cached outputs are still valid.
         self.restore_dirty_for_failed(failed_paths);
 
-        Ok(self.collect_outputs(&plan))
+        Ok(self.collect_outputs(&plan, &executed_node_paths))
     }
 
     /// Re-mark `failed_paths` as changed in `NodeStates`. Idempotent if
@@ -1292,12 +1612,30 @@ impl NodeGraph {
         let shared_cache = self.cache.share();
         let shared_node_states = self.node_states.clone();
 
+        let mut frontier = ChangeFrontier::new(plan.seed_nodes.clone());
+        let mut executed_node_paths: Vec<NodePath> =
+            Vec::with_capacity(plan.planned_node_paths.len());
         let mut failed_paths: HashSet<NodePath> = HashSet::new();
         for level_nodes in &plan.levels {
+            // Value-based cutoff, identical semantics to the sync
+            // kernel: skip a planned node whose every upstream is
+            // unchanged. `AsyncIo` nodes never opt in (their default
+            // `output_cutoff` is `Disabled`), so they always count as
+            // changed once they run — only the decision to run them at
+            // all is shared with the sync path.
+            let runnable: Vec<NodePath> = match self.node_states.read() {
+                Ok(ns) => level_nodes
+                    .iter()
+                    .filter(|path| frontier.must_execute(path, &ns))
+                    .cloned()
+                    .collect(),
+                Err(_) => level_nodes.clone(),
+            };
+
             // Partition dirty level into Sync/Async by execution_kind.
             let mut sync_paths: Vec<NodePath> = Vec::new();
             let mut async_paths: Vec<NodePath> = Vec::new();
-            for path in level_nodes {
+            for path in &runnable {
                 match node_execution_kind(path, &shared_nodes) {
                     Some(NodeExecutionKind::AsyncIo) => async_paths.push(path.clone()),
                     // Missing entity falls through to the sync path —
@@ -1311,7 +1649,7 @@ impl NodeGraph {
             // caller's runtime can offload via `spawn_blocking` if it
             // dislikes that — the plan-14c invariant is only that the
             // graph executor itself never calls `block_on`.
-            let sync_results: Vec<(NodePath, Result<(), String>)> = match mode {
+            let sync_results: Vec<NodeRun> = match mode {
                 ExecutionMode::Sequential => sync_paths
                     .into_iter()
                     .map(|path| {
@@ -1338,11 +1676,15 @@ impl NodeGraph {
                     .collect(),
             };
 
-            for (path, res) in &sync_results {
-                if let Err(msg) = res {
-                    self.add_error(GraphError::execution_at_path(path, msg.clone()));
-                    failed_paths.insert(path.clone());
+            for run in sync_results {
+                if run.outputs_changed {
+                    frontier.mark_changed(run.path.clone());
                 }
+                if let Err(msg) = run.result {
+                    self.add_error(GraphError::execution_at_path(&run.path, msg));
+                    failed_paths.insert(run.path.clone());
+                }
+                executed_node_paths.push(run.path);
             }
 
             // Async I/O work: prepare each future under a short read
@@ -1362,6 +1704,11 @@ impl NodeGraph {
                                     &path,
                                     "Lock poisoned".to_string(),
                                 ));
+                                // The node never ran, so nothing can be
+                                // claimed about its outputs: propagate
+                                // (fail open) rather than let the cutoff
+                                // silently prune its downstream.
+                                frontier.mark_changed(path);
                                 continue;
                             }
                         };
@@ -1398,14 +1745,18 @@ impl NodeGraph {
             let async_results = futures::future::join_all(async_futs).await;
 
             for (path, res) in async_results {
+                // `AsyncIo` nodes never opt into value-based cutoff, so
+                // running one always counts as a change.
+                frontier.mark_changed(path.clone());
                 match res {
-                    Ok(()) => on_progress(ExecutionEvent::Completed(path)),
+                    Ok(()) => on_progress(ExecutionEvent::Completed(path.clone())),
                     Err(msg) => {
                         on_progress(ExecutionEvent::Failed(path.clone(), msg.clone()));
                         self.add_error(GraphError::execution_at_path(&path, msg));
-                        failed_paths.insert(path);
+                        failed_paths.insert(path.clone());
                     }
                 }
+                executed_node_paths.push(path);
             }
         }
 
@@ -1413,7 +1764,7 @@ impl NodeGraph {
         // remote errors etc.) must leave the dirty plan re-runnable.
         self.restore_dirty_for_failed(failed_paths);
 
-        Ok(self.collect_outputs(&plan))
+        Ok(self.collect_outputs(&plan, &executed_node_paths))
     }
 }
 
@@ -2015,5 +2366,524 @@ mod sync_executor_tests {
             probe_output(&r, &probe_path),
             format!("/{}/{}", sg_id.id_string(), probe_id.id_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod value_cutoff_tests {
+    //! Value-based execution cutoff ([`OutputCutoff`]): an opted-in node
+    //! whose fresh outputs equal its cached ones stops propagation, so
+    //! the planned nodes downstream of it are skipped for that pass.
+
+    use super::*;
+    use crate::{AddNode, NumberNode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ── Test nodes ────────────────────────────────────────────────
+
+    /// How many times [`QuantizeNode`] ran since the last reset.
+    static QUANTIZE_RUNS: AtomicUsize = AtomicUsize::new(0);
+    /// How many times [`PlainDoubleNode`] ran since the last reset.
+    static DOUBLE_RUNS: AtomicUsize = AtomicUsize::new(0);
+    /// How many times [`AlwaysFailsNode`] ran since the last reset.
+    static FAIL_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Compare two output snapshots slot-by-slot as `f64`.
+    ///
+    /// A slot that is missing on exactly one side, or whose payload is
+    /// not a number, compares unequal — the fail-open direction.
+    fn number_slots_equal(previous: &[Option<Data>], current: &[Option<Data>]) -> bool {
+        previous.len() == current.len()
+            && previous
+                .iter()
+                .zip(current.iter())
+                .all(|(p, c)| match (p, c) {
+                    (Some(p), Some(c)) => match (p.value::<f64>(), c.value::<f64>()) {
+                        (Ok(p), Ok(c)) => p == c,
+                        _ => false,
+                    },
+                    (None, None) => true,
+                    _ => false,
+                })
+    }
+
+    /// Opted-in value boundary: emits `floor(input)`, so a range of
+    /// input values maps onto one output value. Stands in for a real
+    /// boundary node (a fan-in, a filter) whose result is stable across
+    /// most upstream edits.
+    #[derive(Debug)]
+    struct QuantizeNode;
+
+    impl crate::NodeMeta for QuantizeNode {
+        const NAME: &'static str = "CutoffQuantizeTestNode";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Math;
+        const INPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "In",
+            data_type: DataType::Number,
+            max_connections: Some(1),
+            inspector_visible: true,
+        }];
+        const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "Out",
+            data_type: DataType::Number,
+            max_connections: None,
+            inspector_visible: true,
+        }];
+    }
+
+    impl NodeImpl for QuantizeNode {
+        fn output_cutoff(&self) -> OutputCutoff {
+            OutputCutoff::Enabled
+        }
+
+        fn outputs_equivalent(&self, previous: &[Option<Data>], current: &[Option<Data>]) -> bool {
+            number_slots_equal(previous, current)
+        }
+
+        fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
+            QUANTIZE_RUNS.fetch_add(1, Ordering::SeqCst);
+            let input = ctx
+                .input_values
+                .first()
+                .and_then(|v| v.first())
+                .and_then(|d| d.value::<f64>().ok().copied())
+                .unwrap_or(0.0);
+            ctx.output_writer
+                .set(0, Data::new(input.floor()).map_err(|e| e.to_string())?)
+        }
+    }
+
+    crate::register_nodes!(QuantizeNode);
+
+    /// Same shape as [`QuantizeNode`] but WITHOUT the opt-in: the
+    /// control for "a default node never prunes, even when its outputs
+    /// are bit-identical".
+    #[derive(Debug)]
+    struct PlainDoubleNode;
+
+    impl crate::NodeMeta for PlainDoubleNode {
+        const NAME: &'static str = "CutoffPlainDoubleTestNode";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Math;
+        const INPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "In",
+            data_type: DataType::Number,
+            max_connections: Some(1),
+            inspector_visible: true,
+        }];
+        const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "Out",
+            data_type: DataType::Number,
+            max_connections: None,
+            inspector_visible: true,
+        }];
+    }
+
+    impl NodeImpl for PlainDoubleNode {
+        fn execute_sync(&self, ctx: ExecutionContext) -> Result<(), String> {
+            DOUBLE_RUNS.fetch_add(1, Ordering::SeqCst);
+            let input = ctx
+                .input_values
+                .first()
+                .and_then(|v| v.first())
+                .and_then(|d| d.value::<f64>().ok().copied())
+                .unwrap_or(0.0);
+            ctx.output_writer
+                .set(0, Data::new(input.floor()).map_err(|e| e.to_string())?)
+        }
+    }
+
+    crate::register_nodes!(PlainDoubleNode);
+
+    /// Always fails, so the dirty-restoration path can be observed
+    /// alongside skipping.
+    #[derive(Debug)]
+    struct AlwaysFailsNode;
+
+    impl crate::NodeMeta for AlwaysFailsNode {
+        const NAME: &'static str = "CutoffAlwaysFailsTestNode";
+        const CATEGORY: crate::NodeCategory = crate::NodeCategory::Math;
+        const INPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "In",
+            data_type: DataType::Number,
+            max_connections: Some(1),
+            inspector_visible: true,
+        }];
+        const OUTPUTS: &'static [crate::SlotDef] = &[crate::SlotDef {
+            label: "Out",
+            data_type: DataType::Number,
+            max_connections: None,
+            inspector_visible: true,
+        }];
+    }
+
+    impl NodeImpl for AlwaysFailsNode {
+        fn execute_sync(&self, _ctx: ExecutionContext) -> Result<(), String> {
+            FAIL_RUNS.fetch_add(1, Ordering::SeqCst);
+            Err("CutoffAlwaysFails: deliberate failure (test fixture)".to_string())
+        }
+    }
+
+    crate::register_nodes!(AlwaysFailsNode);
+
+    // ── Helpers ───────────────────────────────────────────────────
+
+    fn path(id: NodeId) -> NodePath {
+        NodePath::root().child(id)
+    }
+
+    fn ran(result: &ExecutionResult, id: NodeId) -> bool {
+        result.node_outputs.contains_key(&path(id))
+    }
+
+    fn set_number(graph: &mut NodeGraph, id: NodeId, value: f64) {
+        graph
+            .update_node_data(&id, Data::new(value).unwrap())
+            .unwrap();
+    }
+
+    fn cached(graph: &NodeGraph, id: NodeId) -> Option<f64> {
+        graph
+            .get_output_value(&id, 0)
+            .and_then(|d| d.value::<f64>().ok().copied())
+    }
+
+    /// `Number → Quantize → Add(B) → Add(C)`: the canonical A→B→C chain
+    /// with the opted-in node at A.
+    fn build_chain() -> (NodeGraph, NodeId, NodeId, NodeId, NodeId) {
+        let mut graph = NodeGraph::new().unwrap();
+        let num = graph.create_node::<NumberNode>().unwrap();
+        let quant = graph.create_node::<QuantizeNode>().unwrap();
+        let b = graph.create_node::<AddNode>().unwrap();
+        let c = graph.create_node::<AddNode>().unwrap();
+        set_number(&mut graph, num, 1.2);
+        graph.connect_nodes(&num, 0, &quant, 0).unwrap();
+        graph.connect_nodes(&quant, 0, &b, 0).unwrap();
+        graph.connect_nodes(&b, 0, &c, 0).unwrap();
+        (graph, num, quant, b, c)
+    }
+
+    // ── (i) equal output → downstream skipped ─────────────────────
+
+    #[test]
+    fn equal_output_skips_the_downstream_cone_and_keeps_its_cached_values() {
+        let (mut graph, num, quant, b, c) = build_chain();
+        let first = graph.execute_sync().unwrap();
+        assert!(
+            ran(&first, b) && ran(&first, c),
+            "first pass runs everything"
+        );
+        assert_eq!(cached(&graph, c), Some(1.0));
+
+        // 1.2 → 1.7: the Number changes, `floor` does not.
+        QUANTIZE_RUNS.store(0, Ordering::SeqCst);
+        set_number(&mut graph, num, 1.7);
+        let second = graph.execute_sync().unwrap();
+
+        assert!(ran(&second, num), "the directly-dirty node always runs");
+        assert_eq!(
+            QUANTIZE_RUNS.load(Ordering::SeqCst),
+            1,
+            "the opted-in node itself still runs — cutoff is about its downstream",
+        );
+        assert!(ran(&second, quant), "an executed node reports its outputs");
+        assert!(
+            !ran(&second, b) && !ran(&second, c),
+            "an equivalent result stops propagation: B and C are skipped",
+        );
+        assert_eq!(
+            cached(&graph, b),
+            Some(1.0),
+            "a skipped node keeps its cached outputs",
+        );
+        assert_eq!(cached(&graph, c), Some(1.0));
+    }
+
+    /// A skipped node is not dirty: it never ran, but it also never
+    /// failed, so nothing re-marks it and the next execute is a no-op.
+    #[test]
+    fn skipped_nodes_are_left_clean_not_dirty() {
+        let (mut graph, num, _quant, _b, _c) = build_chain();
+        graph.execute_sync().unwrap();
+        set_number(&mut graph, num, 1.7);
+        graph.execute_sync().unwrap();
+
+        let third = graph.execute_sync().unwrap();
+        assert!(
+            third.node_outputs.is_empty(),
+            "skipping must not leave dirty state behind, got {:?}",
+            third.node_outputs.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    // ── (ii) differing output → everything runs ───────────────────
+
+    #[test]
+    fn differing_output_propagates_to_the_whole_cone() {
+        let (mut graph, num, quant, b, c) = build_chain();
+        graph.execute_sync().unwrap();
+
+        // 1.2 → 3.4: `floor` moves from 1 to 3.
+        set_number(&mut graph, num, 3.4);
+        let second = graph.execute_sync().unwrap();
+
+        assert!(
+            ran(&second, num) && ran(&second, quant) && ran(&second, b) && ran(&second, c),
+            "a changed value re-runs the full planned cone",
+        );
+        assert_eq!(cached(&graph, c), Some(3.0));
+    }
+
+    // ── (iii) default node → never prunes ─────────────────────────
+
+    #[test]
+    fn a_default_node_never_prunes_even_with_identical_outputs() {
+        let mut graph = NodeGraph::new().unwrap();
+        let num = graph.create_node::<NumberNode>().unwrap();
+        let plain = graph.create_node::<PlainDoubleNode>().unwrap();
+        let b = graph.create_node::<AddNode>().unwrap();
+        let c = graph.create_node::<AddNode>().unwrap();
+        set_number(&mut graph, num, 1.2);
+        graph.connect_nodes(&num, 0, &plain, 0).unwrap();
+        graph.connect_nodes(&plain, 0, &b, 0).unwrap();
+        graph.connect_nodes(&b, 0, &c, 0).unwrap();
+        graph.execute_sync().unwrap();
+
+        // Same edit as the opted-in case: `floor` is identical, but the
+        // node did not opt in, so nothing is skipped.
+        DOUBLE_RUNS.store(0, Ordering::SeqCst);
+        set_number(&mut graph, num, 1.7);
+        let second = graph.execute_sync().unwrap();
+
+        assert_eq!(DOUBLE_RUNS.load(Ordering::SeqCst), 1);
+        assert!(
+            ran(&second, plain) && ran(&second, b) && ran(&second, c),
+            "OutputCutoff::Disabled reproduces reachability-only execution",
+        );
+    }
+
+    // ── (iv) diamond fan-in ───────────────────────────────────────
+
+    /// A join fed by one changed and one unchanged branch executes: a
+    /// single changed upstream is enough.
+    #[test]
+    fn a_join_with_one_changed_branch_executes() {
+        let mut graph = NodeGraph::new().unwrap();
+        let left_num = graph.create_node::<NumberNode>().unwrap();
+        let right_num = graph.create_node::<NumberNode>().unwrap();
+        let left = graph.create_node::<QuantizeNode>().unwrap();
+        let right = graph.create_node::<QuantizeNode>().unwrap();
+        let join = graph.create_node::<AddNode>().unwrap();
+        let tail = graph.create_node::<AddNode>().unwrap();
+        set_number(&mut graph, left_num, 1.2);
+        set_number(&mut graph, right_num, 10.2);
+        graph.connect_nodes(&left_num, 0, &left, 0).unwrap();
+        graph.connect_nodes(&right_num, 0, &right, 0).unwrap();
+        graph.connect_nodes(&left, 0, &join, 0).unwrap();
+        graph.connect_nodes(&right, 0, &join, 1).unwrap();
+        graph.connect_nodes(&join, 0, &tail, 0).unwrap();
+        graph.execute_sync().unwrap();
+        assert_eq!(cached(&graph, join), Some(11.0));
+
+        // Left stays put across the quantiser; right moves.
+        set_number(&mut graph, left_num, 1.7);
+        set_number(&mut graph, right_num, 12.3);
+        let second = graph.execute_sync().unwrap();
+
+        assert!(
+            ran(&second, join),
+            "a join with any changed upstream must execute",
+        );
+        assert!(
+            ran(&second, left),
+            "the absorbed branch's boundary node still runs; it just does not propagate",
+        );
+        assert!(ran(&second, tail), "and so must its downstream");
+        assert_eq!(
+            cached(&graph, join),
+            Some(13.0),
+            "the join still reads the UNCHANGED branch's cached value",
+        );
+    }
+
+    /// Both branches equivalent → the join is skipped.
+    #[test]
+    fn a_join_with_no_changed_branch_is_skipped() {
+        let mut graph = NodeGraph::new().unwrap();
+        let left_num = graph.create_node::<NumberNode>().unwrap();
+        let right_num = graph.create_node::<NumberNode>().unwrap();
+        let left = graph.create_node::<QuantizeNode>().unwrap();
+        let right = graph.create_node::<QuantizeNode>().unwrap();
+        let join = graph.create_node::<AddNode>().unwrap();
+        set_number(&mut graph, left_num, 1.2);
+        set_number(&mut graph, right_num, 10.2);
+        graph.connect_nodes(&left_num, 0, &left, 0).unwrap();
+        graph.connect_nodes(&right_num, 0, &right, 0).unwrap();
+        graph.connect_nodes(&left, 0, &join, 0).unwrap();
+        graph.connect_nodes(&right, 0, &join, 1).unwrap();
+        graph.execute_sync().unwrap();
+
+        set_number(&mut graph, left_num, 1.7);
+        set_number(&mut graph, right_num, 10.9);
+        let second = graph.execute_sync().unwrap();
+
+        assert!(!ran(&second, join));
+        assert_eq!(cached(&graph, join), Some(11.0));
+    }
+
+    // ── (v) failure interaction ───────────────────────────────────
+
+    /// A failed node is re-marked dirty and therefore re-runs on the
+    /// next pass EVEN IF its upstream is unchanged — the restored dirty
+    /// mark is a seed, and seeds always execute. A skipped node gets no
+    /// such mark.
+    #[test]
+    fn a_failed_node_still_retries_while_skipped_nodes_do_not() {
+        let mut graph = NodeGraph::new().unwrap();
+        let num = graph.create_node::<NumberNode>().unwrap();
+        let quant = graph.create_node::<QuantizeNode>().unwrap();
+        let failing = graph.create_node::<AlwaysFailsNode>().unwrap();
+        let skipped = graph.create_node::<AddNode>().unwrap();
+        set_number(&mut graph, num, 1.2);
+        graph.connect_nodes(&num, 0, &quant, 0).unwrap();
+        graph.connect_nodes(&quant, 0, &failing, 0).unwrap();
+        graph.connect_nodes(&quant, 0, &skipped, 0).unwrap();
+
+        let first = graph.execute_sync().unwrap();
+        assert!(first.errors.contains_key(&path(failing)));
+        assert!(ran(&first, skipped));
+
+        // An edit the quantiser absorbs. `skipped` has no changed
+        // upstream; `failing` is dirty from its own failure.
+        FAIL_RUNS.store(0, Ordering::SeqCst);
+        set_number(&mut graph, num, 1.7);
+        let second = graph.execute_sync().unwrap();
+
+        assert_eq!(
+            FAIL_RUNS.load(Ordering::SeqCst),
+            1,
+            "the failed node is re-marked dirty and retries",
+        );
+        assert!(
+            !ran(&second, skipped),
+            "the sibling with no changed upstream is skipped",
+        );
+        assert!(
+            second.errors.contains_key(&path(failing)),
+            "the retry's failure is reported again",
+        );
+    }
+
+    /// A failing opted-in node counts as changed: its downstream must
+    /// not be pruned on the strength of a comparison that never ran.
+    #[test]
+    fn a_failing_node_propagates_even_though_its_outputs_did_not_move() {
+        let mut graph = NodeGraph::new().unwrap();
+        let num = graph.create_node::<NumberNode>().unwrap();
+        let failing = graph.create_node::<AlwaysFailsNode>().unwrap();
+        let downstream = graph.create_node::<AddNode>().unwrap();
+        set_number(&mut graph, num, 1.0);
+        graph.connect_nodes(&num, 0, &failing, 0).unwrap();
+        graph.connect_nodes(&failing, 0, &downstream, 0).unwrap();
+
+        graph.execute_sync().unwrap();
+        set_number(&mut graph, num, 2.0);
+        let second = graph.execute_sync().unwrap();
+
+        assert!(
+            ran(&second, downstream),
+            "a failed node fails open — its downstream still runs",
+        );
+    }
+
+    // ── (vi) SubGraph interface transparency ──────────────────────
+
+    /// `Number → InputProxy → Quantize → OutputProxy → Add`, wired the
+    /// way a SubGraph boundary is: the proxies never write their own
+    /// cache, and consumers resolve through them. Skipping a proxy must
+    /// therefore be invisible, and a later pass that DOES change the
+    /// value must still deliver it through the proxy chain.
+    #[test]
+    fn cutoff_across_a_subgraph_interface_boundary() {
+        let mut graph = NodeGraph::new().unwrap();
+        let sg = graph.add_subgraph_at(&NodePath::root(), "SG").unwrap();
+        graph
+            .add_subgraph_input(&sg, "In", DataType::Number)
+            .unwrap();
+        graph
+            .add_subgraph_output(&sg, "Out", DataType::Number)
+            .unwrap();
+        let (in_proxy, out_proxy) = graph.subgraph_proxy_ids(&sg).unwrap();
+        let sg_path = NodePath::root().child(sg);
+        let in_path = sg_path.child(in_proxy);
+        let out_path = sg_path.child(out_proxy);
+
+        let num = graph.create_node::<NumberNode>().unwrap();
+        let quant_id = graph
+            .create_node_by_name_at(&sg_path, QuantizeNode::NAME)
+            .unwrap();
+        let quant_path = sg_path.child(quant_id);
+        let sink = graph.create_node::<AddNode>().unwrap();
+        set_number(&mut graph, num, 1.2);
+
+        graph.connect_nodes_at(&path(num), 0, &in_path, 0).unwrap();
+        graph.connect_nodes_at(&in_path, 0, &quant_path, 0).unwrap();
+        graph
+            .connect_nodes_at(&quant_path, 0, &out_path, 0)
+            .unwrap();
+        graph
+            .connect_nodes_at(&out_path, 0, &path(sink), 0)
+            .unwrap();
+
+        graph.execute_sync().unwrap();
+        assert_eq!(
+            cached(&graph, sink),
+            Some(1.0),
+            "the value crosses both proxies"
+        );
+
+        // Absorbed edit: the output proxy and the sink are skipped.
+        set_number(&mut graph, num, 1.7);
+        let second = graph.execute_sync().unwrap();
+        assert!(
+            !second.node_outputs.contains_key(&out_path),
+            "the output proxy has no changed upstream and is skipped",
+        );
+        assert!(!ran(&second, sink));
+        assert_eq!(cached(&graph, sink), Some(1.0));
+
+        // Real edit: resolution through the previously-skipped proxy
+        // still delivers the fresh value.
+        set_number(&mut graph, num, 4.5);
+        let third = graph.execute_sync().unwrap();
+        assert!(third.node_outputs.contains_key(&out_path));
+        assert!(ran(&third, sink));
+        assert_eq!(cached(&graph, sink), Some(4.0));
+    }
+
+    // ── Mode parity ───────────────────────────────────────────────
+
+    /// Sequential and Parallel take the same skip decisions.
+    #[test]
+    fn sequential_and_parallel_skip_identically() {
+        for mode in [ExecutionMode::Sequential, ExecutionMode::Parallel] {
+            let (mut graph, num, quant, b, c) = build_chain();
+            graph.execute_sync_with_mode(mode).unwrap();
+
+            set_number(&mut graph, num, 1.7);
+            let second = graph.execute_sync_with_mode(mode).unwrap();
+            assert!(ran(&second, quant), "{mode:?}: the boundary node runs");
+            assert!(
+                !ran(&second, b) && !ran(&second, c),
+                "{mode:?}: its downstream is skipped",
+            );
+
+            set_number(&mut graph, num, 9.9);
+            let third = graph.execute_sync_with_mode(mode).unwrap();
+            assert!(
+                ran(&third, b) && ran(&third, c),
+                "{mode:?}: a real change still propagates",
+            );
+            assert_eq!(cached(&graph, c), Some(9.0));
+        }
     }
 }
