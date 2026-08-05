@@ -3,7 +3,8 @@
 //! Provides `add_node_at`, `add_subgraph_at`, `remove_node_at`,
 //! `node_at_path`, `children_of_path`, `is_subgraph_node_at_path`,
 //! `stamp_interface_direction`, `subgraph_proxy_ids_at_path`,
-//! `subgraph_external_input_slot`, and `subgraph_external_output_slot`.
+//! `subgraph_external_input_slot`, `subgraph_external_output_slot`, and
+//! their inverses `edge_external_target` / `edge_external_source`.
 //!
 //! These replace the old `with_graph_at_path` / `internal_graph`
 //! traversal patterns.
@@ -11,7 +12,7 @@
 use std::{any::TypeId, sync::Arc};
 
 use crate::{
-    Data, DataType, InputSlotId, InputSlotInfo, InterfaceDirection, InterfaceNode,
+    Data, DataType, Edge, InputSlotId, InputSlotInfo, InterfaceDirection, InterfaceNode,
     InterfaceNodeData, NodeEntity, NodeGraph, NodeId, NodeMeta, NodePath, OutputSlotId, SlotDef,
     SlotInfo, SubGraphNode, INTERFACE_NODE_DATA_DOMAIN,
 };
@@ -294,6 +295,77 @@ impl NodeGraph {
         states
             .output_slot(&out_path, port_index)
             .map(|s| (out_path.clone(), s.id))
+    }
+
+    // ── Edge-endpoint resolution (inverse of the retarget) ──
+
+    /// The root-level SubGraph instance whose EXTERNAL input port `edge`
+    /// addresses, as `(instance_id, port_index)`.
+    ///
+    /// # The retarget invariant
+    ///
+    /// A SubGraphNode's external slots are an alias surface for its
+    /// proxy `InterfaceNode`s, so [`NodeGraph::add_edge_with_id`]
+    /// rewrites an edge aimed at instance `I`'s external input port `i`
+    /// into one aimed at `I`'s `InputProxy` — the stored endpoint is
+    /// `root/<I>/<input_proxy_id>` and the port index rides through
+    /// unchanged (only the path and the cached slot id move). The
+    /// author's original endpoint is therefore not recoverable from the
+    /// edge as stored: this method is the walk-back, and it is defined
+    /// from the same [`subgraph_proxy_ids_at_path`](Self::subgraph_proxy_ids_at_path)
+    /// lookup the rewrite itself branches on, so the two directions
+    /// cannot drift apart.
+    ///
+    /// The forward sibling is
+    /// [`subgraph_external_input_slot`](Self::subgraph_external_input_slot),
+    /// which builds the endpoint this resolves.
+    ///
+    /// `None` whenever the edge does not land on a **root-level**
+    /// instance's `InputProxy`: a plain root-to-root edge, an edge into
+    /// an ordinary node inside an instance, and an edge onto the
+    /// external port of an instance nested deeper than root level —
+    /// that one names its instance by a `NodePath`, which this
+    /// `NodeId`-keyed answer cannot carry.
+    pub fn edge_external_target(&self, edge: &Edge) -> Option<(NodeId, usize)> {
+        let instance = self.root_level_instance_at_proxy(&edge.to_node, |(input, _)| input)?;
+        Some((instance, edge.to_input_slot_index))
+    }
+
+    /// The root-level SubGraph instance whose EXTERNAL output port
+    /// `edge` leaves, as `(instance_id, port_index)`. Output twin of
+    /// [`edge_external_target`](Self::edge_external_target), resolving
+    /// the `from` end against the instance's `OutputProxy`; see that
+    /// method for the retarget invariant both are the inverse of.
+    ///
+    /// The forward sibling is
+    /// [`subgraph_external_output_slot`](Self::subgraph_external_output_slot).
+    pub fn edge_external_source(&self, edge: &Edge) -> Option<(NodeId, usize)> {
+        let instance = self.root_level_instance_at_proxy(&edge.from_node, |(_, output)| output)?;
+        Some((instance, edge.from_output_slot_index))
+    }
+
+    /// Shared walk-back for the two `edge_external_*` resolvers: the
+    /// root-level SubGraph instance whose proxy `endpoint` **is**, with
+    /// `select_proxy` picking the input or the output proxy out of the
+    /// instance's pair.
+    fn root_level_instance_at_proxy(
+        &self,
+        endpoint: &NodePath,
+        select_proxy: fn((NodeId, NodeId)) -> NodeId,
+    ) -> Option<NodeId> {
+        let sg_path = endpoint.parent()?;
+        // A root-level instance's proxy is exactly `root/<I>/<proxy>`,
+        // so the instance path is exactly one segment. Anything deeper
+        // is a nested instance's external surface, which a `NodeId`
+        // cannot name.
+        if sg_path.segments().len() != 1 {
+            return None;
+        }
+        let proxy_id = select_proxy(self.subgraph_proxy_ids_at_path(&sg_path)?);
+        if endpoint.leaf()? != proxy_id {
+            return None;
+        }
+        sg_path.leaf()
     }
 
     // ── Atomic node insertion ──
@@ -1622,6 +1694,212 @@ mod tests {
             graph.edges_for_output_slot_at(&num_path, 0),
             vec![e1, e2],
             "path-aware output-slot edge list must preserve connect order at depth-2",
+        );
+    }
+
+    // ── Edge-endpoint resolution (inverse of the retarget) ──
+    //
+    // `add_edge_with_id` retargets an edge aimed at a SubGraph's
+    // external slot onto the instance's proxy. These pin the walk-back:
+    // an edge the author wrote as "instance I, port i" must resolve back
+    // to exactly `(I, i)`, and nothing else must claim to be one.
+
+    /// Add an external input port to a SubGraph at an ARBITRARY path.
+    /// `add_subgraph_input` is root-only, and the nested-instance test
+    /// needs a port on a depth-2 SubGraph; the slot writes mirror that
+    /// helper exactly.
+    fn add_subgraph_input_at(
+        graph: &crate::NodeGraph,
+        sg_path: &crate::NodePath,
+        label: &'static str,
+        data_type: crate::DataType,
+    ) {
+        let (input_proxy_id, _) = graph
+            .subgraph_proxy_ids_at_path(sg_path)
+            .expect("SubGraph at path");
+        let in_path = sg_path.child(input_proxy_id);
+        let mut ns = graph.node_states.write().expect("write ns");
+        ns.add_input_slot(&in_path, label, data_type, Some(1), true);
+        ns.add_output_slot(&in_path, label, data_type);
+        ns.add_input_slot(sg_path, label, data_type, None, true);
+    }
+
+    #[test]
+    fn edge_external_target_resolves_a_retargeted_input_edge_to_its_instance() {
+        use crate::NodeGraphWrite;
+
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_input(&sg_id, "x", crate::DataType::Number)
+            .expect("add input port");
+        let num_id = graph.create_node_by_name("Number").expect("create Number");
+
+        let edge_id = graph
+            .connect_nodes(&num_id, 0, &sg_id, 0)
+            .expect("connect Number -> SG external input");
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge stored");
+
+        // The stored endpoint is the InputProxy (pinned by
+        // `subgraph_edge_alias_tests`); the resolver reports what the
+        // author wrote instead.
+        assert_ne!(
+            edge.to_node,
+            crate::NodePath::root().child(sg_id),
+            "precondition: the edge was retargeted off the instance",
+        );
+        assert_eq!(
+            graph.edge_external_target(&edge),
+            Some((sg_id, 0)),
+            "a retargeted input edge must resolve back to (instance, port)",
+        );
+    }
+
+    #[test]
+    fn edge_external_source_resolves_a_retargeted_output_edge_to_its_instance() {
+        use crate::NodeGraphWrite;
+
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        graph
+            .add_subgraph_output(&sg_id, "y", crate::DataType::Number)
+            .expect("add output port");
+        let add_id = graph.create_node_by_name("Add").expect("create Add");
+
+        let edge_id = graph
+            .connect_nodes(&sg_id, 0, &add_id, 0)
+            .expect("connect SG external output -> Add");
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge stored");
+
+        assert_ne!(
+            edge.from_node,
+            crate::NodePath::root().child(sg_id),
+            "precondition: the edge was retargeted off the instance",
+        );
+        assert_eq!(
+            graph.edge_external_source(&edge),
+            Some((sg_id, 0)),
+            "a retargeted output edge must resolve back to (instance, port)",
+        );
+    }
+
+    #[test]
+    fn a_plain_root_to_root_edge_addresses_no_external_port() {
+        use crate::NodeGraphWrite;
+
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let num_id = graph.create_node_by_name("Number").expect("create Number");
+        let add_id = graph.create_node_by_name("Add").expect("create Add");
+        let edge_id = graph
+            .connect_nodes(&num_id, 0, &add_id, 0)
+            .expect("connect Number -> Add");
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge stored");
+
+        assert_eq!(graph.edge_external_target(&edge), None);
+        assert_eq!(graph.edge_external_source(&edge), None);
+    }
+
+    /// An edge into an ordinary node INSIDE an instance crossed no
+    /// external port — it was never retargeted, and the resolver must
+    /// not mistake "lives under an instance" for "addresses one".
+    #[test]
+    fn an_edge_into_a_nodes_own_slot_inside_an_instance_is_not_an_external_port() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        let sg_path = crate::NodePath::root().child(sg_id);
+        let num_id = graph
+            .create_node_by_name_at(&sg_path, "Number")
+            .expect("create inner Number");
+        let add_id = graph
+            .create_node_by_name_at(&sg_path, "Add")
+            .expect("create inner Add");
+
+        let edge_id = graph
+            .connect_nodes_at(&sg_path.child(num_id), 0, &sg_path.child(add_id), 0)
+            .expect("connect inner Number -> inner Add");
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge stored");
+
+        assert_eq!(graph.edge_external_target(&edge), None);
+        assert_eq!(graph.edge_external_source(&edge), None);
+    }
+
+    /// The retarget applies at every depth, but the answer these
+    /// resolvers give is a root-level `NodeId`. A nested instance's
+    /// external port is therefore `None` rather than a wrong instance.
+    #[test]
+    fn a_nested_instances_external_port_resolves_to_none() {
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let outer = graph
+            .add_subgraph_at(&crate::NodePath::root(), "Outer")
+            .expect("add outer");
+        let outer_path = crate::NodePath::root().child(outer);
+        let inner = graph
+            .add_subgraph_at(&outer_path, "Inner")
+            .expect("add inner");
+        let inner_path = outer_path.child(inner);
+        add_subgraph_input_at(&graph, &inner_path, "x", crate::DataType::Number);
+
+        let num_id = graph
+            .create_node_by_name_at(&outer_path, "Number")
+            .expect("create Number inside outer");
+        let edge_id = graph
+            .connect_nodes_at(&outer_path.child(num_id), 0, &inner_path, 0)
+            .expect("connect -> nested SG external input");
+        let edge = graph.get_edge_by_id(&edge_id).expect("edge stored");
+
+        // The retarget DID happen — this is a depth-3 proxy endpoint.
+        let (inner_input_proxy, _) = graph
+            .subgraph_proxy_ids_at_path(&inner_path)
+            .expect("inner proxy ids");
+        assert_eq!(edge.to_node, inner_path.child(inner_input_proxy));
+        assert_eq!(
+            graph.edge_external_target(&edge),
+            None,
+            "a nested instance cannot be named by a root-level NodeId",
+        );
+    }
+
+    #[test]
+    fn the_port_index_survives_the_retarget_on_both_ends() {
+        use crate::NodeGraphWrite;
+
+        let mut graph = crate::NodeGraph::new().expect("create graph");
+        let sg_id = graph
+            .add_subgraph_at(&crate::NodePath::root(), "SG")
+            .expect("add_subgraph_at");
+        for label in ["a", "b", "c"] {
+            graph
+                .add_subgraph_input(&sg_id, label, crate::DataType::Number)
+                .expect("add input port");
+            graph
+                .add_subgraph_output(&sg_id, label, crate::DataType::Number)
+                .expect("add output port");
+        }
+        let num_id = graph.create_node_by_name("Number").expect("create Number");
+        let add_id = graph.create_node_by_name("Add").expect("create Add");
+
+        let into_port_2 = graph
+            .connect_nodes(&num_id, 0, &sg_id, 2)
+            .expect("connect -> SG external input 2");
+        let out_of_port_1 = graph
+            .connect_nodes(&sg_id, 1, &add_id, 0)
+            .expect("connect SG external output 1 -> Add");
+
+        assert_eq!(
+            graph.edge_external_target(&graph.get_edge_by_id(&into_port_2).expect("edge")),
+            Some((sg_id, 2)),
+            "the input port index must survive the retarget",
+        );
+        assert_eq!(
+            graph.edge_external_source(&graph.get_edge_by_id(&out_of_port_1).expect("edge")),
+            Some((sg_id, 1)),
+            "the output port index must survive the retarget",
         );
     }
 
