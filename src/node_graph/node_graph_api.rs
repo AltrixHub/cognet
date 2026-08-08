@@ -696,10 +696,27 @@ impl NodeGraphWrite for NodeGraph {
 
     fn remove_node(&mut self, node_id: NodeId) -> Result<(), String> {
         if self.node_manager.node_remove(&node_id).is_some() {
+            let path = NodePath::root().child(node_id);
+            // The node's output slot ids key the execution cache and are
+            // unrecoverable once the slot tables are gone.
+            let removed_output_slots: Vec<crate::OutputSlotId> = {
+                let ns = self.node_states.read().map_err(|e| e.to_string())?;
+                (0..ns.output_slot_count(&path))
+                    .filter_map(|index| ns.output_slot(&path, index).map(|slot| slot.id))
+                    .collect()
+            };
             {
                 let mut guard = self.node_states.write().map_err(|e| e.to_string())?;
-                guard.remove_node(&NodePath::root().child(node_id)); // remove_edge auto-tracks downstream
+                guard.remove_node(&path); // remove_edge auto-tracks downstream
             }
+            // Evict the cached outputs and the errors nothing could ever
+            // clear again — see `remove_node_at`.
+            if let Ok(mut cache) = self.cache.lock() {
+                for slot in &removed_output_slots {
+                    cache.outputs.remove(slot);
+                }
+            }
+            self.clear_errors_for_node(node_id);
             self.record_removal(node_id);
             Ok(())
         } else {
@@ -818,6 +835,41 @@ fn validate_async_in_sync_plan(
         Err(GraphExecutionError::RequiresAsyncExecution {
             node_ids: async_nodes,
         })
+    }
+}
+
+/// Plans smaller than this run sequentially even when the caller asked
+/// for [`ExecutionMode::Parallel`].
+///
+/// Gesture-scale dirty cones (tens of nodes, deep and narrow) lose more
+/// to the level-synchronous rayon fan-out — a barrier per topological
+/// level, the shared cache / node-map locks contended from every worker
+/// — than they gain from parallelism (measured 5–20% on the modeling
+/// app's node-scaling survey; up to 2× before its app-layer scans were
+/// removed). The two thresholds bound the two loss modes: a small plan
+/// cannot amortise the fan-out at all, and a narrow one pays a barrier
+/// per level for almost no concurrent work.
+const PARALLEL_MIN_PLAN_NODES: usize = 64;
+/// See [`PARALLEL_MIN_PLAN_NODES`] — the widest level must offer at
+/// least this much concurrent work.
+const PARALLEL_MIN_LEVEL_WIDTH: usize = 4;
+
+/// Degrade a [`ExecutionMode::Parallel`] request to `Sequential` when
+/// `plan` is too small or too narrow to profit from the fan-out.
+/// `Sequential` requests pass through untouched.
+fn effective_mode(plan: &ExecutionPlan, requested: ExecutionMode) -> ExecutionMode {
+    match requested {
+        ExecutionMode::Parallel => {
+            let max_width = plan.levels.iter().map(Vec::len).max().unwrap_or(0);
+            if plan.planned_node_paths.len() < PARALLEL_MIN_PLAN_NODES
+                || max_width < PARALLEL_MIN_LEVEL_WIDTH
+            {
+                ExecutionMode::Sequential
+            } else {
+                ExecutionMode::Parallel
+            }
+        }
+        ExecutionMode::Sequential => ExecutionMode::Sequential,
     }
 }
 
@@ -1459,6 +1511,7 @@ impl NodeGraph {
         on_progress: Arc<dyn Fn(ExecutionEvent) + Send + Sync>,
     ) -> Result<ExecutionResult, GraphExecutionError> {
         let plan = self.build_execution_plan()?;
+        let mode = effective_mode(&plan, mode);
 
         tracing::debug!(
             target: "graph",
@@ -1583,6 +1636,7 @@ impl NodeGraph {
         on_progress: Arc<dyn Fn(ExecutionEvent) + Send + Sync>,
     ) -> Result<ExecutionResult, GraphExecutionError> {
         let plan = self.build_execution_plan()?;
+        let mode = effective_mode(&plan, mode);
 
         tracing::debug!(
             target: "graph",
@@ -1856,6 +1910,99 @@ mod sync_executor_tests {
         let (graph, _, _, add_id) = build_add_graph(7.0, 8.0);
         let result = graph.execute_sync().unwrap();
         assert_eq!(output_for(&result, add_id), 15.0);
+    }
+
+    /// Removing a node evicts its cached outputs: nothing can ever read
+    /// them again (the slot ids die with the slot tables), and mesh-grade
+    /// Arc payloads would otherwise stay resident for the session.
+    #[test]
+    fn removal_evicts_the_nodes_cached_outputs() {
+        let (mut graph, a_id, _, _) = build_add_graph(1.0, 2.0);
+        graph.execute_sync().unwrap();
+
+        let a_slot = {
+            let ns = graph.node_states.read().unwrap();
+            ns.output_slot(&NodePath::root().child(a_id), 0).unwrap().id
+        };
+        assert!(
+            graph
+                .shared_cache()
+                .read()
+                .unwrap()
+                .get_output(&a_slot)
+                .is_some(),
+            "the executed output must be cached before the removal"
+        );
+
+        graph.remove_node(a_id).unwrap();
+        assert!(
+            graph
+                .shared_cache()
+                .read()
+                .unwrap()
+                .get_output(&a_slot)
+                .is_none(),
+            "a removed node's cached outputs must be evicted"
+        );
+    }
+
+    /// Removing a node drops the errors targeting it — no later run can
+    /// clear them, so they would otherwise accumulate forever.
+    #[test]
+    fn removal_drops_the_nodes_errors() {
+        let (mut graph, a_id, b_id, _) = build_add_graph(1.0, 2.0);
+        graph.add_error(GraphError::execution(a_id, "boom"));
+        graph.add_error(GraphError::execution(b_id, "kept"));
+
+        graph.remove_node(a_id).unwrap();
+        let errors = graph.errors();
+        assert!(!errors.contains_key(&ErrorTarget::Node(a_id)));
+        assert!(errors.contains_key(&ErrorTarget::Node(b_id)));
+    }
+
+    /// A gesture-scale plan (small / narrow) degrades a Parallel request
+    /// to Sequential; a wide-enough plan keeps it.
+    #[test]
+    fn effective_mode_degrades_small_and_narrow_plans() {
+        let plan_of = |widths: &[usize]| ExecutionPlan {
+            seed_nodes: HashSet::new(),
+            dirty_nodes: HashSet::new(),
+            levels: widths
+                .iter()
+                .map(|w| {
+                    (0..*w)
+                        .map(|_| NodePath::root().child(NodeId::new()))
+                        .collect()
+                })
+                .collect(),
+            planned_node_paths: (0..widths.iter().sum::<usize>())
+                .map(|_| NodePath::root().child(NodeId::new()))
+                .collect(),
+            removed_nodes: Vec::new(),
+        };
+        // Deep and narrow: plenty of nodes, no concurrent work per level.
+        let narrow = plan_of(&vec![2; 50]);
+        assert_eq!(
+            effective_mode(&narrow, ExecutionMode::Parallel),
+            ExecutionMode::Sequential,
+        );
+        // Small: too few nodes to amortise the fan-out.
+        let small = plan_of(&[10, 10]);
+        assert_eq!(
+            effective_mode(&small, ExecutionMode::Parallel),
+            ExecutionMode::Sequential,
+        );
+        // Big and wide: the fan-out pays.
+        let wide = plan_of(&vec![16; 8]);
+        assert_eq!(
+            effective_mode(&wide, ExecutionMode::Parallel),
+            ExecutionMode::Parallel,
+        );
+        // A Sequential request is never upgraded.
+        assert_eq!(
+            effective_mode(&wide, ExecutionMode::Sequential),
+            ExecutionMode::Sequential,
+        );
     }
 
     /// A plain removal (no re-creation) is reported in `removed_nodes`.

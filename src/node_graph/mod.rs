@@ -137,6 +137,25 @@ impl NodeGraph {
         }
     }
 
+    /// Drop every error targeting `node_id` (the node itself or one of
+    /// its ports). Called by node removal: an error for a node that no
+    /// longer exists can never be cleared by a later run — its target
+    /// never executes again — so it would otherwise sit in the map (and
+    /// ride every [`Self::errors`] snapshot) forever.
+    pub(crate) fn clear_errors_for_node(&self, node_id: NodeId) {
+        if let Ok(mut b) = self.bookkeeping.lock() {
+            b.errors.retain(|target, _| {
+                !matches!(
+                    target,
+                    ErrorTarget::Node(id)
+                    | ErrorTarget::InputPort { node_id: id, .. }
+                    | ErrorTarget::OutputPort { node_id: id, .. }
+                    if *id == node_id
+                )
+            });
+        }
+    }
+
     /// Mark all nodes in the graph as dirty, forcing re-execution.
     pub fn mark_all_nodes_dirty(&self) {
         if let Ok(mut ns) = self.node_states.write() {
