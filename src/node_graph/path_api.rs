@@ -841,22 +841,46 @@ impl NodeGraph {
     /// each path: drops edges, drops slots, drops NodeStates entry,
     /// drops NodeManager entry.
     pub fn remove_node_at(&mut self, path: &NodePath) -> Result<(), String> {
-        // Collect all paths under (and including) `path`, leaves first.
-        let all_paths = {
+        // Collect all paths under (and including) `path`, leaves first —
+        // plus the subtree's output slot ids, which key the execution
+        // cache and are unrecoverable once the slot tables are gone.
+        let (all_paths, removed_output_slots) = {
             let ns = self.node_states.read().map_err(|e| e.to_string())?;
-            collect_subtree_paths(&ns, path)
+            let all_paths = collect_subtree_paths(&ns, path);
+            let slots: Vec<crate::OutputSlotId> = all_paths
+                .iter()
+                .flat_map(|p| {
+                    (0..ns.output_slot_count(p))
+                        .filter_map(|index| ns.output_slot(p, index).map(|slot| slot.id))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            (all_paths, slots)
         };
 
-        let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
-        for p in &all_paths {
-            // Drop edges connected to this node.
-            ns.remove_edges_for_node_at(p);
-            let _ = self.remove_node_at_locked(&mut ns, p);
+        {
+            let mut ns = self.node_states.write().map_err(|e| e.to_string())?;
+            for p in &all_paths {
+                // Drop edges connected to this node.
+                ns.remove_edges_for_node_at(p);
+                let _ = self.remove_node_at_locked(&mut ns, p);
+            }
+        }
+
+        // Evict the removed subtree's cached outputs — mesh-grade Arc
+        // payloads a session with deletions would otherwise retain
+        // forever — and every error targeting it, which no later run
+        // could ever clear.
+        if let Ok(mut cache) = self.cache.lock() {
+            for slot in &removed_output_slots {
+                cache.outputs.remove(slot);
+            }
         }
 
         // Record removals for execution result reporting.
         for p in &all_paths {
             if let Some(id) = p.leaf() {
+                self.clear_errors_for_node(id);
                 self.record_removal(id);
             }
         }
